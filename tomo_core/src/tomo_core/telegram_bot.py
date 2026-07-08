@@ -16,6 +16,9 @@ class TelegramBotApiError(RuntimeError):
     pass
 
 
+TELEGRAM_COMMANDS = [{"command": "connect", "description": "connect supergrok or calendar"}]
+
+
 @dataclass
 class TelegramBotApiClient:
     token: str
@@ -64,6 +67,9 @@ class TelegramBotApiClient:
             payload["text"] = text
         self.request("answerCallbackQuery", payload)
 
+    def set_my_commands(self, commands: list[dict[str, str]]) -> None:
+        self.request("setMyCommands", {"commands": commands})
+
 
 def envelope_from_update(update: dict[str, Any]) -> InboundEnvelope | None:
     message = update.get("message")
@@ -97,10 +103,15 @@ class TelegramPollingBot:
     on_error: Callable[[Exception], None] | None = None
 
     def run_forever(self) -> None:
+        self.register_commands()
         offset: int | None = None
         while True:
             offset = self.poll_once(offset)
             time.sleep(self.idle_sleep_seconds)
+
+    def register_commands(self) -> None:
+        if hasattr(self.client, "set_my_commands"):
+            self.client.set_my_commands(TELEGRAM_COMMANDS)
 
     def poll_once(self, offset: int | None = None) -> int | None:
         updates = self.client.get_updates(offset=offset, timeout=self.poll_timeout)
@@ -159,6 +170,8 @@ class TelegramPollingBot:
                 self.client.send_message(actor_id, f"oauth callback failed: {exc}", reply_to_message_id=message_id)
                 return True
             self.client.send_message(actor_id, f"{provider} connected.", reply_to_message_id=message_id)
+            return True
+        if text.startswith("/"):
             return True
         return False
 

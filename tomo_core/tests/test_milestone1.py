@@ -54,6 +54,25 @@ class MilestoneOneTests(unittest.TestCase):
             self.assertNotIn("**", sent_text)
             self.assertNotIn("`", sent_text)
 
+    def test_delivery_sanitizes_banned_dashes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            client = FakeTelegramClient()
+            response = "bet — this is handled – no weird dash aura."
+            runtime = PersonalAgentRuntime(
+                provider=StaticProvider(response),
+                telegram=TelegramDeliverySink(client),
+                config=RuntimeConfig(data_dir=tmp),
+            )
+
+            runtime.handle_telegram_text(
+                InboundEnvelope(connector="telegram", actor_id="u", message_id="m", text="go")
+            )
+
+            sent_text = " ".join(message["text"] or "" for message in client.sent_messages)
+            self.assertNotIn("—", sent_text)
+            self.assertNotIn("–", sent_text)
+            self.assertIn("bet, this is handled, no weird dash aura.", sent_text)
+
     def test_dm_only_session_key_does_not_require_room_id(self):
         envelope = InboundEnvelope(connector="telegram", actor_id="user-42", message_id="m", text="yo")
         self.assertEqual(envelope.session_key, "telegram:actor:user-42")

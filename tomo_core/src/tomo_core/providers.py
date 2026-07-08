@@ -25,6 +25,7 @@ class XaiApiProvider:
     api_key: str
     model: str = "grok-composer-2.5-fast"
     base_url: str = "https://api.x.ai/v1"
+    reasoning_effort: str | None = None
 
     name: str = "xai_api"
     supports_images_in: bool = True
@@ -32,10 +33,13 @@ class XaiApiProvider:
     supports_tool_calls: bool = True
 
     def complete(self, messages: list[dict[str, str]], actor_id: str | None = None) -> str:
+        request_body = {"model": self.model, "messages": messages}
+        if self.reasoning_effort:
+            request_body["reasoning"] = {"effort": self.reasoning_effort}
         response = httpx.post(
             f"{self.base_url}/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}"},
-            json={"model": self.model, "messages": messages},
+            json=request_body,
             timeout=60,
         )
         response.raise_for_status()
@@ -53,6 +57,7 @@ class SuperGrokOAuthProvider:
     token_store: SuperGrokTokenStore
     model: str = "grok-composer-2.5-fast"
     base_url: str = "https://api.x.ai/v1"
+    reasoning_effort: str = "high"
 
     name: str = "supergrok_oauth"
     supports_images_in: bool = True
@@ -60,9 +65,12 @@ class SuperGrokOAuthProvider:
     supports_tool_calls: bool = True
 
     def complete(self, messages: list[dict[str, str]], actor_id: str | None = None) -> str:
-        return XaiApiProvider(api_key=self.token_store.access_token, model=self.model, base_url=self.base_url).complete(
-            messages, actor_id=actor_id
-        )
+        return XaiApiProvider(
+            api_key=self.token_store.access_token,
+            model=self.model,
+            base_url=self.base_url,
+            reasoning_effort=self.reasoning_effort,
+        ).complete(messages, actor_id=actor_id)
 
 
 @dataclass
@@ -70,6 +78,7 @@ class OAuthBackedSuperGrokProvider:
     oauth: OAuthManager
     model: str = "grok-composer-2.5-fast"
     base_url: str = "https://api.x.ai/v1"
+    reasoning_effort: str = "high"
 
     name: str = "supergrok_oauth_dynamic"
     supports_images_in: bool = True
@@ -90,6 +99,7 @@ class OAuthBackedSuperGrokProvider:
             token_store=SuperGrokTokenStore(access_token=access_token),
             model=self.model,
             base_url=self.base_url,
+            reasoning_effort=self.reasoning_effort,
         ).complete(messages, actor_id=actor_id)
 
 

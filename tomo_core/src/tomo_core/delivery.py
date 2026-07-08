@@ -6,11 +6,17 @@ from .models import OutboundBubble
 
 _SENTENCE_RE = re.compile(r"[^.!?。！？]+[.!?。！？]?", re.UNICODE)
 _MARKDOWN_CHARS_RE = re.compile(r"[*_`#>]+")
+_BANNED_DASHES_RE = re.compile(r"\s*[—–]\s*")
 
 
 def strip_markdown(text: str) -> str:
     cleaned = _MARKDOWN_CHARS_RE.sub("", text)
     cleaned = re.sub(r"\[(.*?)\]\((.*?)\)", r"\1: \2", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def sanitize_style(text: str) -> str:
+    cleaned = _BANNED_DASHES_RE.sub(", ", text)
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
@@ -30,7 +36,7 @@ class DeliveryPlanner:
         self.max_sentences_per_bubble = max_sentences_per_bubble
 
     def compose(self, text: str, reply_to_message_id: str) -> list[OutboundBubble]:
-        plain = strip_markdown(text)
+        plain = sanitize_style(strip_markdown(text))
         sentences = split_sentences(plain)
         groups: list[str] = []
         current: list[str] = []

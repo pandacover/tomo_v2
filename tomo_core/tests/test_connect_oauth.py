@@ -13,6 +13,7 @@ class FakeTelegramConnectClient:
         self.updates = updates
         self.sent_messages = []
         self.answered_callbacks = []
+        self.commands = []
 
     def get_updates(self, offset=None, timeout=30):
         return self.updates
@@ -32,6 +33,14 @@ class FakeTelegramConnectClient:
 
     def answer_callback_query(self, callback_query_id, text=None):
         self.answered_callbacks.append({"id": callback_query_id, "text": text})
+
+    def set_my_commands(self, commands):
+        self.commands = commands
+
+
+class RuntimeShouldNotHandleCommands:
+    def handle_telegram_text(self, envelope):
+        raise AssertionError("slash commands must not start the agent turn")
 
 
 class ConnectOAuthTests(unittest.TestCase):
@@ -99,6 +108,35 @@ class ConnectOAuthTests(unittest.TestCase):
             buttons = message["reply_markup"]["inline_keyboard"]
             self.assertEqual(buttons[0][0]["callback_data"], "connect:supergrok")
             self.assertEqual(buttons[1][0]["callback_data"], "connect:google_calendar")
+
+    def test_register_commands_exposes_connect_as_telegram_command(self):
+        client = FakeTelegramConnectClient([])
+        bot = TelegramPollingBot(client=client, runtime=None, oauth=None)
+
+        bot.register_commands()
+
+        self.assertEqual(client.commands, [{"command": "connect", "description": "connect supergrok or calendar"}])
+
+    def test_unknown_slash_command_is_ignored_without_agent_turn(self):
+        client = FakeTelegramConnectClient(
+            [
+                {
+                    "update_id": 3,
+                    "message": {
+                        "message_id": 4,
+                        "from": {"id": 99},
+                        "chat": {"id": 99, "type": "private"},
+                        "text": "/start",
+                    },
+                }
+            ]
+        )
+        bot = TelegramPollingBot(client=client, runtime=RuntimeShouldNotHandleCommands(), oauth=None)
+
+        next_offset = bot.poll_once()
+
+        self.assertEqual(next_offset, 4)
+        self.assertEqual(client.sent_messages, [])
 
     def test_connect_callback_sends_provider_auth_url(self):
         with tempfile.TemporaryDirectory() as tmp:

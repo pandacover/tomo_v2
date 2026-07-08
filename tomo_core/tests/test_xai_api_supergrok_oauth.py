@@ -86,6 +86,7 @@ class NamingMigrationTests(unittest.TestCase):
 
             self.assertEqual(reply, "supergrok reply")
             self.assertEqual(post.call_args.kwargs["headers"]["Authorization"], "Bearer supergrok-access")
+            self.assertEqual(post.call_args.kwargs["json"]["reasoning"], {"effort": "high"})
 
 
 class FakeTelegramClient:

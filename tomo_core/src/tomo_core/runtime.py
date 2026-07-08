@@ -59,7 +59,7 @@ class PersonalAgentRuntime:
             {
                 "role": "system",
                 "content": (
-                    f"soul defines your personality, speech and behavior. you do not deviate from your soul.\n\nsoul: {soul}\n\n"
+                    f"{soul}\n\n"
                     "runtime rules: reply in plain text. do not use markdown. "
                     "do not mention invisible tool execution. stay conversational."
                 ),
