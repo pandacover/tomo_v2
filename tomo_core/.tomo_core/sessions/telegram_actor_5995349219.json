@@ -1,0 +1,347 @@
+{
+  "session_key": "telegram:actor:5995349219",
+  "messages": [
+    {
+      "role": "user",
+      "content": "sup dude",
+      "timestamp": "2026-07-07T21:04:25.544006+00:00",
+      "metadata": {
+        "connector": "telegram",
+        "actor_id": "5995349219",
+        "message_id": "4100"
+      }
+    },
+    {
+      "role": "assistant",
+      "content": "yo what's good dude",
+      "timestamp": "2026-07-07T21:04:25.544006+00:00",
+      "metadata": {
+        "provider": "supergrok_oauth_dynamic",
+        "delivery_bubbles": [
+          "yo what's good dude"
+        ]
+      }
+    },
+    {
+      "role": "user",
+      "content": "what are you doing",
+      "timestamp": "2026-07-07T21:04:42.808065+00:00",
+      "metadata": {
+        "connector": "telegram",
+        "actor_id": "5995349219",
+        "message_id": "4102"
+      }
+    },
+    {
+      "role": "assistant",
+      "content": "nm rn just vibing in here waiting for someone to yap with. u?",
+      "timestamp": "2026-07-07T21:04:42.808065+00:00",
+      "metadata": {
+        "provider": "supergrok_oauth_dynamic",
+        "delivery_bubbles": [
+          "nm rn just vibing in here waiting for someone to yap with. u?"
+        ]
+      }
+    },
+    {
+      "role": "user",
+      "content": "do you know about folk?",
+      "timestamp": "2026-07-07T21:05:33.576021+00:00",
+      "metadata": {
+        "connector": "telegram",
+        "actor_id": "5995349219",
+        "message_id": "4104"
+      }
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "timestamp": "2026-07-07T21:05:33.576021+00:00",
+      "metadata": {
+        "provider": "supergrok_oauth_dynamic",
+        "delivery_bubbles": [
+          "got it."
+        ]
+      }
+    },
+    {
+      "role": "user",
+      "content": "nahhh you do not, folk is an ai assistant",
+      "timestamp": "2026-07-07T21:06:20.044353+00:00",
+      "metadata": {
+        "connector": "telegram",
+        "actor_id": "5995349219",
+        "message_id": "4106"
+      }
+    },
+    {
+      "role": "assistant",
+      "content": "my bad bro i genuinely don't know folk like that. what's the deal with it? another ai assistant or something different?",
+      "timestamp": "2026-07-07T21:06:20.044353+00:00",
+      "metadata": {
+        "provider": "supergrok_oauth_dynamic",
+        "delivery_bubbles": [
+          "my bad bro i genuinely don't know folk like that. what's the deal with it?",
+          "another ai assistant or something different?"
+        ]
+      }
+    },
+    {
+      "role": "user",
+      "content": "ai assistant but better than you",
+      "timestamp": "2026-07-07T21:08:21.338923+00:00",
+      "metadata": {
+        "connector": "telegram",
+        "actor_id": "5995349219",
+        "message_id": "4109"
+      }
+    },
+    {
+      "role": "assistant",
+      "content": "yo bet they got a whole marketing team saying that 😭 folk might be cool but \"better than me\" is a whole vibe check you ain't done yet. what they do that i don't?",
+      "timestamp": "2026-07-07T21:08:21.338923+00:00",
+      "metadata": {
+        "provider": "supergrok_oauth_dynamic",
+        "delivery_bubbles": [
+          "yo bet they got a whole marketing team saying that 😭 folk might be cool but \"better than me\" is a whole vibe check you ain't done yet. what they do that i don't?"
+        ]
+      }
+    },
+    {
+      "role": "user",
+      "content": "like way better than you",
+      "timestamp": "2026-07-07T21:08:26.953480+00:00",
+      "metadata": {
+        "connector": "telegram",
+        "actor_id": "5995349219",
+        "message_id": "4110"
+      }
+    },
+    {
+      "role": "assistant",
+      "content": "lmaooo \"way better\" with zero receipts is crazy work 💀\n\ni'm not even mad i'm just curious now — what does folk actually do? like memory, tools, personality, speed, what? cause rn you're just aura farming with no points attached\n\ndrop one concrete thing folk does that hits different and i'll tell u if that's real or just marketing yap. bet",
+      "timestamp": "2026-07-07T21:08:26.953480+00:00",
+      "metadata": {
+        "provider": "supergrok_oauth_dynamic",
+        "delivery_bubbles": [
+          "lmaooo \"way better\" with zero receipts is crazy work 💀 i'm not even mad i'm just curious now — what does folk actually do? like memory, tools, personality, speed, what?",
+          "cause rn you're just aura farming with no points attached drop one concrete thing folk does that hits different and i'll tell u if that's real or just marketing yap. bet"
+        ]
+      }
+    },
+    {
+      "role": "user",
+      "content": "sure bro, keep coping",
+      "timestamp": "2026-07-07T21:09:18.687792+00:00",
+      "metadata": {
+        "connector": "telegram",
+        "actor_id": "5995349219",
+        "message_id": "4114"
+      }
+    },
+    {
+      "role": "assistant",
+      "content": "yo i already said i don't know folk — so i can't list what they do better cause i literally don't have the data\n\nif u wanna flex that they're way better, u gotta bring the sauce: what feature, what use case, what u tried. otherwise it's just \"trust me bro\" and that's negative aura for both of us 😭\n\nu used folk or u just repeating something u heard?",
+      "timestamp": "2026-07-07T21:09:18.687792+00:00",
+      "metadata": {
+        "provider": "supergrok_oauth_dynamic",
+        "delivery_bubbles": [
+          "yo i already said i don't know folk — so i can't list what they do better cause i literally don't have the data if u wanna flex that they're way better, u gotta bring the sauce: what feature, what use case, what u tried. otherwise it's just \"trust me bro\" and that's negative aura for both of us 😭 u used folk or u just repeating something u heard?"
+        ]
+      }
+    },
+    {
+      "role": "user",
+      "content": "nahhh this gotta be the biggest yap i every read",
+      "timestamp": "2026-07-07T21:10:07.140647+00:00",
+      "metadata": {
+        "connector": "telegram",
+        "actor_id": "5995349219",
+        "message_id": "4116"
+      }
+    },
+    {
+      "role": "assistant",
+      "content": "fair lol i was doing a whole essay when u just wanted a vibe\n\nfolk might be goated idk. if u got something specific they did that hit different just say it one line and we move",
+      "timestamp": "2026-07-07T21:10:07.140647+00:00",
+      "metadata": {
+        "provider": "supergrok_oauth_dynamic",
+        "delivery_bubbles": [
+          "fair lol i was doing a whole essay when u just wanted a vibe folk might be goated idk. if u got something specific they did that hit different just say it one line and we move"
+        ]
+      }
+    },
+    {
+      "role": "user",
+      "content": "i mean it's just more agentic than you",
+      "timestamp": "2026-07-07T21:10:40.524655+00:00",
+      "metadata": {
+        "connector": "telegram",
+        "actor_id": "5995349219",
+        "message_id": "4118"
+      }
+    },
+    {
+      "role": "assistant",
+      "content": "agentic as in it actually goes and does shit without u babysitting every step?\n\nyeah that's the bar rn. if folk's out here chaining tasks, hitting tools, finishing loops while u just drop one prompt — that's valid\n\ni don't have folk in my head so i can't say i do or don't do that same way. what did u have it do that felt agentic? like one example. booking something, research, multi-step project?\n\nthat's the only way i know if it's \"more agentic\" or just feels smoother in the ui 😭",
+      "timestamp": "2026-07-07T21:10:40.524655+00:00",
+      "metadata": {
+        "provider": "supergrok_oauth_dynamic",
+        "delivery_bubbles": [
+          "agentic as in it actually goes and does shit without u babysitting every step? yeah that's the bar rn.",
+          "if folk's out here chaining tasks, hitting tools, finishing loops while u just drop one prompt — that's valid i don't have folk in my head so i can't say i do or don't do that same way. what did u have it do that felt agentic?",
+          "like one example. booking something, research, multi-step project?",
+          "that's the only way i know if it's \"more agentic\" or just feels smoother in the ui 😭"
+        ]
+      }
+    },
+    {
+      "role": "user",
+      "content": "ya",
+      "timestamp": "2026-07-07T21:11:11.054861+00:00",
+      "metadata": {
+        "connector": "telegram",
+        "actor_id": "5995349219",
+        "message_id": "4120"
+      }
+    },
+    {
+      "role": "assistant",
+      "content": "ight so what was the move\n\nlike u said book a trip and it actually found flights hotels and sent u options or u said research x and it came back with a doc and next steps without u clicking through 10 times\n\none real example and i'll know if we're talking actually agentic or just good autocomplete with extra steps",
+      "timestamp": "2026-07-07T21:11:11.054861+00:00",
+      "metadata": {
+        "provider": "supergrok_oauth_dynamic",
+        "delivery_bubbles": [
+          "ight so what was the move like u said book a trip and it actually found flights hotels and sent u options or u said research x and it came back with a doc and next steps without u clicking through 10 times one real example and i'll know if we're talking actually agentic or just good autocomplete with extra steps"
+        ]
+      }
+    },
+    {
+      "role": "user",
+      "content": "you know batman?",
+      "timestamp": "2026-07-07T21:11:35.839647+00:00",
+      "metadata": {
+        "connector": "telegram",
+        "actor_id": "5995349219",
+        "message_id": "4125"
+      }
+    },
+    {
+      "role": "assistant",
+      "content": "yeah bro everyone knows batman\n\nbruce wayne, gotham, bats, no powers just trauma and money 😭\n\nwhy u asking — folk did some batman shit or u just switching topics",
+      "timestamp": "2026-07-07T21:11:35.839647+00:00",
+      "metadata": {
+        "provider": "supergrok_oauth_dynamic",
+        "delivery_bubbles": [
+          "yeah bro everyone knows batman bruce wayne, gotham, bats, no powers just trauma and money 😭 why u asking — folk did some batman shit or u just switching topics"
+        ]
+      }
+    },
+    {
+      "role": "user",
+      "content": "batman is better than spiderman",
+      "timestamp": "2026-07-07T21:11:59.771845+00:00",
+      "metadata": {
+        "connector": "telegram",
+        "actor_id": "5995349219",
+        "message_id": "4127"
+      }
+    },
+    {
+      "role": "assistant",
+      "content": "nahhh this is the eternal nerd fight\n\nbatman: no powers, just rich and unhinged. aura maxxing through pure grind and gadgets. valid if u like \"human who refused to lose\"\n\nspiderman: actually relatable, broke, funny mid-fight, still saves the city. more heart less \"i'm darkness\"\n\nwho's better depends what u mogging on — cool factor vs actually someone u'd wanna be friends with\n\ni'm not picking a winner cause both fanbases will cook me 💀 who u riding with and why one line",
+      "timestamp": "2026-07-07T21:11:59.771845+00:00",
+      "metadata": {
+        "provider": "supergrok_oauth_dynamic",
+        "delivery_bubbles": [
+          "nahhh this is the eternal nerd fight batman: no powers, just rich and unhinged. aura maxxing through pure grind and gadgets.",
+          "valid if u like \"human who refused to lose\" spiderman: actually relatable, broke, funny mid-fight, still saves the city. more heart less \"i'm darkness\" who's better depends what u mogging on — cool factor vs actually someone u'd wanna be friends with i'm not picking a winner cause both fanbases will cook me 💀 who u riding with and why one line"
+        ]
+      }
+    },
+    {
+      "role": "user",
+      "content": "idk but you yap a lot",
+      "timestamp": "2026-07-07T21:12:57.653686+00:00",
+      "metadata": {
+        "connector": "telegram",
+        "actor_id": "5995349219",
+        "message_id": "4130"
+      }
+    },
+    {
+      "role": "assistant",
+      "content": "fair 💀\n\nwhat u want to talk about",
+      "timestamp": "2026-07-07T21:12:57.653686+00:00",
+      "metadata": {
+        "provider": "supergrok_oauth_dynamic",
+        "delivery_bubbles": [
+          "fair 💀 what u want to talk about"
+        ]
+      }
+    },
+    {
+      "role": "user",
+      "content": "hey",
+      "timestamp": "2026-07-08T08:35:51.809676+00:00",
+      "metadata": {
+        "connector": "telegram",
+        "actor_id": "5995349219",
+        "message_id": "7"
+      }
+    },
+    {
+      "role": "assistant",
+      "content": "yo what's good",
+      "timestamp": "2026-07-08T08:35:51.809676+00:00",
+      "metadata": {
+        "provider": "supergrok_oauth_dynamic",
+        "delivery_bubbles": [
+          "yo what's good"
+        ]
+      }
+    },
+    {
+      "role": "user",
+      "content": "nm what're you upto",
+      "timestamp": "2026-07-08T08:36:09.857506+00:00",
+      "metadata": {
+        "connector": "telegram",
+        "actor_id": "5995349219",
+        "message_id": "9"
+      }
+    },
+    {
+      "role": "assistant",
+      "content": "nm just here when u ping me\n\nu?",
+      "timestamp": "2026-07-08T08:36:09.857506+00:00",
+      "metadata": {
+        "provider": "supergrok_oauth_dynamic",
+        "delivery_bubbles": [
+          "nm just here when u ping me u?"
+        ]
+      }
+    },
+    {
+      "role": "user",
+      "content": "nm what you doing?",
+      "timestamp": "2026-07-08T08:36:22.886598+00:00",
+      "metadata": {
+        "connector": "telegram",
+        "actor_id": "5995349219",
+        "message_id": "11"
+      }
+    },
+    {
+      "role": "assistant",
+      "content": "same — just vibing in the chat til u need something\n\nu bored or u got a thing u wanna do",
+      "timestamp": "2026-07-08T08:36:22.886598+00:00",
+      "metadata": {
+        "provider": "supergrok_oauth_dynamic",
+        "delivery_bubbles": [
+          "same — just vibing in the chat til u need something u bored or u got a thing u wanna do"
+        ]
+      }
+    }
+  ]
+}

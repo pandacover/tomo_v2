@@ -1,0 +1,27 @@
+{
+  "access_token": "eyJ0eXAiOiJhdCtqd3QiLCJhbGciOiJFUzI1NiIsImtpZCI6Im9hdXRoMi1wcm9kdWN0aW9uLTIwMjYtMDItMTkifQ.eyJpc3MiOiJodHRwczovL2F1dGgueC5haSIsInN1YiI6IjYwZWQ3ZDA0LWQ5N2MtNDAxNi04YThiLWZkZjdmMjcwMzI1ZiIsImF1ZCI6ImIxYTAwNDkyLTA3M2EtNDdlYS04MTZmLTRjMzI5MjY0YTgyOCIsImV4cCI6MTc4MzUyMTI1NiwiaWF0IjoxNzgzNDk5NjU2LCJzY29wZSI6Im9wZW5pZCBwcm9maWxlIGVtYWlsIG9mZmxpbmVfYWNjZXNzIGdyb2stY2xpOmFjY2VzcyBhcGk6YWNjZXNzIiwicHJpbmNpcGFsX3R5cGUiOiJVc2VyIiwicHJpbmNpcGFsX2lkIjoiNjBlZDdkMDQtZDk3Yy00MDE2LThhOGItZmRmN2YyNzAzMjVmIiwiY2xpZW50X2lkIjoiYjFhMDA0OTItMDczYS00N2VhLTgxNmYtNGMzMjkyNjRhODI4IiwianRpIjoiNDRlZGYzZGItOGI2NS00NTgzLWE3NzItZWNmY2VmYWUzYmEyIiwidGllciI6MSwidGVhbV9pZCI6IjJkZmRmYWMzLTAyZDEtNGRkMy1iNmFhLTk4Yjg1ODM0ZDg0OCIsInJlZmVycmVyIjoidG9tby1jb3JlIn0.Mv5BBvb9qjcpxwV_lvpfh_OPeWy6-EZjDW_cX_Ep9RynAtLwmPzuISFchTYPq_VHVsA9FPbK-0ZYm4Y3fZjAcg",
+  "token_type": "Bearer",
+  "expires_in": 21600,
+  "refresh_token": "aXVZ5grHsKcj1LkZVPDWC3YutpPgFZTVb7PRzecbsgsb3LbiRaF3B-ooS-CmhLKco9GvVp5btzBRjt9d6jkCfA",
+  "scope": "openid profile email offline_access grok-cli:access api:access",
+  "id_token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzI1NiIsImtpZCI6Im9hdXRoMi1wcm9kdWN0aW9uLTIwMjYtMDItMTkifQ.eyJpc3MiOiJodHRwczovL2F1dGgueC5haSIsInN1YiI6IjYwZWQ3ZDA0LWQ5N2MtNDAxNi04YThiLWZkZjdmMjcwMzI1ZiIsImF1ZCI6ImIxYTAwNDkyLTA3M2EtNDdlYS04MTZmLTRjMzI5MjY0YTgyOCIsImV4cCI6MTc4MzUyMTI1NiwiaWF0IjoxNzgzNDk5NjU2LCJub25jZSI6IiIsImdpdmVuX25hbWUiOiJMdXYiLCJmYW1pbHlfbmFtZSI6IiIsImVtYWlsIjoibHV2bWFraW4wMUBnbWFpbC5jb20iLCJlbWFpbF92ZXJpZmllZCI6dHJ1ZX0.MWrcAYM8wXcd836KkC2Xov5YpzRadKIwyUpribPHBSHrKtihRLtEJqkwTbOvQgzZcB8mtlCmhpYMUjufZpjFCw",
+  "provider": "supergrok",
+  "actor_id": "5995349219",
+  "saved_at": 1783499658,
+  "config": {
+    "provider": "supergrok",
+    "client_id": "b1a00492-073a-47ea-816f-4c329264a828",
+    "auth_url": "https://auth.x.ai/oauth2/authorize",
+    "token_url": "https://auth.x.ai/oauth2/token",
+    "redirect_uri": "http://127.0.0.1:56121/callback",
+    "scopes": [
+      "openid",
+      "profile",
+      "email",
+      "offline_access",
+      "grok-cli:access",
+      "api:access"
+    ],
+    "client_secret": null
+  }
+}
