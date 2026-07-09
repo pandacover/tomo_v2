@@ -146,6 +146,12 @@ class TelegramOnboardingStore:
                     select 1 from telegram_inbox as active
                     where active.chat_id = candidate.chat_id and active.status = 'processing'
                   )
+                  and not exists (
+                    select 1 from telegram_inbox as earlier
+                    where earlier.chat_id = candidate.chat_id
+                      and earlier.update_id < candidate.update_id
+                      and earlier.status != 'completed'
+                  )
                 order by available_at, update_id
                 limit 1
                 """,

@@ -20,6 +20,7 @@ from .sandbox_inbound import SandboxInboundError, emit_failure, run_once
 from .telegram import TelegramDeliverySink
 from .telegram_bot import TelegramBotApiClient, TelegramPollingBot
 from .onboarding_store import TelegramOnboardingStore
+from .telegram_router import TelegramUpdateRouter
 from .shared_gateway import SharedTelegramGateway
 
 
@@ -178,13 +179,12 @@ def run_shared_gateway_foreground(args: argparse.Namespace) -> int:
         instances = RuntimeInstanceRegistry(args.data_dir, provider_factory, client, soul_path=args.soul)
         gateway = SharedTelegramGateway(client=client, store=store, instances=instances)
         print("shared telegram gateway polling started. press ctrl+c to stop.")
-        offset = None
-        while True:
-            for update in client.get_updates(offset=offset, timeout=args.poll_timeout):
-                if "update_id" in update:
-                    offset = int(update["update_id"]) + 1
-                gateway.process_update(update)
-            time.sleep(0.2)
+        TelegramUpdateRouter(
+            client=client,
+            store=store,
+            process_update=gateway.process_update,
+            poll_timeout=args.poll_timeout,
+        ).run_forever()
     finally:
         if _read_pid(pid_path) == os.getpid():
             pid_path.unlink(missing_ok=True)

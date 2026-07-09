@@ -119,21 +119,23 @@ class TelegramPollingBot:
         for update in updates:
             if "update_id" in update:
                 next_offset = int(update["update_id"]) + 1
-            if self._handle_connect_update(update):
-                continue
-            envelope = envelope_from_update(update)
-            if envelope is None:
-                continue
-            if self.runtime is None:
-                continue
-            try:
-                self.runtime.handle_telegram_text(envelope)
-            except Exception as exc:
-                if self.on_error:
-                    self.on_error(exc)
-                else:
-                    raise
+            self.process_update(update)
         return next_offset
+
+    def process_update(self, update: dict[str, Any]) -> None:
+        """Process one already-received update; local polling calls this directly."""
+        if self._handle_connect_update(update):
+            return
+        envelope = envelope_from_update(update)
+        if envelope is None or self.runtime is None:
+            return
+        try:
+            self.runtime.handle_telegram_text(envelope)
+        except Exception as exc:
+            if self.on_error:
+                self.on_error(exc)
+            else:
+                raise
 
     def _handle_connect_update(self, update: dict[str, Any]) -> bool:
         if "callback_query" in update:
