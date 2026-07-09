@@ -1,5 +1,6 @@
-import { getAuth } from '../../../../lib/auth';
-import { dashboardEnv, requireDashboardEnv } from '../../../../lib/env';
+import { NextResponse } from 'next/server';
+import { getAuth } from '@/lib/auth';
+import { dashboardEnv, requireDashboardEnv } from '@/lib/env';
 
 export const GET = async (request: Request): Promise<Response> => {
   const auth = await getAuth();
@@ -8,7 +9,7 @@ export const GET = async (request: Request): Promise<Response> => {
 
   if (!session?.user?.id) {
     const next = encodeURIComponent('/api/onboarding/telegram');
-    return Response.redirect(`${url.origin}/login?next=${next}`, 302);
+    return NextResponse.redirect(`${url.origin}/login?next=${next}`, 302);
   }
 
   const response = await fetch(`${dashboardEnv.controlApiUrl}/v1/onboarding/telegram/install-link`, {
@@ -29,5 +30,6 @@ export const GET = async (request: Request): Promise<Response> => {
   if (!payload.dmUrl) {
     return new Response('telegram onboarding failed: missing telegram deeplink', { status: 502 });
   }
-  return Response.redirect(payload.dmUrl, 302);
+
+  return NextResponse.redirect(payload.dmUrl, 302);
 };

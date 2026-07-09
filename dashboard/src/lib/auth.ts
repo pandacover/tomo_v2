@@ -4,16 +4,14 @@ import { dash } from '@better-auth/infra';
 import { betterAuth } from 'better-auth';
 import { dashboardEnv, requireDashboardEnv } from './env';
 
-type Auth = ReturnType<typeof betterAuth>;
+type SqliteDatabase = unknown;
 
-let authPromise: Promise<Auth> | undefined;
+let authPromise: ReturnType<typeof createAuth> | undefined;
 
-export function getAuth(): Promise<Auth> {
+export function getAuth() {
   authPromise ??= createAuth();
   return authPromise;
 }
-
-type SqliteDatabase = unknown;
 
 async function openAuthDatabase(dbPath: string): Promise<SqliteDatabase> {
   if (typeof Bun !== 'undefined') {
@@ -21,27 +19,24 @@ async function openAuthDatabase(dbPath: string): Promise<SqliteDatabase> {
     return new Database(dbPath, { create: true });
   }
 
-  const [majorRaw, minorRaw] = process.versions.node.split('.');
-  const major = Number(majorRaw);
-  const minor = Number(minorRaw ?? 0);
-  if (major > 22 || (major === 22 && minor >= 5)) {
-    const { DatabaseSync } = await import('node:sqlite');
-    return new DatabaseSync(dbPath);
-  }
-
-  const { default: Database } = await import('better-sqlite3');
-  return new Database(dbPath);
+  const { DatabaseSync } = await import('node:sqlite');
+  return new DatabaseSync(dbPath);
 }
 
-async function createAuth(): Promise<Auth> {
+async function createAuth() {
   fs.mkdirSync(path.dirname(dashboardEnv.authDbPath), { recursive: true });
-  const database = await openAuthDatabase(dashboardEnv.authDbPath);
+
   const hostedAuth = !/localhost|127\.0\.0\.1/i.test(dashboardEnv.betterAuthUrl);
+  const dashPlugin = hostedAuth
+    ? dash({ apiKey: requireDashboardEnv('betterAuthApiKey') })
+    : dashboardEnv.betterAuthApiKey
+      ? dash({ apiKey: dashboardEnv.betterAuthApiKey })
+      : undefined;
 
   return betterAuth({
     secret: requireDashboardEnv('betterAuthSecret'),
     baseURL: dashboardEnv.betterAuthUrl,
-    database,
+    database: await openAuthDatabase(dashboardEnv.authDbPath),
     emailAndPassword: {
       enabled: true,
       autoSignIn: true,
@@ -57,7 +52,7 @@ async function createAuth(): Promise<Auth> {
           },
         }
       : {}),
-    plugins: dashboardEnv.betterAuthApiKey ? [dash({ apiKey: dashboardEnv.betterAuthApiKey })] : [],
+    plugins: dashPlugin ? [dashPlugin] : [],
   });
 }
 

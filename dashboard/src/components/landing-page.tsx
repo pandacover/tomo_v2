@@ -1,4 +1,4 @@
-import { features, principles } from '../lib/landing-content';
+import { features, principles } from '@/lib/landing-content';
 import { FeatureRow } from './feature-row';
 import { FloatingGlyphs } from './floating-glyphs';
 import { LandingHero } from './landing-hero';

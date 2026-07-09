@@ -1,4 +1,4 @@
-@import 'tailwindcss';
+@import "tailwindcss";
 
 @theme {
   --color-tomo-paper: #ffffff;
@@ -7,8 +7,8 @@
   --color-tomo-soft: #f3f3f4;
   --spacing-tomo-gutter: 24px;
   --spacing-tomo-container: 1120px;
-  --font-heading: geist, ui-sans-serif, system-ui, sans-serif;
-  --font-body: geist, ui-sans-serif, system-ui, sans-serif;
+  --font-heading: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-body: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
 }
 
 :root {

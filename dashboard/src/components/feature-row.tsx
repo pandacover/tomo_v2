@@ -1,9 +1,10 @@
-import type { features } from '../lib/landing-content';
+import type { features } from '@/lib/landing-content';
 
 type Feature = (typeof features)[number];
 
 type FeatureRowProps = Feature & {
   className?: string;
+  reverse?: boolean;
 };
 
 const edgeClass = {

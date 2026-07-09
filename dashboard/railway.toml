@@ -2,7 +2,7 @@
 buildCommand = "bun install && bun run build"
 
 [deploy]
-startCommand = "bun run start -- --host 0.0.0.0 --port $PORT"
+startCommand = "bun run start -- -H 0.0.0.0 -p $PORT"
 healthcheckPath = "/"
 healthcheckTimeout = 30
 restartPolicyType = "ON_FAILURE"

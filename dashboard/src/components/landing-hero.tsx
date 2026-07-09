@@ -1,4 +1,4 @@
-import { hero } from '../lib/landing-content';
+import { hero } from '@/lib/landing-content';
 
 export const LandingHero = () => {
   return (

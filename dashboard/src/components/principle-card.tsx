@@ -1,4 +1,4 @@
-import type { principles } from '../lib/landing-content';
+import type { principles } from '@/lib/landing-content';
 
 type Principle = (typeof principles)[number];
 

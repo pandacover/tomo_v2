@@ -1,7 +1,7 @@
 'use client';
 
-import { useMemo, useState } from 'react';
-import { authClient } from '../lib/auth-client';
+import { useState } from 'react';
+import { authClient } from '@/lib/auth-client';
 
 type LoginFormProps = { next?: string };
 
@@ -11,7 +11,7 @@ export function LoginForm({ next = '/api/onboarding/telegram' }: LoginFormProps)
   const [password, setPassword] = useState('');
   const [name, setName] = useState('');
   const [error, setError] = useState<string | null>(null);
-  const callbackURL = useMemo(() => next || '/api/onboarding/telegram', [next]);
+  const callbackURL = next || '/api/onboarding/telegram';
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
@@ -25,7 +25,7 @@ export function LoginForm({ next = '/api/onboarding/telegram' }: LoginFormProps)
   return (
     <form onSubmit={submit} className="mx-auto flex max-w-md flex-col gap-4 rounded-[2rem] border border-tomo-ink/10 bg-white/70 p-8 shadow-xl backdrop-blur">
       <h1 className="font-heading text-4xl font-black text-tomo-ink">text tomo</h1>
-      <p className="text-sm text-tomo-ink/70">sign in first, then we'll open telegram and bind your chat.</p>
+      <p className="text-sm text-tomo-ink/70">sign in first, then we&apos;ll open telegram and bind your chat.</p>
       {mode === 'signup' ? (
         <input className="rounded-full border px-4 py-3" value={name} onChange={(e) => setName(e.target.value)} placeholder="name" />
       ) : null}
