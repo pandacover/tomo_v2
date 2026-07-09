@@ -22,6 +22,12 @@ class SandboxHandle:
 
 
 @dataclass(frozen=True)
+class VolumeHandle:
+    id: str
+    name: str
+
+
+@dataclass(frozen=True)
 class ExecResult:
     exit_code: int
     output: str
@@ -36,6 +42,12 @@ class DaytonaClient:
 
     def volume(self, volume_id: str, mount_path: str, *, subpath: str | None = None) -> VolumeMount:
         return VolumeMount(volume_id=volume_id, mount_path=mount_path, subpath=subpath)
+
+    def get_volume(self, name: str) -> VolumeHandle:
+        return self._volume_handle("get_volume", lambda: self._client.volume.get(name))
+
+    def create_volume(self, name: str) -> VolumeHandle:
+        return self._volume_handle("create_volume", lambda: self._client.volume.create(name=name))
 
     def create_snapshot(self, name: str, snapshot: str, volume_id: str, mount_path: str) -> SandboxHandle:
         params = CreateSandboxFromSnapshotParams(
@@ -62,6 +74,10 @@ class DaytonaClient:
     def _handle(self, operation: str, action: Any) -> SandboxHandle:
         sandbox = self._run(operation, action)
         return SandboxHandle(id=sandbox.id, name=sandbox.name, _sandbox=sandbox)
+
+    def _volume_handle(self, operation: str, action: Any) -> VolumeHandle:
+        volume = self._run(operation, action)
+        return VolumeHandle(id=volume.id, name=volume.name)
 
     def _run(self, operation: str, action: Any) -> Any:
         try:

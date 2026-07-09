@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import Mock
 
-from tomo_core.daytona_client import DaytonaClient, DaytonaClientError, SandboxHandle
+from tomo_core.daytona_client import DaytonaClient, DaytonaClientError, SandboxHandle, VolumeHandle
 
 
 class DaytonaClientTests(unittest.TestCase):
@@ -51,6 +51,19 @@ class DaytonaClientTests(unittest.TestCase):
         self.assertEqual(mount.volume_id, "volume-123")
         self.assertEqual(mount.mount_path, "/workspace")
         self.assertEqual(mount.subpath, "project")
+
+    def test_get_and_create_volume_return_safe_handles(self):
+        self.sdk.volume.get.return_value.id = "volume-123"
+        self.sdk.volume.get.return_value.name = "agent-data"
+        self.sdk.volume.create.return_value.id = "volume-456"
+        self.sdk.volume.create.return_value.name = "other-data"
+
+        existing = self.client.get_volume("agent-data")
+        created = self.client.create_volume("other-data")
+
+        self.assertEqual(existing, VolumeHandle("volume-123", "agent-data"))
+        self.assertEqual(created, VolumeHandle("volume-456", "other-data"))
+        self.sdk.volume.create.assert_called_once_with(name="other-data")
 
     def test_errors_are_typed_and_do_not_expose_command_or_secrets(self):
         self.sandbox.process.exec.side_effect = RuntimeError("token=sensitive-value")
