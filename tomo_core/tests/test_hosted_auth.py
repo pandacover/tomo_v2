@@ -75,6 +75,17 @@ class HostedGrokAuthTests(unittest.TestCase):
             self.assertGreater(saved["expires_at"], int(time.time()))
             self.assertEqual(post.call_args.kwargs["data"]["client_id"], "b1a00492-073a-47ea-816f-4c329264a828")
 
+    def test_access_token_bootstraps_the_explicit_host_data_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            auth_path = Path(tmp) / "hosted" / "supergrok.json"
+            encoded = base64.b64encode(json.dumps({"access_token": "fresh"}).encode()).decode()
+
+            with patch.dict(os.environ, {"TOMO_SUPERGROK_OAUTH_JSON_B64": encoded}, clear=True):
+                token = HostedGrokAuth.from_environment(auth_path=auth_path).access_token()
+
+            self.assertEqual(token, "fresh")
+            self.assertTrue(auth_path.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

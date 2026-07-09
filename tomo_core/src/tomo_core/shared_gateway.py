@@ -41,6 +41,36 @@ class TelegramRuntimeDispatch:
 
 
 @dataclass
+class HostedTelegramRuntimeDispatch:
+    """Keeps Telegram delivery on Railway while executing turns in Daytona."""
+
+    client: TelegramClient
+    supervisor: Any
+    sandbox_dispatch: Any
+
+    def send_setup(self, chat_id: str, tomo_id: str, reply_to_message_id: str) -> None:
+        self.client.send_message(chat_id, "tomo is setting up.", reply_to_message_id=reply_to_message_id)
+
+    def ensure_worker(self, tomo_id: str) -> None:
+        self.supervisor.reconcile(tomo_id)
+
+    def send_connected(self, chat_id: str, reply_to_message_id: str) -> None:
+        self.client.send_message(chat_id, "tomo is connected. text me.", reply_to_message_id=reply_to_message_id)
+
+    def send_retry(self, chat_id: str, reply_to_message_id: str) -> None:
+        self.client.send_message(chat_id, "tomo is still setting up. try again in a moment.", reply_to_message_id=reply_to_message_id)
+
+    def dispatch(self, installation, envelope: InboundEnvelope) -> None:
+        request_id = f"telegram:{installation.chat_id}:{envelope.message_id}"
+        for bubble in self.sandbox_dispatch(installation.tomo_id, request_id, envelope):
+            self.client.send_message(
+                installation.chat_id,
+                bubble.text,
+                reply_to_message_id=bubble.reply_to_message_id,
+            )
+
+
+@dataclass
 class _BoundChatTelegramClient:
     client: TelegramClient
     chat_id: str

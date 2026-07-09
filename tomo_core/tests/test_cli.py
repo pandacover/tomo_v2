@@ -22,7 +22,7 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with patch("subprocess.Popen") as popen, patch("tomo_core.cli._pid_is_running", return_value=False):
                 popen.return_value.pid = 12345
-                code = main(["telegram-shared", "start", "--token", "token", "--data-dir", tmp, "--background"])
+                code = main(["telegram-shared", "start", "--token", "token", "--data-dir", tmp, "--static-response", "test", "--background"])
                 self.assertEqual(code, 0)
                 popen.assert_called_once()
                 self.assertEqual((Path(tmp) / "telegram_shared.pid").read_text(encoding="utf-8"), "12345")
@@ -35,9 +35,17 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with patch("subprocess.Popen") as popen, patch("tomo_core.cli._pid_is_running", return_value=False):
                 popen.return_value.pid = 67890
-                code = main(["telegram-shared", "restart", "--token", "token", "--data-dir", tmp])
+                code = main(["telegram-shared", "restart", "--token", "token", "--data-dir", tmp, "--static-response", "test"])
         self.assertEqual(code, 0)
         popen.assert_called_once()
+
+    def test_telegram_shared_production_mode_fails_closed_without_hosted_dependencies(self):
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(main(["telegram-shared", "start", "--token", "token"]), 2)
+
+    def test_telegram_shared_ignores_static_response_environment_without_explicit_flag(self):
+        with patch.dict("os.environ", {"TOMO_CORE_STATIC_RESPONSE": "test"}, clear=True):
+            self.assertEqual(main(["telegram-shared", "start", "--token", "token"]), 2)
 
     def test_sandbox_inbound_uses_only_the_supergrok_access_token_and_daytona_data_dir(self):
         token = "supergrok-access-token"

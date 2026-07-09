@@ -11,6 +11,9 @@ from pathlib import Path
 import uvicorn
 
 from .instances import RuntimeInstanceRegistry
+from .daytona_client import DaytonaClient
+from .daytona_supervisor import DaytonaSupervisor
+from .hosted_auth import HostedGrokAuth
 from .models import RuntimeConfig
 from .oauth import OAuthManager
 from .grok_auth import GrokAuthStore
@@ -22,6 +25,9 @@ from .telegram_bot import TelegramBotApiClient, TelegramPollingBot
 from .onboarding_store import TelegramOnboardingStore
 from .telegram_router import TelegramUpdateRouter
 from .shared_gateway import SharedTelegramGateway
+from .shared_gateway import HostedTelegramRuntimeDispatch
+from .sandbox_dispatch import SandboxDispatch
+from .sandbox_registry import SandboxRegistry
 
 
 def build_provider(args: argparse.Namespace, oauth: OAuthManager):
@@ -128,8 +134,9 @@ def _append_arg(argv: list[str], name: str, value: object | None) -> None:
 
 
 def start_shared_gateway_background(args: argparse.Namespace) -> int:
-    if not args.token:
-        print("missing TOMO_TELEGRAM_GLOBAL_BOT_TOKEN or --token.", file=sys.stderr)
+    missing = _missing_shared_gateway_configuration(args)
+    if missing:
+        print(f"missing shared hosted gateway configuration: {', '.join(missing)}", file=sys.stderr)
         return 2
     pid_path = _shared_pid_path(args.data_dir)
     existing_pid = _read_pid(pid_path)
@@ -163,21 +170,26 @@ def start_shared_gateway_background(args: argparse.Namespace) -> int:
 
 
 def run_shared_gateway_foreground(args: argparse.Namespace) -> int:
-    if not args.token:
-        print("missing TOMO_TELEGRAM_GLOBAL_BOT_TOKEN or --token.", file=sys.stderr)
+    missing = _missing_shared_gateway_configuration(args)
+    if missing:
+        print(f"missing shared hosted gateway configuration: {', '.join(missing)}", file=sys.stderr)
         return 2
     pid_path = _shared_pid_path(args.data_dir)
     pid_path.write_text(str(os.getpid()), encoding="utf-8")
     try:
         client = TelegramBotApiClient(token=args.token)
-        oauth = build_oauth_manager(args)
-
-        def provider_factory(_tomo_id: str):
-            return build_provider(args, oauth)
-
         store = TelegramOnboardingStore(args.data_dir)
-        instances = RuntimeInstanceRegistry(args.data_dir, provider_factory, client, soul_path=args.soul)
-        gateway = SharedTelegramGateway(client=client, store=store, instances=instances)
+        if args.static_response:
+            instances = RuntimeInstanceRegistry(args.data_dir, lambda _: StaticProvider(args.static_response), client, soul_path=args.soul)
+            gateway = SharedTelegramGateway(client=client, store=store, instances=instances)
+        else:
+            auth = HostedGrokAuth.from_environment(auth_path=Path(args.data_dir) / "supergrok_auth.json")
+            auth.bootstrap()
+            registry = SandboxRegistry(args.data_dir)
+            daytona = DaytonaClient()
+            supervisor = DaytonaSupervisor(registry, daytona, snapshot=os.environ["TOMO_DAYTONA_SNAPSHOT_NAME"])
+            dispatch = HostedTelegramRuntimeDispatch(client, supervisor, SandboxDispatch(registry, daytona, auth.access_token).dispatch)
+            gateway = SharedTelegramGateway(client=client, store=store, dispatch=dispatch)
         print("shared telegram gateway polling started. press ctrl+c to stop.")
         TelegramUpdateRouter(
             client=client,
@@ -188,6 +200,18 @@ def run_shared_gateway_foreground(args: argparse.Namespace) -> int:
     finally:
         if _read_pid(pid_path) == os.getpid():
             pid_path.unlink(missing_ok=True)
+
+
+def _missing_shared_gateway_configuration(args: argparse.Namespace) -> list[str]:
+    if args.static_response:
+        return [] if args.token else ["TOMO_TELEGRAM_GLOBAL_BOT_TOKEN or --token"]
+    required = {
+        "DAYTONA_API_KEY": os.getenv("DAYTONA_API_KEY"),
+        "TOMO_DAYTONA_SNAPSHOT_NAME": os.getenv("TOMO_DAYTONA_SNAPSHOT_NAME"),
+        "TOMO_SUPERGROK_OAUTH_JSON_B64": os.getenv("TOMO_SUPERGROK_OAUTH_JSON_B64"),
+        "TOMO_TELEGRAM_GLOBAL_BOT_TOKEN or --token": args.token,
+    }
+    return [name for name, value in required.items() if not value]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -234,7 +258,7 @@ def main(argv: list[str] | None = None) -> int:
     shared_start.add_argument("--supergrok-client-secret", default=None)
     shared_start.add_argument("--google-client-id", default=None)
     shared_start.add_argument("--google-client-secret", default=None)
-    shared_start.add_argument("--static-response", default=os.getenv("TOMO_CORE_STATIC_RESPONSE"))
+    shared_start.add_argument("--static-response")
     shared_start.add_argument("--poll-timeout", type=int, default=30)
     shared_start.add_argument("--background", action="store_true", help="start poller in the background and return")
 
@@ -253,7 +277,7 @@ def main(argv: list[str] | None = None) -> int:
     shared_restart.add_argument("--supergrok-client-secret", default=None)
     shared_restart.add_argument("--google-client-id", default=None)
     shared_restart.add_argument("--google-client-secret", default=None)
-    shared_restart.add_argument("--static-response", default=os.getenv("TOMO_CORE_STATIC_RESPONSE"))
+    shared_restart.add_argument("--static-response")
     shared_restart.add_argument("--poll-timeout", type=int, default=30)
 
     sandbox = sub.add_parser("sandbox", help="sandbox runtime commands")

@@ -55,10 +55,14 @@ class HostedGrokAuth:
     auth_path: Path
 
     @classmethod
-    def from_environment(cls) -> HostedGrokAuth:
+    def from_environment(cls, *, auth_path: Path | None = None) -> HostedGrokAuth:
         return cls(
-            encoded_auth=os.getenv("TOMO_GROK_AUTH_B64") or os.getenv("GROK_AUTH_B64"),
-            auth_path=default_grok_auth_path(),
+            encoded_auth=(
+                os.getenv("TOMO_SUPERGROK_OAUTH_JSON_B64")
+                or os.getenv("TOMO_GROK_AUTH_B64")
+                or os.getenv("GROK_AUTH_B64")
+            ),
+            auth_path=auth_path or default_grok_auth_path(),
         )
 
     def bootstrap(self) -> bool:
@@ -75,6 +79,15 @@ class HostedGrokAuth:
         if self._refresh_if_needed(current):
             self._write_auth(current)
         return True
+
+    def access_token(self) -> str:
+        """Refresh and return the host-held token immediately before sandbox use."""
+        if not self.bootstrap():
+            raise RuntimeError("hosted access token unavailable")
+        token = _token_payload(self._read_auth())
+        if token is None or not isinstance(token.get("access_token"), str) or not token["access_token"]:
+            raise RuntimeError("hosted access token unavailable")
+        return token["access_token"]
 
     def _decode(self) -> dict[str, Any]:
         try:

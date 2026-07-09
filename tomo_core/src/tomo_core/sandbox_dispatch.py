@@ -9,7 +9,6 @@ from threading import Lock
 from typing import Callable
 
 from .daytona_client import DaytonaClient, DaytonaClientError
-from .grok_auth import GrokAuthStore
 from .hosted_auth import HostedGrokAuth
 from .models import InboundEnvelope, OutboundBubble
 from .sandbox_protocol import encode_inbound
@@ -89,8 +88,4 @@ class SandboxDispatch:
 
 def _fresh_hosted_access_token() -> str:
     """Refresh the host-managed credential immediately before a sandbox turn."""
-    HostedGrokAuth.from_environment().bootstrap()
-    token = GrokAuthStore().access_token()
-    if not token:
-        raise RuntimeError("hosted access token unavailable")
-    return token
+    return HostedGrokAuth.from_environment().access_token()

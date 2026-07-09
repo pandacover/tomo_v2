@@ -1,11 +1,13 @@
 import tempfile
 import unittest
 from contextlib import contextmanager
+from unittest.mock import Mock
 
 from tomo_core.instances import RuntimeInstanceRegistry
+from tomo_core.models import InboundEnvelope, OutboundBubble
 from tomo_core.onboarding_store import TelegramOnboardingStore
 from tomo_core.providers import StaticProvider
-from tomo_core.shared_gateway import SharedTelegramGateway, TelegramRuntimeDispatch
+from tomo_core.shared_gateway import HostedTelegramRuntimeDispatch, SharedTelegramGateway, TelegramRuntimeDispatch
 from tomo_core.telegram import FakeTelegramClient
 
 
@@ -102,6 +104,26 @@ class SharedGatewayTests(unittest.TestCase):
             self.assertEqual(client.sent_messages[-1]["actor_id"], "123")
             session = instances.get(installation.tomo_id).sessions.load("telegram:actor:999")
             self.assertEqual(session.model_history()[-2]["content"], "hi")
+
+    def test_hosted_runtime_dispatch_reconciles_and_sends_sandbox_bubbles_to_installation_chat(self):
+        with self._store() as store:
+            installation = self._installation(store, chat_id="123", actor_id="999")
+            client = FakeTelegramClient()
+            supervisor = Mock()
+            sandbox = Mock(return_value=[OutboundBubble("first", "2"), OutboundBubble("second")])
+            dispatch = HostedTelegramRuntimeDispatch(client, supervisor, sandbox)
+
+            dispatch.send_setup("123", installation.tomo_id, "1")
+            dispatch.ensure_worker(installation.tomo_id)
+            dispatch.send_connected("123", "1")
+            dispatch.send_retry("123", "1")
+            dispatch.dispatch(installation, InboundEnvelope("telegram", "999", "2", "hello"))
+
+            supervisor.reconcile.assert_called_once_with(installation.tomo_id)
+            sandbox.assert_called_once()
+            self.assertEqual([message["actor_id"] for message in client.sent_messages], ["123", "123", "123", "123", "123"])
+            self.assertEqual([message["text"] for message in client.sent_messages], ["tomo is setting up.", "tomo is connected. text me.", "tomo is still setting up. try again in a moment.", "first", "second"])
+            self.assertEqual(client.sent_messages[-2]["reply_to_message_id"], "2")
 
     @staticmethod
     @contextmanager
