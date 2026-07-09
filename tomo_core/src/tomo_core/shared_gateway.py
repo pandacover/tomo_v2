@@ -10,10 +10,60 @@ from .telegram import TelegramClient
 
 
 @dataclass
+class TelegramRuntimeDispatch:
+    """Delivers a trusted Telegram chat's work to its personal runtime."""
+
+    client: TelegramClient
+    instances: RuntimeInstanceRegistry
+
+    def send_setup(self, chat_id: str, tomo_id: str, reply_to_message_id: str) -> None:
+        self.client.send_message(chat_id, "tomo is setting up.", reply_to_message_id=reply_to_message_id)
+
+    def ensure_worker(self, tomo_id: str) -> None:
+        self.instances.get(tomo_id)
+
+    def send_connected(self, chat_id: str, reply_to_message_id: str) -> None:
+        self.client.send_message(chat_id, "tomo is connected. text me.", reply_to_message_id=reply_to_message_id)
+
+    def send_retry(self, chat_id: str, reply_to_message_id: str) -> None:
+        self.client.send_message(chat_id, "tomo is still setting up. try again in a moment.", reply_to_message_id=reply_to_message_id)
+
+    def dispatch(self, installation, envelope: InboundEnvelope) -> None:
+        runtime = self.instances.get(installation.tomo_id)
+        # A runtime session belongs to the Telegram sender, but Railway delivery
+        # must remain pinned to the installation's trusted chat.
+        original_client = runtime.telegram.client
+        runtime.telegram.client = _BoundChatTelegramClient(self.client, installation.chat_id)
+        try:
+            runtime.handle_telegram_text(envelope)
+        finally:
+            runtime.telegram.client = original_client
+
+
+@dataclass
+class _BoundChatTelegramClient:
+    client: TelegramClient
+    chat_id: str
+
+    def send_typing(self, actor_id: str) -> None:
+        self.client.send_typing(self.chat_id)
+
+    def send_message(self, actor_id: str, text: str, reply_to_message_id: str | None = None) -> None:
+        self.client.send_message(self.chat_id, text, reply_to_message_id=reply_to_message_id)
+
+
+@dataclass
 class SharedTelegramGateway:
     client: TelegramClient
     store: TelegramOnboardingStore
-    instances: RuntimeInstanceRegistry
+    instances: RuntimeInstanceRegistry | None = None
+    dispatch: TelegramRuntimeDispatch | None = None
+
+    def __post_init__(self) -> None:
+        if self.dispatch is None:
+            if self.instances is None:
+                raise ValueError("SharedTelegramGateway requires a TelegramRuntimeDispatch")
+            self.dispatch = TelegramRuntimeDispatch(client=self.client, instances=self.instances)
 
     def process_update(self, update: dict[str, Any]) -> bool:
         message = update.get("message")
@@ -36,15 +86,24 @@ class SharedTelegramGateway:
             self.client.send_message(chat_id, "open tomo from the dashboard first, then press start here.", reply_to_message_id=message_id)
             return True
 
-        runtime = self.instances.get(installation.tomo_id)
-        runtime.handle_telegram_text(
+        if installation.actor_id != actor_id:
+            self.client.send_message(chat_id, "open tomo from the dashboard first, then press start here.", reply_to_message_id=message_id)
+            return True
+
+        self.dispatch.dispatch(
+            installation,
             InboundEnvelope(
                 connector="telegram",
-                actor_id=chat_id,
+                actor_id=actor_id,
                 message_id=message_id,
                 text=text,
-                native_metadata={"chat_id": chat_id, "from_id": actor_id, "tomo_id": installation.tomo_id},
-            )
+                native_metadata={
+                    "chat_id": chat_id,
+                    "delivery_chat_id": installation.chat_id,
+                    "from_id": actor_id,
+                    "tomo_id": installation.tomo_id,
+                },
+            ),
         )
         return True
 
@@ -57,6 +116,12 @@ class SharedTelegramGateway:
         if installation is None:
             self.client.send_message(chat_id, "that tomo link expired. tap text tomo on the dashboard again.", reply_to_message_id=message_id)
             return True
-        self.instances.get(installation.tomo_id)
-        self.client.send_message(chat_id, "tomo is connected. text me.", reply_to_message_id=message_id)
+        self.dispatch.send_setup(chat_id, installation.tomo_id, message_id)
+        try:
+            self.dispatch.ensure_worker(installation.tomo_id)
+        except Exception:
+            # The installation is intentionally retained so a retry can resume setup.
+            self.dispatch.send_retry(chat_id, message_id)
+            return True
+        self.dispatch.send_connected(chat_id, message_id)
         return True
