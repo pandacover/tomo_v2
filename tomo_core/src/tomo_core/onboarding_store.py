@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import secrets
 import sqlite3
 import time
@@ -23,6 +24,19 @@ class TelegramInstallation:
     chat_id: str
     actor_id: str
     installed_at: int
+
+
+@dataclass(frozen=True)
+class TelegramInboxUpdate:
+    update_id: int
+    chat_id: str
+    payload: str
+    status: str
+    attempts: int
+    available_at: int
+    error_code: str | None
+    created_at: int
+    updated_at: int
 
 
 class TelegramOnboardingStore:
@@ -101,6 +115,120 @@ class TelegramOnboardingStore:
         finally:
             db.close()
 
+    def enqueue_update(self, update_id: int, chat_id: str, payload: str, *, now: int | None = None) -> bool:
+        now = int(time.time()) if now is None else now
+        db = self._connect()
+        try:
+            result = db.execute(
+                """
+                insert into telegram_inbox(
+                  update_id, chat_id, payload, status, attempts, available_at, error_code, created_at, updated_at
+                ) values (?, ?, ?, 'pending', 0, ?, null, ?, ?)
+                on conflict(update_id) do nothing
+                """,
+                (update_id, chat_id, payload, now, now, now),
+            )
+            db.commit()
+            return result.rowcount == 1
+        finally:
+            db.close()
+
+    def claim_next_update(self, *, now: int | None = None) -> TelegramInboxUpdate | None:
+        now = int(time.time()) if now is None else now
+        db = self._connect()
+        try:
+            db.execute("begin immediate")
+            row = db.execute(
+                """
+                select * from telegram_inbox as candidate
+                where status = 'pending' and available_at <= ?
+                  and not exists (
+                    select 1 from telegram_inbox as active
+                    where active.chat_id = candidate.chat_id and active.status = 'processing'
+                  )
+                order by available_at, update_id
+                limit 1
+                """,
+                (now,),
+            ).fetchone()
+            if row is None:
+                db.commit()
+                return None
+            db.execute(
+                """
+                update telegram_inbox
+                set status = 'processing', attempts = attempts + 1, updated_at = ?
+                where update_id = ?
+                """,
+                (now, row["update_id"]),
+            )
+            db.commit()
+            return TelegramInboxUpdate(
+                update_id=int(row["update_id"]),
+                chat_id=row["chat_id"],
+                payload=row["payload"],
+                status="processing",
+                attempts=int(row["attempts"]) + 1,
+                available_at=int(row["available_at"]),
+                error_code=row["error_code"],
+                created_at=int(row["created_at"]),
+                updated_at=now,
+            )
+        finally:
+            db.close()
+
+    def complete_update(self, update_id: int, *, now: int | None = None) -> None:
+        now = int(time.time()) if now is None else now
+        db = self._connect()
+        try:
+            db.execute(
+                """
+                update telegram_inbox set status = 'completed', error_code = null, updated_at = ?
+                where update_id = ? and status = 'processing'
+                """,
+                (now, update_id),
+            )
+            db.commit()
+        finally:
+            db.close()
+
+    def retry_update(self, update_id: int, error_code: str, *, now: int | None = None) -> None:
+        now = int(time.time()) if now is None else now
+        db = self._connect()
+        try:
+            row = db.execute(
+                "select attempts from telegram_inbox where update_id = ? and status = 'processing'", (update_id,)
+            ).fetchone()
+            if row is not None:
+                delay = min(300, 2 ** (int(row["attempts"]) - 1))
+                db.execute(
+                    """
+                    update telegram_inbox
+                    set status = 'pending', available_at = ?, error_code = ?, updated_at = ?
+                    where update_id = ? and status = 'processing'
+                    """,
+                    (now + delay, self._safe_error_code(error_code), now, update_id),
+                )
+                db.commit()
+        finally:
+            db.close()
+
+    def reset_interrupted_updates(self, *, now: int | None = None) -> int:
+        now = int(time.time()) if now is None else now
+        db = self._connect()
+        try:
+            result = db.execute(
+                """
+                update telegram_inbox set status = 'pending', available_at = ?, updated_at = ?
+                where status = 'processing'
+                """,
+                (now, now),
+            )
+            db.commit()
+            return result.rowcount
+        finally:
+            db.close()
+
     def _init_db(self) -> None:
         db = sqlite3.connect(self.db_path)
         db.row_factory = sqlite3.Row
@@ -124,6 +252,23 @@ class TelegramOnboardingStore:
                   installed_at integer not null
                 )
             """)
+            db.execute("""
+                create table if not exists telegram_inbox(
+                  update_id integer primary key,
+                  chat_id text not null,
+                  payload text not null,
+                  status text not null check(status in ('pending', 'processing', 'completed')),
+                  attempts integer not null default 0,
+                  available_at integer not null,
+                  error_code text,
+                  created_at integer not null,
+                  updated_at integer not null
+                )
+            """)
+            db.execute("""
+                create index if not exists telegram_inbox_pending_idx
+                on telegram_inbox(status, available_at, update_id)
+            """)
         finally:
             db.close()
 
@@ -141,3 +286,8 @@ class TelegramOnboardingStore:
         suffix = hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:10]
         safe_user = "".join(ch if ch.isalnum() else "-" for ch in user_id.lower()).strip("-")[:32] or "user"
         return f"tomo-{safe_user}-{suffix}"
+
+    @staticmethod
+    def _safe_error_code(error_code: str) -> str:
+        normalized = re.sub(r"[^a-z0-9]+", "_", error_code.lower()).strip("_")
+        return normalized[:64] or "unknown_error"
