@@ -27,9 +27,9 @@ export const GET = async (request: Request): Promise<Response> => {
   }
 
   const payload = await response.json() as { dmUrl?: string; browserUrl?: string };
-  if (!payload.dmUrl) {
-    return new Response('telegram onboarding failed: missing telegram deeplink', { status: 502 });
+  if (!payload.browserUrl) {
+    return new Response('telegram onboarding failed: missing telegram browser link', { status: 502 });
   }
 
-  return NextResponse.redirect(payload.dmUrl, 302);
+  return NextResponse.redirect(payload.browserUrl, 302);
 };
