@@ -27,10 +27,16 @@ describe('GET /api/onboarding/telegram', () => {
     globalThis.fetch = originalFetch;
   });
 
-  it('redirects to the https t.me link so browsers preserve the start token', async () => {
+  it('renders a user-activated Telegram handoff that preserves the start token', async () => {
     const response = await GET(new Request('https://dashboard.example/api/onboarding/telegram'));
 
-    expect(response.status).toBe(302);
-    expect(response.headers.get('location')).toBe('https://t.me/tomo_bot?start=single-use-token');
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toContain('text/html');
+    expect(response.headers.get('referrer-policy')).toBe('no-referrer');
+    expect(response.headers.get('cache-control')).toBe('no-store');
+
+    const body = await response.text();
+    expect(body).toContain('href="tg://resolve?domain=tomo_bot&start=single-use-token"');
+    expect(body).toContain('href="https://t.me/tomo_bot?start=single-use-token"');
   });
 });
