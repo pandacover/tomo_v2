@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -24,59 +26,75 @@ def _base_env() -> dict[str, str]:
     return env
 
 
-def _run(args: list[str], env: dict[str, str]) -> int:
-    print(f"running: {' '.join(args)}", flush=True)
-    return subprocess.run(args, env=env, check=False).returncode
-
-
-def _run_control(env: dict[str, str]) -> int:
-    args = [
+def _control_command(env: dict[str, str]) -> list[str]:
+    return [
         "uv",
         "run",
         "tomo-core",
         "control",
         "start",
         "--host",
-        env["TOMO_CONTROL_HOST"],
+        env.get("TOMO_CONTROL_HOST", "0.0.0.0"),
         "--port",
-        env["TOMO_CONTROL_PORT"],
+        env.get("TOMO_CONTROL_PORT", env.get("PORT", "8787")),
     ]
-    return _run(args, env)
+
+
+def _stop_children(processes: list[subprocess.Popen[object]]) -> None:
+    for process in processes:
+        if process.poll() is None:
+            process.terminate()
+
+    deadline = time.monotonic() + 10
+    for process in processes:
+        if process.poll() is not None:
+            continue
+        try:
+            process.wait(timeout=max(0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            process.kill()
+
+    for process in processes:
+        if process.poll() is None:
+            process.wait()
 
 
 def start(env: dict[str, str]) -> int:
+    commands = [_control_command(env)]
     if env.get("TOMO_TELEGRAM_GLOBAL_BOT_TOKEN"):
-        code = _run(["uv", "run", "tomo-core", "telegram-shared", "restart"], env)
-        if code != 0:
-            return code
+        commands.append(["uv", "run", "tomo-core", "telegram-shared", "start"])
+        print("starting control api and shared telegram listener.", flush=True)
     else:
         print("TOMO_TELEGRAM_GLOBAL_BOT_TOKEN is not set; starting control api only.", flush=True)
-    return _run_control(env)
 
+    processes = [subprocess.Popen(command, env=env, shell=False) for command in commands]
+    shutdown_signal: int | None = None
 
-def stop(env: dict[str, str]) -> int:
-    return _run(["uv", "run", "tomo-core", "telegram-shared", "stop"], env)
+    def forward_signal(signum: int, _frame: object) -> None:
+        nonlocal shutdown_signal
+        shutdown_signal = signum
+        _stop_children(processes)
 
+    signal.signal(signal.SIGTERM, forward_signal)
+    signal.signal(signal.SIGINT, forward_signal)
 
-def restart(env: dict[str, str]) -> int:
-    stop_code = stop(env)
-    if stop_code != 0:
-        return stop_code
-    return start(env)
+    while shutdown_signal is None:
+        for process in processes:
+            code = process.poll()
+            if code is not None:
+                _stop_children(processes)
+                return code if code != 0 else 0
+        time.sleep(0.1)
+
+    return 128 + shutdown_signal
 
 
 def main(argv: list[str] | None = None) -> int:
     args = list(argv if argv is not None else sys.argv[1:])
-    command = args[0] if args else "start"
-    env = _base_env()
-    if command == "start":
-        return start(env)
-    if command == "stop":
-        return stop(env)
-    if command == "restart":
-        return restart(env)
-    print("usage: railway_core_start.py [start|stop|restart]", file=sys.stderr)
-    return 2
+    if args and args != ["start"]:
+        print("usage: railway_core_start.py [start]", file=sys.stderr)
+        return 2
+    return start(_base_env())
 
 
 if __name__ == "__main__":
