@@ -1,3 +1,4 @@
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -37,3 +38,19 @@ class CliTests(unittest.TestCase):
                 code = main(["telegram-shared", "restart", "--token", "token", "--data-dir", tmp])
         self.assertEqual(code, 0)
         popen.assert_called_once()
+
+    def test_sandbox_inbound_uses_only_the_supergrok_access_token_and_daytona_data_dir(self):
+        token = "supergrok-access-token"
+        with (
+            patch.dict("os.environ", {"TOMO_SUPERGROK_ACCESS_TOKEN": token}, clear=True),
+            patch("tomo_core.cli.supergrok_oauth_provider_from_access_token") as provider_factory,
+            patch("tomo_core.cli.run_once", return_value=0) as run_once,
+            patch("sys.stdin", io.StringIO()),
+            patch("sys.stdout", io.StringIO()),
+        ):
+            code = main(["sandbox", "inbound", "--once"])
+
+        self.assertEqual(code, 0)
+        provider_factory.assert_called_once_with(token)
+        self.assertEqual(run_once.call_args.kwargs["data_dir"], "/home/daytona/.tomo")
+        self.assertEqual(run_once.call_args.kwargs["secret_values"], (token,))

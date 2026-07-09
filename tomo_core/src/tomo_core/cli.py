@@ -14,8 +14,9 @@ from .instances import RuntimeInstanceRegistry
 from .models import RuntimeConfig
 from .oauth import OAuthManager
 from .grok_auth import GrokAuthStore
-from .providers import GrokAuthProvider, OAuthBackedSuperGrokProvider, StaticProvider, XaiApiProvider
+from .providers import GrokAuthProvider, OAuthBackedSuperGrokProvider, StaticProvider, XaiApiProvider, supergrok_oauth_provider_from_access_token
 from .runtime import PersonalAgentRuntime
+from .sandbox_inbound import SandboxInboundError, emit_failure, run_once
 from .telegram import TelegramDeliverySink
 from .telegram_bot import TelegramBotApiClient, TelegramPollingBot
 from .onboarding_store import TelegramOnboardingStore
@@ -255,6 +256,11 @@ def main(argv: list[str] | None = None) -> int:
     shared_restart.add_argument("--static-response", default=os.getenv("TOMO_CORE_STATIC_RESPONSE"))
     shared_restart.add_argument("--poll-timeout", type=int, default=30)
 
+    sandbox = sub.add_parser("sandbox", help="sandbox runtime commands")
+    sandbox_sub = sandbox.add_subparsers(dest="sandbox_command", required=True)
+    sandbox_inbound = sandbox_sub.add_parser("inbound", help="handle one sandbox protocol envelope from stdin")
+    sandbox_inbound.add_argument("--once", action="store_true", required=True)
+
     args = parser.parse_args(argv)
     if args.command == "telegram" and args.telegram_command == "start":
         if not args.token:
@@ -286,6 +292,26 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "telegram-shared" and args.shared_command == "restart":
         stop_shared_gateway(args.data_dir)
         return start_shared_gateway_background(args)
+
+    if args.command == "sandbox" and args.sandbox_command == "inbound":
+        access_token = os.getenv("TOMO_SUPERGROK_ACCESS_TOKEN")
+        if not access_token:
+            emit_failure(sys.stdout, "missing_access_token")
+            return 1
+        try:
+            provider = supergrok_oauth_provider_from_access_token(access_token)
+            return run_once(
+                sys.stdin,
+                sys.stdout,
+                data_dir=os.getenv("TOMO_DATA_DIR", "/home/daytona/.tomo"),
+                provider=provider,
+                secret_values=(access_token,),
+            )
+        except SandboxInboundError:
+            return 1
+        except Exception:
+            emit_failure(sys.stdout, "provider_failed")
+            return 1
 
     return 0
 

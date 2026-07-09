@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 import httpx
@@ -49,7 +49,7 @@ class XaiApiProvider:
 
 @dataclass
 class SuperGrokTokenStore:
-    access_token: str
+    access_token: str = field(repr=False)
 
 
 @dataclass
@@ -71,6 +71,13 @@ class SuperGrokOAuthProvider:
             base_url=self.base_url,
             reasoning_effort=self.reasoning_effort,
         ).complete(messages, actor_id=actor_id)
+
+
+def supergrok_oauth_provider_from_access_token(access_token: str) -> SuperGrokOAuthProvider:
+    """Build a fixed-token provider without retaining the token in repr output."""
+    if not access_token:
+        raise ValueError("SuperGrok access token is required")
+    return SuperGrokOAuthProvider(token_store=SuperGrokTokenStore(access_token=access_token))
 
 
 @dataclass
