@@ -27,6 +27,22 @@ cd ../dashboard
 bun run dev
 ```
 
+## railway core service
+
+preferred: set the railway service root directory to `tomo_core/`. the committed `tomo_core/railway.toml` starts `scripts/railway_core_start.py`, which runs the control api on `$PORT` and starts the one shared telegram poller when `TOMO_TELEGRAM_GLOBAL_BOT_TOKEN` is set. the repo-root `railway.toml` is also present so a root-based core service has a start command instead of failing railpack detection.
+
+mount a railway volume at `/data` and set:
+
+```text
+TOMO_CORE_DATA_DIR=/data
+TOMO_CONTROL_API_KEY=<shared dashboard/control secret>
+TOMO_TELEGRAM_GLOBAL_BOT_TOKEN=<botfather token>
+TOMO_TELEGRAM_GLOBAL_BOT_USERNAME=<bot username without @>
+XAI_API_KEY=<optional for real model replies>
+```
+
+health check path: `/v1/health`.
+
 ## flow
 
 1. open the dashboard.

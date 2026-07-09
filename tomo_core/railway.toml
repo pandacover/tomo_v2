@@ -1,0 +1,5 @@
+[deploy]
+startCommand = "uv run python scripts/railway_core_start.py"
+healthcheckPath = "/v1/health"
+healthcheckTimeout = 30
+restartPolicyType = "ON_FAILURE"
