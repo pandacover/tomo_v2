@@ -43,6 +43,16 @@ XAI_API_KEY=<optional for real model replies>
 
 health check path: `/v1/health`.
 
+ops commands from `tomo_core/`:
+
+```bash
+uv run tomo-core telegram-shared start --background
+uv run tomo-core telegram-shared stop
+uv run tomo-core telegram-shared restart
+```
+
+railway uses `restart` to fire-and-forget the telegram poller, then execs the control api in the foreground for the service health check.
+
 ## flow
 
 1. open the dashboard.

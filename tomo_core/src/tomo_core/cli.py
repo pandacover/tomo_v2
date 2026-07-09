@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
+import subprocess
 import sys
 import time
+from pathlib import Path
 
 import uvicorn
 
@@ -39,16 +42,18 @@ def build_provider(args: argparse.Namespace, oauth: OAuthManager):
 
 def build_oauth_manager(args: argparse.Namespace) -> OAuthManager:
     providers = OAuthManager.default_providers(
-        google_client_id=args.google_client_id or os.getenv("GOOGLE_OAUTH_CLIENT_ID") or os.getenv("TOMO_GOOGLE_OAUTH_CLIENT_ID"),
-        google_client_secret=args.google_client_secret
+        google_client_id=getattr(args, "google_client_id", None)
+        or os.getenv("GOOGLE_OAUTH_CLIENT_ID")
+        or os.getenv("TOMO_GOOGLE_OAUTH_CLIENT_ID"),
+        google_client_secret=getattr(args, "google_client_secret", None)
         or os.getenv("GOOGLE_OAUTH_CLIENT_SECRET")
         or os.getenv("TOMO_GOOGLE_OAUTH_CLIENT_SECRET"),
-        supergrok_client_id=args.supergrok_client_id
+        supergrok_client_id=getattr(args, "supergrok_client_id", None)
         or os.getenv("SUPERGROK_OAUTH_CLIENT_ID")
         or os.getenv("GROK_OAUTH_CLIENT_ID")
         or os.getenv("TOMO_SUPERGROK_OAUTH_CLIENT_ID")
         or getattr(args, "xai_client_id", None),
-        supergrok_client_secret=args.supergrok_client_secret
+        supergrok_client_secret=getattr(args, "supergrok_client_secret", None)
         or os.getenv("SUPERGROK_OAUTH_CLIENT_SECRET")
         or os.getenv("GROK_OAUTH_CLIENT_SECRET")
         or os.getenv("TOMO_SUPERGROK_OAUTH_CLIENT_SECRET")
@@ -57,6 +62,131 @@ def build_oauth_manager(args: argparse.Namespace) -> OAuthManager:
         supergrok_token_url=os.getenv("SUPERGROK_OAUTH_TOKEN_URL", os.getenv("XAI_OAUTH_TOKEN_URL", "https://auth.x.ai/oauth2/token")),
     )
     return OAuthManager(data_dir=args.data_dir, providers=providers)
+
+
+def _shared_pid_path(data_dir: str) -> Path:
+    root = Path(data_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    return root / "telegram_shared.pid"
+
+
+def _shared_log_path(data_dir: str) -> Path:
+    root = Path(data_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    return root / "telegram_shared.log"
+
+
+def _pid_is_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _read_pid(pid_path: Path) -> int | None:
+    try:
+        return int(pid_path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def stop_shared_gateway(data_dir: str, timeout_seconds: float = 10) -> int:
+    pid_path = _shared_pid_path(data_dir)
+    pid = _read_pid(pid_path)
+    if pid is None:
+        pid_path.unlink(missing_ok=True)
+        print("shared telegram gateway is not running.")
+        return 0
+    if not _pid_is_running(pid):
+        pid_path.unlink(missing_ok=True)
+        print("shared telegram gateway pid was stale; cleaned it up.")
+        return 0
+    print(f"stopping shared telegram gateway pid {pid}.")
+    os.kill(pid, signal.SIGTERM)
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if not _pid_is_running(pid):
+            pid_path.unlink(missing_ok=True)
+            return 0
+        time.sleep(0.2)
+    if hasattr(signal, "SIGKILL"):
+        os.kill(pid, signal.SIGKILL)
+    pid_path.unlink(missing_ok=True)
+    return 0
+
+
+def _append_arg(argv: list[str], name: str, value: object | None) -> None:
+    if value is not None:
+        argv.extend([name, str(value)])
+
+
+def start_shared_gateway_background(args: argparse.Namespace) -> int:
+    if not args.token:
+        print("missing TOMO_TELEGRAM_GLOBAL_BOT_TOKEN or --token.", file=sys.stderr)
+        return 2
+    pid_path = _shared_pid_path(args.data_dir)
+    existing_pid = _read_pid(pid_path)
+    if existing_pid is not None and _pid_is_running(existing_pid):
+        print(f"shared telegram gateway already running as pid {existing_pid}.")
+        return 0
+
+    child_argv = [sys.executable, "-m", "tomo_core.cli", "telegram-shared", "start"]
+    _append_arg(child_argv, "--token", args.token)
+    _append_arg(child_argv, "--bot-username", args.bot_username)
+    _append_arg(child_argv, "--data-dir", args.data_dir)
+    _append_arg(child_argv, "--soul", args.soul)
+    _append_arg(child_argv, "--model", args.model)
+    _append_arg(child_argv, "--static-response", args.static_response)
+    _append_arg(child_argv, "--poll-timeout", args.poll_timeout)
+
+    log_path = _shared_log_path(args.data_dir)
+    popen_kwargs: dict[str, object] = {
+        "stdin": subprocess.DEVNULL,
+        "cwd": os.getcwd(),
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        popen_kwargs["start_new_session"] = True
+    with log_path.open("ab") as log:
+        process = subprocess.Popen(child_argv, stdout=log, stderr=subprocess.STDOUT, **popen_kwargs)
+    pid_path.write_text(str(process.pid), encoding="utf-8")
+    print(f"shared telegram gateway started in background as pid {process.pid}; logs: {log_path}")
+    return 0
+
+
+def run_shared_gateway_foreground(args: argparse.Namespace) -> int:
+    if not args.token:
+        print("missing TOMO_TELEGRAM_GLOBAL_BOT_TOKEN or --token.", file=sys.stderr)
+        return 2
+    pid_path = _shared_pid_path(args.data_dir)
+    pid_path.write_text(str(os.getpid()), encoding="utf-8")
+    try:
+        client = TelegramBotApiClient(token=args.token)
+        oauth = build_oauth_manager(args)
+
+        def provider_factory(_tomo_id: str):
+            return build_provider(args, oauth)
+
+        store = TelegramOnboardingStore(args.data_dir)
+        instances = RuntimeInstanceRegistry(args.data_dir, provider_factory, client, soul_path=args.soul)
+        gateway = SharedTelegramGateway(client=client, store=store, instances=instances)
+        print("shared telegram gateway polling started. press ctrl+c to stop.")
+        offset = None
+        while True:
+            for update in client.get_updates(offset=offset, timeout=args.poll_timeout):
+                if "update_id" in update:
+                    offset = int(update["update_id"]) + 1
+                gateway.process_update(update)
+            time.sleep(0.2)
+    finally:
+        if _read_pid(pid_path) == os.getpid():
+            pid_path.unlink(missing_ok=True)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -97,8 +227,33 @@ def main(argv: list[str] | None = None) -> int:
     shared_start.add_argument("--data-dir", default=os.getenv("TOMO_CORE_DATA_DIR", ".tomo_core"))
     shared_start.add_argument("--soul", default=os.getenv("TOMO_CORE_SOUL", "SOUL.md"))
     shared_start.add_argument("--model", default=os.getenv("TOMO_XAI_MODEL", "grok-composer-2.5-fast"))
+    shared_start.add_argument("--xai-api-key", default=None)
+    shared_start.add_argument("--use-grok-login", action="store_true", help="use ~/.grok/auth.json from `grok login`")
+    shared_start.add_argument("--supergrok-client-id", default=None)
+    shared_start.add_argument("--supergrok-client-secret", default=None)
+    shared_start.add_argument("--google-client-id", default=None)
+    shared_start.add_argument("--google-client-secret", default=None)
     shared_start.add_argument("--static-response", default=os.getenv("TOMO_CORE_STATIC_RESPONSE"))
     shared_start.add_argument("--poll-timeout", type=int, default=30)
+    shared_start.add_argument("--background", action="store_true", help="start poller in the background and return")
+
+    shared_stop = shared_sub.add_parser("stop", help="stop background shared telegram polling")
+    shared_stop.add_argument("--data-dir", default=os.getenv("TOMO_CORE_DATA_DIR", ".tomo_core"))
+
+    shared_restart = shared_sub.add_parser("restart", help="restart shared telegram polling in the background")
+    shared_restart.add_argument("--token", default=os.getenv("TOMO_TELEGRAM_GLOBAL_BOT_TOKEN"))
+    shared_restart.add_argument("--bot-username", default=os.getenv("TOMO_TELEGRAM_GLOBAL_BOT_USERNAME"))
+    shared_restart.add_argument("--data-dir", default=os.getenv("TOMO_CORE_DATA_DIR", ".tomo_core"))
+    shared_restart.add_argument("--soul", default=os.getenv("TOMO_CORE_SOUL", "SOUL.md"))
+    shared_restart.add_argument("--model", default=os.getenv("TOMO_XAI_MODEL", "grok-composer-2.5-fast"))
+    shared_restart.add_argument("--xai-api-key", default=None)
+    shared_restart.add_argument("--use-grok-login", action="store_true", help="use ~/.grok/auth.json from `grok login`")
+    shared_restart.add_argument("--supergrok-client-id", default=None)
+    shared_restart.add_argument("--supergrok-client-secret", default=None)
+    shared_restart.add_argument("--google-client-id", default=None)
+    shared_restart.add_argument("--google-client-secret", default=None)
+    shared_restart.add_argument("--static-response", default=os.getenv("TOMO_CORE_STATIC_RESPONSE"))
+    shared_restart.add_argument("--poll-timeout", type=int, default=30)
 
     args = parser.parse_args(argv)
     if args.command == "telegram" and args.telegram_command == "start":
@@ -121,24 +276,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "telegram-shared" and args.shared_command == "start":
-        if not args.token:
-            print("missing TOMO_TELEGRAM_GLOBAL_BOT_TOKEN or --token.", file=sys.stderr)
-            return 2
-        client = TelegramBotApiClient(token=args.token)
-        oauth = build_oauth_manager(args)
-        def provider_factory(_tomo_id: str):
-            return build_provider(args, oauth)
-        store = TelegramOnboardingStore(args.data_dir)
-        instances = RuntimeInstanceRegistry(args.data_dir, provider_factory, client, soul_path=args.soul)
-        gateway = SharedTelegramGateway(client=client, store=store, instances=instances)
-        print("shared telegram gateway polling started. press ctrl+c to stop.")
-        offset = None
-        while True:
-            for update in client.get_updates(offset=offset, timeout=args.poll_timeout):
-                if "update_id" in update:
-                    offset = int(update["update_id"]) + 1
-                gateway.process_update(update)
-            time.sleep(0.2)
+        if args.background:
+            return start_shared_gateway_background(args)
+        return run_shared_gateway_foreground(args)
+
+    if args.command == "telegram-shared" and args.shared_command == "stop":
+        return stop_shared_gateway(args.data_dir)
+
+    if args.command == "telegram-shared" and args.shared_command == "restart":
+        stop_shared_gateway(args.data_dir)
+        return start_shared_gateway_background(args)
 
     return 0
 
