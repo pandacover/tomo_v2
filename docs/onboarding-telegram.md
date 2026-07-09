@@ -31,6 +31,8 @@ bun run dev
 
 preferred: set the railway service root directory to `tomo_core/`. the committed `tomo_core/railway.toml` starts `scripts/railway_core_start.py`, which runs the control api on `$PORT` and starts the one shared telegram poller when `TOMO_TELEGRAM_GLOBAL_BOT_TOKEN` is set. the repo-root `railway.toml` is also present so a root-based core service has a start command instead of failing railpack detection.
 
+if the railway logs show a waku/bun dashboard build but deploy with `cd tomo_core && uv run python scripts/railway_core_start.py`, the dashboard service is picking up the core service config. use the `dashboard/` railway service root with `dashboard/railway.toml`; its health check is `/`, not `/v1/health`.
+
 mount a railway volume at `/data` and set:
 
 ```text
