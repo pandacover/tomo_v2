@@ -36,6 +36,7 @@ async function openAuthDatabase(dbPath: string): Promise<SqliteDatabase> {
 async function createAuth(): Promise<Auth> {
   fs.mkdirSync(path.dirname(dashboardEnv.authDbPath), { recursive: true });
   const database = await openAuthDatabase(dashboardEnv.authDbPath);
+  const hostedAuth = !/localhost|127\.0\.0\.1/i.test(dashboardEnv.betterAuthUrl);
 
   return betterAuth({
     secret: requireDashboardEnv('betterAuthSecret'),
@@ -46,6 +47,16 @@ async function createAuth(): Promise<Auth> {
       autoSignIn: true,
     },
     trustedOrigins: [dashboardEnv.betterAuthUrl],
+    ...(hostedAuth
+      ? {
+          advanced: {
+            trustedProxyHeaders: true,
+            ipAddress: {
+              ipAddressHeaders: ['x-forwarded-for', 'x-real-ip', 'cf-connecting-ip'],
+            },
+          },
+        }
+      : {}),
     plugins: dashboardEnv.betterAuthApiKey ? [dash({ apiKey: dashboardEnv.betterAuthApiKey })] : [],
   });
 }
