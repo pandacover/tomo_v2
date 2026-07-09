@@ -1,0 +1,180 @@
+@import 'tailwindcss';
+
+@theme {
+  --color-tomo-paper: #ffffff;
+  --color-tomo-ink: #000000;
+  --color-tomo-accent: #d4ff00;
+  --color-tomo-soft: #f3f3f4;
+  --spacing-tomo-gutter: 24px;
+  --spacing-tomo-container: 1120px;
+  --font-heading: geist, ui-sans-serif, system-ui, sans-serif;
+  --font-body: geist, ui-sans-serif, system-ui, sans-serif;
+}
+
+:root {
+  color-scheme: light;
+  background: var(--color-tomo-paper);
+  color: var(--color-tomo-ink);
+  font-family: var(--font-body);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  scroll-behavior: smooth;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  overflow-x: hidden;
+  background: var(--color-tomo-paper);
+  color: var(--color-tomo-ink);
+  text-transform: lowercase;
+  letter-spacing: -0.01em;
+}
+
+button,
+a {
+  -webkit-tap-highlight-color: transparent;
+}
+
+.font-heading {
+  font-family: var(--font-heading);
+  text-transform: lowercase;
+}
+
+.kinetic-layer {
+  position: relative;
+  z-index: 10;
+}
+
+.floating-glyph {
+  position: absolute;
+  z-index: 0;
+  opacity: 0.05;
+  user-select: none;
+}
+
+.scatter-1 {
+  transform: rotate(-2deg) translateY(10px);
+}
+
+.scatter-2 {
+  transform: rotate(3deg) translateX(15px);
+}
+
+.scatter-3 {
+  transform: rotate(-1deg) translateY(-20px) scale(1.05);
+}
+
+.scatter-4 {
+  transform: rotate(1.5deg) translateX(-10px);
+}
+
+.text-balance {
+  text-wrap: balance;
+}
+
+@keyframes slide-up-fade {
+  from {
+    opacity: 0;
+    transform: translateY(30px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes glyph-float {
+  0%,
+  100% {
+    transform: translateY(0) rotate(var(--base-rotation));
+  }
+
+  50% {
+    transform: translateY(-20px) rotate(calc(var(--base-rotation) + 2deg));
+  }
+}
+
+.animate-reveal {
+  opacity: 0;
+  animation: slide-up-fade 0.8s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.float-t {
+  --base-rotation: -2deg;
+  animation: glyph-float 8s ease-in-out infinite;
+}
+
+.float-o {
+  --base-rotation: 3deg;
+  animation: glyph-float 10s ease-in-out infinite;
+}
+
+.float-m {
+  --base-rotation: -1deg;
+  animation: glyph-float 9s ease-in-out infinite;
+}
+
+.float-o-2 {
+  --base-rotation: 1.5deg;
+  animation: glyph-float 11s ease-in-out infinite;
+}
+
+.hover-card,
+.hover-card-black {
+  transition:
+    transform 0.4s cubic-bezier(0.34, 1.56, 0.64, 1),
+    box-shadow 0.4s ease;
+}
+
+.hover-card:hover {
+  transform: scale(1.02) rotate(-1deg);
+  box-shadow: 20px 20px 0 var(--color-tomo-accent) !important;
+}
+
+.hover-card-black:hover {
+  transform: scale(1.02) rotate(1deg);
+  box-shadow: 20px 20px 0 var(--color-tomo-ink) !important;
+}
+
+@media (max-width: 767px) {
+  .scatter-1,
+  .scatter-2,
+  .scatter-3,
+  .scatter-4 {
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    scroll-behavior: auto;
+  }
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+
+  .animate-reveal,
+  .float-t,
+  .float-o,
+  .float-m,
+  .float-o-2,
+  .hover-card,
+  .hover-card-black {
+    animation: none !important;
+    opacity: 1 !important;
+    transform: none !important;
+  }
+}

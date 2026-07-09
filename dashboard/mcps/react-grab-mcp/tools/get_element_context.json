@@ -1,0 +1,8 @@
+{
+  "name": "get_element_context",
+  "description": "Get the latest React Grab context that was submitted. Returns the most recent UI element selection with its prompt.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {}
+  }
+}

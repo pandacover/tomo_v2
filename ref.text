@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+
+<html class="light stitch-anim-fade-in" lang="en" style="scroll-behavior: smooth;"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>Tomo — The Thoughtful Companion</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@100..900&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<script id="tailwind-config">
+      tailwind.config = {
+        darkMode: "class",
+        theme: {
+          extend: {
+            "colors": {
+                    "primary": "#000000", // Black
+                    "secondary": "#d4ff00", // Neon Yellow
+                    "tertiary": "#f3f3f4", // Light Gray
+                    "background": "#ffffff", // Stark White
+                    "on-background": "#000000",
+                    "surface": "#ffffff",
+                    "accent-pink": "#000000",
+                    "accent-orange": "#d4ff00"
+            },
+            "fontFamily": {
+                    "heading": ["Geist", "sans-serif"],
+                    "body": ["Geist", "sans-serif"]
+            },
+            "spacing": {
+                    "gutter": "24px",
+                    "container-max": "1120px"
+            }
+          },
+        },
+      }
+    </script>
+<style>
+        body {
+            background-color: #ffffff;
+            color: #000000;
+            -webkit-font-smoothing: antialiased;
+            font-family: 'Geist', sans-serif;
+            overflow-x: hidden;
+        }
+        .font-heading { font-family: 'Geist', sans-serif; text-transform: lowercase; font-weight: 800; }
+        .font-body { font-family: 'Geist', sans-serif; text-transform: lowercase; letter-spacing: -0.01em; }
+        
+        .kinetic-layer {
+            position: relative;
+            z-index: 10;
+        }
+        
+        .floating-glyph {
+            position: absolute;
+            z-index: 0;
+            opacity: 0.05;
+            pointer-events: none;
+            user-select: none;
+        }
+
+        .scatter-1 { transform: rotate(-2deg) translateY(10px); }
+        .scatter-2 { transform: rotate(3deg) translateX(15px); }
+        .scatter-3 { transform: rotate(-1deg) translateY(-20px) scale(1.05); }
+        .scatter-4 { transform: rotate(1.5deg) translateX(-10px); }
+
+        .text-balance {
+            text-wrap: balance;
+        }
+
+        /* Motion System */
+        @keyframes slideUpFade {
+            from {
+                opacity: 0;
+                transform: translateY(30px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        @keyframes float {
+            0%, 100% { transform: translateY(0) rotate(var(--base-rotation)); }
+            50% { transform: translateY(-20px) rotate(calc(var(--base-rotation) + 2deg)); }
+        }
+
+        .animate-reveal {
+            opacity: 0;
+            animation: slideUpFade 0.8s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+        }
+
+        .float-t { --base-rotation: -2deg; animation: float 8s ease-in-out infinite; }
+        .float-o { --base-rotation: 3deg; animation: float 10s ease-in-out infinite; }
+        .float-m { --base-rotation: -1deg; animation: float 9s ease-in-out infinite; }
+        .float-o-2 { --base-rotation: 1.5deg; animation: float 11s ease-in-out infinite; }
+
+        .hover-card {
+            transition: transform 0.4s cubic-bezier(0.34, 1.56, 0.64, 1), box-shadow 0.4s ease;
+        }
+        .hover-card:hover {
+            transform: scale(1.02) rotate(-1deg);
+            box-shadow: 20px 20px 0px 0px rgba(212,255,0,1) !important;
+        }
+        .hover-card-black:hover {
+            transform: scale(1.02) rotate(1deg);
+            box-shadow: 20px 20px 0px 0px rgba(0,0,0,1) !important;
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            .animate-reveal, .float-t, .float-o, .float-m, .float-o-2, .hover-card, .hover-card-black {
+                animation: none !important;
+                transition: none !important;
+                opacity: 1 !important;
+                transform: none !important;
+            }
+        }
+    </style>
+</head>
+<body class="font-body text-[16px] lowercase bg-background">
+<!-- Floating Decorative Glyphs -->
+<div class="floating-glyph float-t top-20 -left-10 text-[300px] text-primary select-none">t</div>
+<div class="floating-glyph float-o top-[40%] -right-20 text-[400px] text-secondary select-none">o</div>
+<div class="floating-glyph float-m bottom-[10%] left-0 text-[350px] text-primary select-none">m</div>
+<div class="floating-glyph float-o-2 bottom-[-5%] right-10 text-[250px] text-secondary select-none">o</div>
+<!-- TopNavBar -->
+<header class="fixed top-0 w-full z-50 transition-all duration-300">
+<div class="flex justify-between items-center w-full px-gutter py-4 max-w-container-max mx-auto h-20">
+<div class="font-heading text-4xl font-extrabold text-primary cursor-pointer active:scale-95 transition-all">
+            tomo
+        </div>
+<div class="flex items-center gap-4">
+<nav class="hidden md:flex items-center gap-8 mr-8">
+<a class="text-on-background/60 hover:text-primary transition-colors duration-200 cursor-pointer font-body" href="#how-it-works">how it works</a>
+<a class="text-on-background/60 hover:text-primary transition-colors duration-200 cursor-pointer font-body" href="#about-tomo">about tomo</a>
+</nav>
+</div>
+</div>
+</header>
+<main class="relative pt-20 overflow-visible">
+<!-- Hero Section -->
+<section class="relative px-gutter py-20 md:py-32 max-w-container-max mx-auto kinetic-layer">
+<div class="flex flex-col items-center text-center max-w-4xl mx-auto space-y-12 scatter-1">
+<div class="animate-reveal inline-flex items-center gap-2 px-6 py-2 bg-secondary rounded-full text-primary border border-primary/10 shadow-sm" style="animation-delay: 0.1s;">
+<span class="material-symbols-outlined text-[18px]">temp_preferences_custom</span>
+<span class="font-heading text-sm tracking-[0.2em] uppercase">introducing tomo 1.0</span>
+</div>
+<h1 class="font-heading text-[72px] md:text-[120px] leading-[0.9] text-on-background text-balance max-w-[900px] tracking-tighter">
+<span class="animate-reveal inline-block" style="animation-delay: 0.2s;">meet tomo,</span><br/>
+<span class="bg-black px-4 py-1 rounded-sm inline-block mt-2 text-secondary animate-reveal" style="animation-delay: 0.3s;">a stalker, </span>
+<div><span class="bg-black px-4 py-1 rounded-sm inline-block mt-2 text-secondary animate-reveal" style="animation-delay: 0.4s;">an assistant,</span></div>
+<div><span class="bg-black px-4 py-1 rounded-sm inline-block mt-2 text-secondary animate-reveal" style="animation-delay: 0.5s;"> a friend</span></div>
+</h1>
+<div class="flex justify-center pt-8 scatter-2 animate-reveal" style="animation-delay: 0.6s;">
+<button class="bg-primary text-white px-12 py-5 rounded-none font-heading text-xl uppercase tracking-widest hover:bg-secondary hover:text-black transition-all active:scale-95 cursor-pointer shadow-[8px_8px_0px_0px_rgba(212,255,0,1)]">
+                    TEXT TOMO
+                </button>
+</div>
+</div>
+</section>
+<!-- How It Works Section -->
+<section class="px-gutter py-20 max-w-container-max mx-auto kinetic-layer" id="how-it-works">
+<div class="grid grid-cols-1 md:grid-cols-2 gap-12">
+<div class="animate-reveal hover-card bg-black text-white p-12 rounded-none scatter-3 border-2 border-black shadow-[12px_12px_0px_0px_rgba(212,255,0,1)]" style="animation-delay: 0.7s;">
+<h4 class="font-heading text-4xl text-secondary mb-6">privacy by design</h4>
+<p class="font-body text-lg text-white/80 leading-relaxed max-w-md">your conversations are yours alone. end-to-end encryption ensures tomo only knows what you want it to.</p>
+</div>
+<div class="animate-reveal hover-card-black bg-secondary p-12 rounded-none scatter-4 border-2 border-black shadow-[12px_12px_0px_0px_rgba(0,0,0,1)] md:mt-24" style="animation-delay: 0.8s;">
+<h4 class="font-heading text-4xl text-black mb-6">seamless integration</h4>
+<p class="font-body text-lg text-black/80 leading-relaxed max-w-md">connects with your calendar, notes, and local environment to act on your behalf, naturally.</p>
+</div>
+</div>
+</section>
+<!-- Feature Grid -->
+<section class="px-gutter py-32 overflow-visible kinetic-layer">
+<div class="max-w-container-max mx-auto space-y-32">
+<!-- Feature 1 -->
+<div class="grid grid-cols-1 md:grid-cols-2 gap-8 items-center scatter-1 animate-reveal" style="animation-delay: 0.9s;">
+<div class="order-1">
+<h3 class="font-heading text-6xl md:text-8xl text-on-background leading-none">authentic connection</h3>
+</div>
+<div class="order-2">
+<div class="bg-white p-10 rounded-none shadow-none border-l-8 border-secondary border-t border-b border-r border-black/10">
+<p class="font-body text-xl text-on-background/80 leading-relaxed">moving beyond commands. tomo learns your preferences, mood, and subtle cues to foster a relationship that feels genuinely supportive.</p>
+</div>
+</div>
+</div>
+<!-- Feature 2 -->
+<div class="grid grid-cols-1 md:grid-cols-2 gap-8 items-center scatter-3 animate-reveal" style="animation-delay: 1.0s;">
+<div class="order-1 md:order-2">
+<h3 class="font-heading text-6xl md:text-8xl text-on-background leading-none md:text-right">intuitive support</h3>
+</div>
+<div class="order-2 md:order-1">
+<div class="bg-white p-10 rounded-none shadow-none border-r-8 border-primary border-t border-b border-l border-black/10">
+<p class="font-body text-xl text-on-background/80 leading-relaxed">anticipating needs before they are voiced. from managing schedules to suggesting pauses, tomo aligns with your natural pace.</p>
+</div>
+</div>
+</div>
+<!-- Feature 3 -->
+<div class="grid grid-cols-1 md:grid-cols-2 gap-8 items-center scatter-4 animate-reveal" style="animation-delay: 1.1s;">
+<div class="order-1">
+<h3 class="font-heading text-6xl md:text-8xl text-on-background leading-none">grounded intelligence</h3>
+</div>
+<div class="order-2">
+<div class="bg-white p-10 rounded-none shadow-none border-t-8 border-secondary border-l border-b border-r border-black/10">
+<p class="font-body text-xl text-on-background/80 leading-relaxed">no hallucinations, just clarity. tomo uses verified data and localized context to provide information that is both accurate and useful.</p>
+</div>
+</div>
+</div>
+</div>
+</section>
+<section class="px-gutter py-20"></section>
+</main>
+<script>
+    // Parallax-ish effect for scattered layers
+    window.addEventListener('scroll', () => {
+        const scrolled = window.scrollY;
+        const layers = document.querySelectorAll('.scatter-1, .scatter-2, .scatter-3, .scatter-4');
+        
+        layers.forEach((layer, index) => {
+            const speed = (index + 1) * 0.05;
+            const yPos = -(scrolled * speed);
+            // Preserving original transform and adding scroll offset
+            const currentTransform = getComputedStyle(layer).transform;
+            layer.style.transform = `${currentTransform === 'none' ? '' : currentTransform} translateY(${yPos}px)`;
+        });
+
+        const header = document.querySelector('header');
+        if (scrolled > 50) {
+            header.classList.add('bg-white/80', 'backdrop-blur-md', 'shadow-sm', 'border-b', 'border-black/5');
+        } else {
+            header.classList.remove('bg-white/80', 'backdrop-blur-md', 'shadow-sm', 'border-b', 'border-black/5');
+        }
+    });
+
+    // Smooth scroll
+    document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+        anchor.addEventListener('click', function (e) {
+            e.preventDefault();
+            const target = document.querySelector(this.getAttribute('href'));
+            if (target) {
+                target.scrollIntoView({ behavior: 'smooth' });
+            }
+        });
+    });
+
+    // Interaction Observer for revealing sections on scroll
+    const observerOptions = {
+        threshold: 0.1
+    };
+
+    const revealObserver = new IntersectionObserver((entries) => {
+        entries.forEach(entry => {
+            if (entry.isIntersecting) {
+                entry.target.classList.add('animate-reveal');
+                revealObserver.unobserve(entry.target);
+            }
+        });
+    }, observerOptions);
+
+    // Any items that aren't revealed via standard timing (like late features)
+    document.querySelectorAll('.kinetic-layer > div, .kinetic-layer > section').forEach(el => {
+        if (!el.classList.contains('animate-reveal')) {
+            revealObserver.observe(el);
+        }
+    });
+</script>
+</body></html>
