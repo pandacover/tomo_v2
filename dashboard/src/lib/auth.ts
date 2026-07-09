@@ -13,14 +13,34 @@ export function getAuth(): Promise<Auth> {
   return authPromise;
 }
 
+type SqliteDatabase = unknown;
+
+async function openAuthDatabase(dbPath: string): Promise<SqliteDatabase> {
+  if (typeof Bun !== 'undefined') {
+    const { Database } = await import('bun:sqlite');
+    return new Database(dbPath, { create: true });
+  }
+
+  const [majorRaw, minorRaw] = process.versions.node.split('.');
+  const major = Number(majorRaw);
+  const minor = Number(minorRaw ?? 0);
+  if (major > 22 || (major === 22 && minor >= 5)) {
+    const { DatabaseSync } = await import('node:sqlite');
+    return new DatabaseSync(dbPath);
+  }
+
+  const { default: Database } = await import('better-sqlite3');
+  return new Database(dbPath);
+}
+
 async function createAuth(): Promise<Auth> {
   fs.mkdirSync(path.dirname(dashboardEnv.authDbPath), { recursive: true });
-  const { default: Database } = await import('better-sqlite3');
+  const database = await openAuthDatabase(dashboardEnv.authDbPath);
 
   return betterAuth({
     secret: requireDashboardEnv('betterAuthSecret'),
     baseURL: dashboardEnv.betterAuthUrl,
-    database: new Database(dashboardEnv.authDbPath),
+    database,
     emailAndPassword: {
       enabled: true,
       autoSignIn: true,
