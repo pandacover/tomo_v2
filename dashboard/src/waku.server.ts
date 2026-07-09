@@ -1,23 +1,25 @@
-import type { Context, MiddlewareHandler } from 'hono';
+import type { MiddlewareHandler } from 'hono';
 import { fsRouter } from 'waku';
 import adapter from 'waku/adapters/node';
 
 import { getAuth } from './lib/auth';
 
-const betterAuthRouteMethods = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD'] as const;
+const isBetterAuthPath = (pathname: string): boolean =>
+  pathname === '/api/auth' || pathname.startsWith('/api/auth/');
 
-const forwardBetterAuth = async (c: Context) => {
-  const auth = await getAuth();
-  return await auth.handler(c.req.raw);
-};
+function registerBetterAuthRoutes(_opts: { app: import('hono').Hono }): MiddlewareHandler {
+  return async (c, next) => {
+    const pathname = new URL(c.req.url).pathname;
+    if (!isBetterAuthPath(pathname)) {
+      await next();
+      return;
+    }
 
-function registerBetterAuthRoutes({ app }: { app: import('hono').Hono }): MiddlewareHandler {
-  for (const method of betterAuthRouteMethods) {
-    app.on(method, '/api/auth', forwardBetterAuth);
-    app.on(method, '/api/auth/*', forwardBetterAuth);
-  }
-
-  return async (c, next) => next();
+    const auth = await getAuth();
+    const response = await auth.handler(c.req.raw);
+    c.res = response;
+    return response;
+  };
 }
 
 export default adapter(fsRouter(import.meta.glob('./pages/**/*.{tsx,ts}')), {
