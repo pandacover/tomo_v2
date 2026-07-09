@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { dash } from '@better-auth/infra';
 import { betterAuth } from 'better-auth';
 import { dashboardEnv, requireDashboardEnv } from './env';
 
@@ -25,6 +26,7 @@ async function createAuth(): Promise<Auth> {
       autoSignIn: true,
     },
     trustedOrigins: [dashboardEnv.betterAuthUrl],
+    plugins: dashboardEnv.betterAuthApiKey ? [dash({ apiKey: dashboardEnv.betterAuthApiKey })] : [],
   });
 }
 

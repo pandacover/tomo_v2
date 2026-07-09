@@ -3,6 +3,7 @@
 ## dashboard env
 
 - `BETTER_AUTH_SECRET`: better auth session signing secret, at least 32 high-entropy chars.
+- `BETTER_AUTH_API_KEY`: Better Auth Infrastructure project API key used by `@better-auth/infra` `dash()`; optional locally, but set in production when using Better Auth Infrastructure.
 - `BETTER_AUTH_URL`: dashboard public url, e.g. `http://localhost:3000` locally.
 - `TOMO_DASHBOARD_DATA_DIR`: dashboard sqlite directory, default `.tomo_dashboard`.
 - `TOMO_CONTROL_API_URL`: python control api origin, no `/v1` suffix.

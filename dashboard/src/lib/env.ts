@@ -5,6 +5,7 @@ const fallbackAuthSecret = 'tomo-dashboard-local-build-secret-change-me';
 
 export const dashboardEnv = {
   betterAuthSecret: process.env.BETTER_AUTH_SECRET ?? process.env.TOMO_DASHBOARD_AUTH_SECRET ?? fallbackAuthSecret,
+  betterAuthApiKey: process.env.BETTER_AUTH_API_KEY,
   betterAuthUrl: process.env.BETTER_AUTH_URL ?? 'http://localhost:3000',
   dataDir: rootDataDir,
   authDbPath: process.env.TOMO_DASHBOARD_AUTH_DB ?? path.join(rootDataDir, 'auth.sqlite'),
