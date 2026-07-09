@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { dash } from '@better-auth/infra';
 import { betterAuth } from 'better-auth';
+import { getMigrations } from 'better-auth/db/migration';
 import { dashboardEnv, requireDashboardEnv } from './env';
 
 type SqliteDatabase = unknown;
@@ -33,7 +34,7 @@ async function createAuth() {
       ? dash({ apiKey: dashboardEnv.betterAuthApiKey })
       : undefined;
 
-  return betterAuth({
+  const auth = betterAuth({
     secret: requireDashboardEnv('betterAuthSecret'),
     baseURL: dashboardEnv.betterAuthUrl,
     database: await openAuthDatabase(dashboardEnv.authDbPath),
@@ -54,6 +55,16 @@ async function createAuth() {
       : {}),
     plugins: dashPlugin ? [dashPlugin] : [],
   });
+
+  await ensureAuthSchema(auth.options);
+  return auth;
+}
+
+async function ensureAuthSchema(options: Parameters<typeof getMigrations>[0]): Promise<void> {
+  const { toBeCreated, toBeAdded, runMigrations } = await getMigrations(options);
+  if (toBeCreated.length > 0 || toBeAdded.length > 0) {
+    await runMigrations();
+  }
 }
 
 export type AuthSession = Awaited<ReturnType<Awaited<ReturnType<typeof getAuth>>['api']['getSession']>>;
