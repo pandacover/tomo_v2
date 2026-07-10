@@ -35,6 +35,10 @@ cd /c/Users/luvma/OneDrive/Desktop/zero_labs/tomo_v2/tomo_core
 PYTHONPATH=src python -m unittest discover -s tests -v
 ```
 
+## hosted operations
+
+For the shared Telegram gateway on Railway and per-user Daytona sandboxes, see [../docs/daytona-railway.md](../docs/daytona-railway.md). User onboarding and local hosted-mode setup are in [../docs/onboarding-telegram.md](../docs/onboarding-telegram.md).
+
 ## run a real telegram bot
 
 create a bot with botfather and copy the bot token.

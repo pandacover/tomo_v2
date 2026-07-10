@@ -31,6 +31,7 @@ implemented now:
 - OAuthManager with pkce begin, callback/code exchange, pending challenge storage, and token storage
 - default google calendar oauth config with calendar.events scope
 - configurable supergrok oauth endpoints via env
+- hosted local/Daytona shared Telegram gateway, durable inbox, Railway/Daytona operations, and recovery runbooks documented in `../docs/`
 
 next slices:
 

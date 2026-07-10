@@ -1,76 +1,62 @@
-# telegram onboarding
+# Telegram onboarding
 
-## dashboard env
+## Dashboard setup
 
-- `BETTER_AUTH_SECRET`: better auth session signing secret, at least 32 high-entropy chars.
-- `BETTER_AUTH_API_KEY`: Better Auth Infrastructure project API key used by `@better-auth/infra` `dash()`; optional locally, but set in production when using Better Auth Infrastructure.
-- `BETTER_AUTH_URL`: dashboard public url, e.g. `http://localhost:3000` locally or `https://your-app.up.railway.app` in production. Railway deploys can infer this from `RAILWAY_PUBLIC_DOMAIN`, but set it explicitly if Better Auth Infra shows a different base URL.
+Configure the dashboard service with:
 
-For Better Auth Infrastructure Dash ownership verification, use the deployed base auth URL without a double slash, for example `https://your-app.up.railway.app/api/auth`. After adding or changing `BETTER_AUTH_API_KEY`, redeploy the dashboard so the `dash()` plugin routes are mounted.
-- `TOMO_DASHBOARD_DATA_DIR`: dashboard sqlite directory, default `.tomo_dashboard`.
-- `TOMO_CONTROL_API_URL`: python control api origin, no `/v1` suffix.
-- `TOMO_CONTROL_API_KEY`: shared secret sent from dashboard to control api as `x-api-key`.
+- `BETTER_AUTH_SECRET`: at least 32 high-entropy characters.
+- `BETTER_AUTH_API_KEY`: required in production when using Better Auth Infrastructure.
+- `BETTER_AUTH_URL`: public dashboard URL, such as `https://your-app.up.railway.app`.
+- `TOMO_DASHBOARD_DATA_DIR`: SQLite directory; defaults to `.tomo_dashboard`.
+- `TOMO_CONTROL_API_URL`: control API origin, without `/v1`.
+- `TOMO_CONTROL_API_KEY`: shared secret sent as `x-api-key`.
 
-## control and shared gateway env
+For Better Auth Infrastructure ownership verification, use the deployed URL without a double slash, for example `https://your-app.up.railway.app/api/auth`. Redeploy the dashboard after changing `BETTER_AUTH_API_KEY` so `dash()` routes mount.
 
-- `TOMO_CONTROL_API_KEY`: same secret accepted by the control api.
-- `TOMO_CORE_DATA_DIR`: canonical python runtime data dir, default `.tomo_core`.
-- `TOMO_TELEGRAM_GLOBAL_BOT_TOKEN`: one shared bot token.
-- `TOMO_TELEGRAM_GLOBAL_BOT_USERNAME`: bot username without `@`.
-- `XAI_API_KEY` or per-user SuperGrok OAuth tokens for real model replies.
+## User flow
 
-## local run
+1. The user signs in to the dashboard and selects **text tomo**.
+2. The dashboard requests a short-lived Telegram deep link from the control API.
+3. Telegram opens the one shared bot; the user sends `/start <token>` by pressing Start.
+4. The listener consumes the one-time token, binds that private chat to one `tomo_id`, and provisions its runtime.
+5. Later private DMs route to that same `tomo_id`.
+
+The link expires after 10 minutes. Dashboard sign-in by itself does not bind a Telegram chat. A user whose link expires should select **text tomo** again.
+
+## Local hosted mode
+
+Run the shared gateway in-process for local development. `local` requires no Daytona variables.
 
 ```bash
 cd tomo_core
+export TOMO_HOSTED_RUNTIME=local
+export TOMO_CORE_DATA_DIR=.tomo_core
+export TOMO_TELEGRAM_GLOBAL_BOT_TOKEN='123:abc'
+export TOMO_TELEGRAM_GLOBAL_BOT_USERNAME='your_bot'
+export XAI_API_KEY='xai-api-key'
 uv run tomo-core control start --host 127.0.0.1 --port 8787
-uv run tomo-core telegram-shared start
-
-cd ../dashboard
-bun run dev
 ```
 
-## railway core service
-
-preferred: set the railway service root directory to `tomo_core/`. the committed `tomo_core/railway.toml` starts `scripts/railway_core_start.py`, which runs the control api on `$PORT` and starts the one shared telegram poller when `TOMO_TELEGRAM_GLOBAL_BOT_TOKEN` is set. the repo-root `railway.toml` is also present so a root-based core service has a start command instead of failing railpack detection.
-
-if the railway logs show a waku/bun dashboard build but deploy with `cd tomo_core && uv run python scripts/railway_core_start.py`, the dashboard service is picking up the core service config. use the `dashboard/` railway service root with `dashboard/railway.toml`; its health check is `/`, not `/v1/health`.
-
-mount a railway volume at `/data` and set:
-
-```text
-TOMO_CORE_DATA_DIR=/data
-TOMO_CONTROL_API_KEY=<shared dashboard/control secret>
-TOMO_TELEGRAM_GLOBAL_BOT_TOKEN=<botfather token>
-TOMO_TELEGRAM_GLOBAL_BOT_USERNAME=<bot username without @>
-XAI_API_KEY=<optional for real model replies>
-```
-
-health check path: `/v1/health`.
-
-ops commands from `tomo_core/`:
+In another terminal:
 
 ```bash
-uv run tomo-core telegram-shared start --background
-uv run tomo-core telegram-shared stop
-uv run tomo-core telegram-shared restart
+cd tomo_core
+uv run tomo-core telegram-shared start
 ```
 
-railway uses `restart` to fire-and-forget the telegram poller, then execs the control api in the foreground for the service health check.
+For a local static smoke test, set `TOMO_CORE_STATIC_RESPONSE`; it uses a fixed reply instead of model credentials. `telegram-shared start --background` is available locally and writes the PID and combined log at `<TOMO_CORE_DATA_DIR>/telegram_shared.pid` and `telegram_shared.log`. Stop or restart it with:
 
-## flow
+```bash
+uv run tomo-core telegram-shared stop --data-dir .tomo_core
+uv run tomo-core telegram-shared restart --data-dir .tomo_core
+```
 
-1. open the dashboard.
-2. click `text tomo`.
-3. sign in or sign up.
-4. telegram opens with the shared bot.
-5. press start.
-6. send a normal dm.
+## Hosted invariants
 
-## invariants
+- Run exactly one shared listener per global bot token. Use `telegram-shared`, never legacy `telegram start`, for the hosted bot.
+- The listener accepts private chats only and verifies that the message sender is the bound actor.
+- The dashboard never receives or returns the bot token.
+- Delivery is durable at-least-once; a message can be repeated after a crash between execution/delivery and durable completion.
+- In Daytona mode, Railway owns bot credentials and refresh credentials; sandboxes get only the current access token for a command.
 
-- never run more than one shared gateway against the same global bot token.
-- do not use legacy `telegram start` for the hosted global bot.
-- dashboard sign-in alone does not bind telegram. `/start <token>` does.
-- the dashboard never sees or returns the telegram bot token.
-- every bound chat routes to a per-user `tomo_id` runtime instance.
+See [Railway and Daytona operations](daytona-railway.md) for production variables, snapshot releases, logs, and recovery.
