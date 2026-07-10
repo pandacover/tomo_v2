@@ -100,11 +100,18 @@ class SandboxDispatch:
             raise
         except Exception as error:
             raise SandboxDispatchError("access_token_failed") from error
-        if result.exit_code != 0:
-            raise SandboxDispatchError("sandbox_timeout" if result.exit_code == 124 else "sandbox_exec_failed")
         try:
-            return parse_result_marker(result.output, request_id)
-        except SandboxProtocolError:
+            bubbles = parse_result_marker(result.output, request_id)
+        except SandboxProtocolError as error:
+            if error.code == "auth_expired":
+                raise
+            if result.exit_code != 0:
+                raise SandboxDispatchError("sandbox_timeout" if result.exit_code == 124 else "sandbox_exec_failed") from error
             raise
         except ValueError as error:
+            if result.exit_code != 0:
+                raise SandboxDispatchError("sandbox_timeout" if result.exit_code == 124 else "sandbox_exec_failed") from error
             raise SandboxDispatchError("invalid_result") from error
+        if result.exit_code != 0:
+            raise SandboxDispatchError("sandbox_timeout" if result.exit_code == 124 else "sandbox_exec_failed")
+        return bubbles

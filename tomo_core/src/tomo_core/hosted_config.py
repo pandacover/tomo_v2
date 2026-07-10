@@ -11,6 +11,14 @@ from typing import Mapping
 
 _MAX_POLL_TIMEOUT = 60
 _MAX_ROUTER_WORKERS = 32
+_DAYTONA_HOSTED_VARIABLES = (
+    "DAYTONA_API_KEY",
+    "DAYTONA_API_URL",
+    "DAYTONA_TARGET",
+    "TOMO_DAYTONA_SNAPSHOT",
+    "TOMO_DAYTONA_SANDBOX_DATA_DIR",
+    "TOMO_SUPERGROK_OAUTH_JSON_B64",
+)
 
 
 @dataclass(frozen=True)
@@ -45,6 +53,10 @@ class HostedRuntimeConfig:
             runtime = configured_runtime.lower()
         if runtime not in {"local", "daytona"}:
             raise ValueError("missing or invalid TOMO_HOSTED_RUNTIME (expected local or daytona)")
+        if runtime == "local":
+            configured_hosted_variables = [name for name in _DAYTONA_HOSTED_VARIABLES if name in values]
+            if configured_hosted_variables:
+                raise ValueError(f"local runtime cannot use Daytona hosted configuration: {', '.join(configured_hosted_variables)}")
 
         resolved_token = token if token is not None else values.get("TOMO_TELEGRAM_GLOBAL_BOT_TOKEN")
         resolved_data_dir = data_dir if data_dir is not None else values.get("TOMO_CORE_DATA_DIR")

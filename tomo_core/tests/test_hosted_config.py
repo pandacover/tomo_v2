@@ -21,6 +21,25 @@ class HostedRuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config.worker_count, 4)
         self.assertEqual(config.poll_timeout, 30)
 
+    def test_local_mode_rejects_each_daytona_hosted_variable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = {
+                "TOMO_HOSTED_RUNTIME": "local",
+                "TOMO_TELEGRAM_GLOBAL_BOT_TOKEN": "bot-token",
+                "TOMO_CORE_DATA_DIR": tmp,
+            }
+            for name in (
+                "DAYTONA_API_KEY",
+                "DAYTONA_API_URL",
+                "DAYTONA_TARGET",
+                "TOMO_DAYTONA_SNAPSHOT",
+                "TOMO_DAYTONA_SANDBOX_DATA_DIR",
+                "TOMO_SUPERGROK_OAUTH_JSON_B64",
+            ):
+                with self.subTest(name=name):
+                    with self.assertRaisesRegex(ValueError, name):
+                        HostedRuntimeConfig.from_env({**base, name: "configured"})
+
     def test_static_response_explicitly_selects_local_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = HostedRuntimeConfig.from_env(

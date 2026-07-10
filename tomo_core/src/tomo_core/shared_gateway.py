@@ -9,6 +9,7 @@ from .models import InboundEnvelope, OutboundBubble
 from .onboarding_store import TelegramInstallation, TelegramOnboardingStore
 from .sandbox_dispatch import TelegramRuntimeDispatchError
 from .telegram import TelegramClient
+from .telegram_router import RetryableTelegramUpdateError
 
 
 class TelegramRuntimeDispatch(Protocol):
@@ -113,8 +114,13 @@ class SharedTelegramGateway:
                     },
                 ),
             )
-        except (TelegramRuntimeDispatchError, SandboxSupervisorError):
-            return True
+        except (TelegramRuntimeDispatchError, SandboxSupervisorError) as error:
+            self.client.send_message(
+                installation.chat_id,
+                "tomo had trouble replying. try again in a moment.",
+                reply_to_message_id=message_id,
+            )
+            raise RetryableTelegramUpdateError(error.code) from error
         for index, bubble in enumerate(bubbles):
             self.client.send_message(
                 installation.chat_id,

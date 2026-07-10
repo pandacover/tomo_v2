@@ -10,6 +10,7 @@ from tomo_core.providers import StaticProvider
 from tomo_core.shared_gateway import InProcessTelegramRuntimeDispatch, SharedTelegramGateway
 from tomo_core.sandbox_dispatch import SandboxDispatchError
 from tomo_core.telegram import FakeTelegramClient
+from tomo_core.telegram_router import RetryableTelegramUpdateError
 
 
 def private_update(text, chat_id="123", from_id="123", message_id=1):
@@ -125,6 +126,21 @@ class SharedGatewayTests(unittest.TestCase):
             self.assertEqual([message["actor_id"] for message in client.sent_messages], ["123", "123"])
             self.assertEqual([message["text"] for message in client.sent_messages], ["first", "second"])
             self.assertEqual([message["reply_to_message_id"] for message in client.sent_messages], ["2", "earlier"])
+
+    def test_bound_dm_transient_delivery_failure_sends_one_retry_bubble_and_requests_router_retry(self):
+        with self._store() as store:
+            self._installation(store, chat_id="123", actor_id="999")
+            client = FakeTelegramClient()
+            dispatch = FakeRuntimeDispatch()
+            dispatch.deliver_telegram = Mock(side_effect=SandboxDispatchError("sandbox_exec_failed"))
+            gateway = SharedTelegramGateway(client=client, store=store, dispatch=dispatch)
+
+            with self.assertRaises(RetryableTelegramUpdateError) as raised:
+                gateway.process_update(private_update("hello", chat_id="123", from_id="999", message_id=2))
+
+            self.assertEqual(raised.exception.error_code, "sandbox_exec_failed")
+            self.assertEqual([message["text"] for message in client.sent_messages], ["tomo had trouble replying. try again in a moment."])
+            self.assertEqual([message["reply_to_message_id"] for message in client.sent_messages], ["2"])
 
     @staticmethod
     @contextmanager

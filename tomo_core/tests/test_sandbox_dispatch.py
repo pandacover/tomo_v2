@@ -77,6 +77,19 @@ class SandboxDispatchTests(unittest.TestCase):
         self.auth.access_token.assert_has_calls([unittest.mock.call(force_refresh=False), unittest.mock.call(force_refresh=True)])
         self.assertEqual(self.daytona.exec.call_count, 2)
 
+    def test_deliver_refreshes_once_when_auth_expired_result_exits_nonzero(self):
+        expired = encode_error("telegram:update:42", "auth_expired")
+        success = encode_result("telegram:update:42", [OutboundBubble("hello")])
+        self.daytona.exec.side_effect = [
+            ExecResult(1, f"{RESULT_MARKER}{expired}\n"),
+            ExecResult(0, f"{RESULT_MARKER}{success}\n"),
+        ]
+
+        self.assertEqual(self.dispatch.deliver_telegram(self.installation, 42, self.inbound), [OutboundBubble("hello")])
+
+        self.auth.access_token.assert_has_calls([unittest.mock.call(force_refresh=False), unittest.mock.call(force_refresh=True)])
+        self.assertEqual(self.daytona.exec.call_count, 2)
+
     def test_deliver_rejects_a_nonzero_exit_with_a_safe_code(self):
         self.daytona.exec.return_value = ExecResult(1, "provider traceback")
 
@@ -84,6 +97,17 @@ class SandboxDispatchTests(unittest.TestCase):
             self.dispatch.deliver_telegram(self.installation, 42, self.inbound)
 
         self.assertEqual(raised.exception.code, "sandbox_exec_failed")
+
+    def test_deliver_rejects_nonzero_success_or_invalid_result_markers_with_a_safe_code(self):
+        success = encode_result("telegram:update:42", [OutboundBubble("hello")])
+        for output in (f"{RESULT_MARKER}{success}\n", f"{RESULT_MARKER}not-json\n"):
+            with self.subTest(output=output):
+                self.daytona.exec.return_value = ExecResult(1, output)
+
+                with self.assertRaises(SandboxDispatchError) as raised:
+                    self.dispatch.deliver_telegram(self.installation, 42, self.inbound)
+
+                self.assertEqual(raised.exception.code, "sandbox_exec_failed")
 
     def test_deliver_rejects_an_execution_timeout_with_a_safe_code(self):
         self.daytona.exec.side_effect = TimeoutError()
