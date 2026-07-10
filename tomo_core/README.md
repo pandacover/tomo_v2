@@ -15,7 +15,11 @@ what is included:
 - static provider fallback for local bot smoke tests
 - langgraph-shaped turn graph, with a linear fallback when langgraph is not installed
 - soul injection into the model messages
-- one logical assistant turn stored in json session history
+- two-stage conversational loop: soul-aware move selection followed by move-specific realization
+- one primary conversational move plus up to two supporting moves
+- 1-4 intentional telegram utterances, each capped at three sentences
+- compact move metadata stored with one logical assistant turn
+- malformed realization receives one bounded repair attempt
 - delivery planner that emits 1 to 4 plain-text bubbles
 - first bubble replies to the triggering telegram message
 - no tool execution message bubbles

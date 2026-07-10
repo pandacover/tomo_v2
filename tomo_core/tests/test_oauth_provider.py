@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tomo_core.oauth import OAuthManager, OAuthProviderConfig
-from tomo_core.providers import OAuthBackedSuperGrokProvider
+from tomo_core.providers import OAuthBackedSuperGrokProvider, ProviderSetupRequired
 
 
 class OAuthBackedProviderTests(unittest.TestCase):
@@ -47,10 +47,11 @@ class OAuthBackedProviderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             oauth = OAuthManager(data_dir=tmp, providers={})
 
-            reply = OAuthBackedSuperGrokProvider(oauth=oauth).complete([{"role": "user", "content": "hi"}], actor_id="99")
+            with self.assertRaises(ProviderSetupRequired) as raised:
+                OAuthBackedSuperGrokProvider(oauth=oauth).complete([{"role": "user", "content": "hi"}], actor_id="99")
 
-            self.assertIn("/connect", reply)
-            self.assertIn("supergrok", reply)
+            self.assertIn("/connect", raised.exception.user_message)
+            self.assertIn("supergrok", raised.exception.user_message)
 
 
 if __name__ == "__main__":

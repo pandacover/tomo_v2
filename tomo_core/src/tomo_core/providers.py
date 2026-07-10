@@ -20,6 +20,12 @@ class ProviderAdapter(Protocol):
         ...
 
 
+class ProviderSetupRequired(RuntimeError):
+    def __init__(self, user_message: str) -> None:
+        self.user_message = user_message
+        super().__init__("provider setup required")
+
+
 @dataclass
 class XaiApiProvider:
     api_key: str
@@ -98,14 +104,14 @@ class OAuthBackedSuperGrokProvider:
 
     def complete(self, messages: list[dict[str, str]], actor_id: str | None = None) -> str:
         if not actor_id:
-            return "use /connect to connect supergrok oauth first."
+            raise ProviderSetupRequired("use /connect to connect supergrok oauth first.")
         token_path = self.oauth.token_path("supergrok", actor_id)
         if not token_path.exists():
-            return "use /connect to connect supergrok oauth first."
+            raise ProviderSetupRequired("use /connect to connect supergrok oauth first.")
         token = json.loads(token_path.read_text(encoding="utf-8"))
         access_token = token.get("access_token")
         if not access_token:
-            return "use /connect to connect supergrok oauth first."
+            raise ProviderSetupRequired("use /connect to connect supergrok oauth first.")
         return SuperGrokOAuthProvider(
             token_store=SuperGrokTokenStore(access_token=access_token),
             model=self.model,
@@ -128,7 +134,7 @@ class GrokAuthProvider:
     def complete(self, messages: list[dict[str, str]], actor_id: str | None = None) -> str:
         access_token = self.auth_store.access_token()
         if not access_token:
-            return "run grok login or grok login --device-auth first, then restart me."
+            raise ProviderSetupRequired("run grok login or grok login --device-auth first, then restart me.")
         return XaiApiProvider(api_key=access_token, model=self.model, base_url=self.base_url).complete(messages, actor_id=actor_id)
 
 
@@ -148,4 +154,16 @@ class StaticProvider:
     supports_tool_calls: bool = False
 
     def complete(self, messages: list[dict[str, str]], actor_id: str | None = None) -> str:
+        system_text = "\n".join(message["content"] for message in messages if message.get("role") == "system")
+        if '"primary_move"' in system_text and '"supporting_moves"' in system_text:
+            return json.dumps(
+                {
+                    "primary_move": "answer",
+                    "supporting_moves": [],
+                    "response_goal": "return the configured static smoke response",
+                    "confidence": "high",
+                }
+            )
+        if '"utterances"' in system_text:
+            return json.dumps({"utterances": [self.response]})
         return self.response

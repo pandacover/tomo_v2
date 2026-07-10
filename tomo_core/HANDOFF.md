@@ -27,6 +27,11 @@ implemented now:
 - TelegramBotApiClient with getUpdates, sendChatAction, sendMessage, answerCallbackQuery
 - TelegramPollingBot with dm-only text routing, /connect, and callback_query routing
 - DeliveryPlanner with plain-text cleanup and 1..4 bubble clamp
+- `tomo_core.conversation` with `ConversationEngine.respond(ConversationRequest) -> ConversationResult`
+- two normal model calls per valid turn: move selection, then soul-guided realization
+- at most one repair call when realization violates the utterance contract
+- compact assistant metadata records primary move, supporting moves, response goal, and confidence
+- intentional utterances preserve one logical assistant turn while sending 1..4 Telegram bubbles
 - SOUL.md loading
 - OAuthManager with pkce begin, callback/code exchange, pending challenge storage, and token storage
 - default google calendar oauth config with calendar.events scope
@@ -55,3 +60,7 @@ next slices:
 4. tools and memory
 - add web search, geolocation, durable memory, and image support in separate tested slices
 - keep tool execution invisible in normal telegram chat
+
+5. deferred conversation infrastructure
+- session identity, idempotent persistence, delivery retry duplication, durable memory, and deployment snapshot rollout remain separate work
+- the production Daytona snapshot does not contain conversation moves until a later approved snapshot build and Railway rollout

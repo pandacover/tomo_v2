@@ -13,6 +13,21 @@ from tomo_core.sandbox_protocol import RESULT_MARKER, encode_inbound
 
 
 class SandboxInboundTests(unittest.TestCase):
+    class ScriptedProvider:
+        name = "scripted"
+        supports_images_in = False
+        supports_images_out = False
+        supports_tool_calls = False
+
+        def __init__(self):
+            self.responses = [
+                '{"primary_move":"answer","supporting_moves":[],"response_goal":"answer","confidence":"high"}',
+                '{"utterances":["hello back.","second bubble."]}',
+            ]
+
+        def complete(self, messages, actor_id=None):
+            return self.responses.pop(0)
+
     def test_run_once_runs_an_envelope_without_a_telegram_client(self):
         envelope = InboundEnvelope(connector="telegram", actor_id="user-1", message_id="message-1", text="hello")
         stdout = io.StringIO()
@@ -78,18 +93,20 @@ class SandboxInboundTests(unittest.TestCase):
         stdout = io.StringIO()
 
         with tempfile.TemporaryDirectory() as data_dir:
-            runtime = build_runtime(StaticProvider("hello back"), RuntimeConfig(data_dir=data_dir))
+            runtime = build_runtime(self.ScriptedProvider(), RuntimeConfig(data_dir=data_dir))
             self.assertIsInstance(runtime.telegram, CollectingTelegramSink)
 
             result = run_once(
                 io.StringIO(encode_inbound("request-1", envelope)),
                 stdout,
                 config=RuntimeConfig(data_dir=data_dir),
-                provider=StaticProvider("hello back"),
+                provider=self.ScriptedProvider(),
             )
 
         self.assertEqual(result, 0)
-        self.assertIn('"text":"hello back"', stdout.getvalue())
+        self.assertIn('"text":"hello back."', stdout.getvalue())
+        self.assertIn('"text":"second bubble."', stdout.getvalue())
+        self.assertIn('"reply_to_message_id":"message-1"', stdout.getvalue())
 
     def test_run_once_maps_http_401_to_auth_expired_without_exception_text(self):
         envelope = InboundEnvelope(connector="telegram", actor_id="user-1", message_id="message-1", text="hello")

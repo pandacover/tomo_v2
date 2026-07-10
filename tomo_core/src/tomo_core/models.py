@@ -45,17 +45,39 @@ class OutboundBubble:
 
 
 @dataclass(frozen=True)
+class ResponseContract:
+    min_utterances: int = 1
+    max_utterances: int = 4
+    max_sentences_per_utterance: int = 3
+
+    def __post_init__(self) -> None:
+        if self.min_utterances != 1:
+            raise ValueError("min_utterances must be 1")
+        if self.max_utterances < self.min_utterances:
+            raise ValueError("max_utterances must be >= min_utterances")
+        if self.max_utterances > 4:
+            raise ValueError("max_utterances cannot exceed 4")
+        if self.max_sentences_per_utterance < 1:
+            raise ValueError("max_sentences_per_utterance must be at least 1")
+        if self.max_sentences_per_utterance > 3:
+            raise ValueError("max_sentences_per_utterance cannot exceed 3")
+
+
+@dataclass(frozen=True)
 class RuntimeConfig:
     max_bubbles: int = 4
     min_bubbles: int = 1
-    max_sentences_per_bubble: int = 2
+    max_sentences_per_bubble: int = 3
     data_dir: str = ".tomo_core"
     soul_path: str = "SOUL.md"
 
     def __post_init__(self) -> None:
-        if self.min_bubbles < 1:
-            raise ValueError("min_bubbles must be at least 1")
-        if self.max_bubbles < self.min_bubbles:
-            raise ValueError("max_bubbles must be >= min_bubbles")
-        if self.max_bubbles > 4:
-            raise ValueError("max_bubbles cannot exceed 4 for milestone 1")
+        self.response_contract
+
+    @property
+    def response_contract(self) -> ResponseContract:
+        return ResponseContract(
+            min_utterances=self.min_bubbles,
+            max_utterances=self.max_bubbles,
+            max_sentences_per_utterance=self.max_sentences_per_bubble,
+        )

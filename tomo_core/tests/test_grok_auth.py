@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tomo_core.grok_auth import GrokAuthStore
-from tomo_core.providers import GrokAuthProvider
+from tomo_core.providers import GrokAuthProvider, ProviderSetupRequired
 
 
 class GrokAuthTests(unittest.TestCase):
@@ -38,11 +38,12 @@ class GrokAuthTests(unittest.TestCase):
 
     def test_missing_grok_auth_returns_login_guidance(self):
         with tempfile.TemporaryDirectory() as tmp:
-            reply = GrokAuthProvider(auth_store=GrokAuthStore(auth_path=Path(tmp) / "missing.json")).complete(
-                [{"role": "user", "content": "hi"}], actor_id="99"
-            )
+            with self.assertRaises(ProviderSetupRequired) as raised:
+                GrokAuthProvider(auth_store=GrokAuthStore(auth_path=Path(tmp) / "missing.json")).complete(
+                    [{"role": "user", "content": "hi"}], actor_id="99"
+                )
 
-            self.assertIn("grok login", reply)
+            self.assertIn("grok login", raised.exception.user_message)
 
 
 if __name__ == "__main__":

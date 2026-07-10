@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .conversation import ConversationEngine, ConversationRequest
 from .delivery import DeliveryPlanner
 from .graph import build_langgraph_or_linear
 from .models import InboundEnvelope, RuntimeConfig
@@ -20,13 +21,11 @@ class PersonalAgentRuntime:
     ) -> None:
         self.config = config or RuntimeConfig()
         self.provider = provider
+        contract = self.config.response_contract
+        self.conversation = ConversationEngine(provider, contract=contract)
         self.telegram = telegram
         self.sessions = JsonSessionStore(self.config.data_dir)
-        self.delivery = DeliveryPlanner(
-            min_bubbles=self.config.min_bubbles,
-            max_bubbles=self.config.max_bubbles,
-            max_sentences_per_bubble=self.config.max_sentences_per_bubble,
-        )
+        self.delivery = DeliveryPlanner(contract=contract)
         self.graph = self._build_graph()
 
     def handle_telegram_text(self, envelope: InboundEnvelope) -> list[dict[str, str | None]]:
@@ -45,7 +44,7 @@ class PersonalAgentRuntime:
         return build_langgraph_or_linear(
             [
                 ("load_context", self._load_context),
-                ("draft_answer", self._draft_answer),
+                ("run_conversation", self._run_conversation),
                 ("compose_delivery", self._compose_delivery),
                 ("persist_turn", self._persist_turn),
             ]
@@ -55,33 +54,27 @@ class PersonalAgentRuntime:
         envelope: InboundEnvelope = state["envelope"]
         session = self.sessions.load(envelope.session_key)
         soul = load_soul(Path(self.config.soul_path))
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    f"{soul}\n\n"
-                    "runtime rules: reply in plain text. do not use markdown. "
-                    "do not mention invisible tool execution. stay conversational."
-                ),
-            },
-            *session.model_history(),
-            {"role": "user", "content": envelope.text},
-        ]
-        return {"session": session, "soul": soul, "messages": messages}
+        return {"session": session, "soul": soul}
 
-    def _draft_answer(self, state):
+    def _run_conversation(self, state):
         envelope: InboundEnvelope = state["envelope"]
-        answer = self.provider.complete(state["messages"], actor_id=envelope.actor_id)
-        return {"answer": answer}
+        request = ConversationRequest.from_history(
+            envelope=envelope,
+            soul=state["soul"],
+            history=state["session"].model_history(),
+        )
+        return {"conversation_result": self.conversation.respond(request)}
 
     def _compose_delivery(self, state):
         envelope: InboundEnvelope = state["envelope"]
-        bubbles = self.delivery.compose(state["answer"], reply_to_message_id=envelope.message_id)
+        result = state["conversation_result"]
+        bubbles = self.delivery.compose_utterances(result.utterances, reply_to_message_id=envelope.message_id)
         return {"bubbles": bubbles}
 
     def _persist_turn(self, state):
         envelope: InboundEnvelope = state["envelope"]
         session = state["session"]
+        result = state["conversation_result"]
         session.append(
             StoredMessage(
                 role="user",
@@ -92,9 +85,15 @@ class PersonalAgentRuntime:
         session.append(
             StoredMessage(
                 role="assistant",
-                content=state["answer"],
+                content=result.logical_text,
                 metadata={
                     "provider": self.provider.name,
+                    "conversation": {
+                        "primary_move": result.plan.primary.value,
+                        "supporting_moves": [move.value for move in result.plan.supporting],
+                        "response_goal": result.plan.response_goal,
+                        "confidence": result.plan.confidence.value,
+                    },
                     "delivery_bubbles": [bubble.text for bubble in state["bubbles"]],
                 },
             )

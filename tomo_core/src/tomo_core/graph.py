@@ -26,8 +26,7 @@ def build_langgraph_or_linear(nodes: list[tuple[str, Callable[[dict[str, Any]], 
             envelope: Any
             session: Any
             soul: Any
-            messages: Any
-            answer: Any
+            conversation_result: Any
             bubbles: Any
 
         state_schema = GraphState
