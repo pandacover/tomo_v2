@@ -1,85 +1,60 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
+from .daytona_supervisor import SandboxSupervisorError
 from .instances import RuntimeInstanceRegistry
-from .models import InboundEnvelope
-from .onboarding_store import TelegramOnboardingStore
+from .models import InboundEnvelope, OutboundBubble
+from .onboarding_store import TelegramInstallation, TelegramOnboardingStore
+from .sandbox_dispatch import TelegramRuntimeDispatchError
 from .telegram import TelegramClient
 
 
-@dataclass
-class TelegramRuntimeDispatch:
-    """Delivers a trusted Telegram chat's work to its personal runtime."""
+class TelegramRuntimeDispatch(Protocol):
+    def ensure_worker(self, installation: TelegramInstallation) -> None:
+        ...
 
-    client: TelegramClient
+    def deliver_telegram(
+        self, installation: TelegramInstallation, update_id: int, envelope: InboundEnvelope
+    ) -> list[OutboundBubble]:
+        ...
+
+
+@dataclass
+class InProcessTelegramRuntimeDispatch:
+    """Explicit local-mode adapter which returns bubbles without Telegram I/O."""
+
     instances: RuntimeInstanceRegistry
 
-    def send_setup(self, chat_id: str, tomo_id: str, reply_to_message_id: str) -> None:
-        self.client.send_message(chat_id, "tomo is setting up.", reply_to_message_id=reply_to_message_id)
+    def ensure_worker(self, installation: TelegramInstallation) -> None:
+        self.instances.get(installation.tomo_id)
 
-    def ensure_worker(self, tomo_id: str) -> None:
-        self.instances.get(tomo_id)
-
-    def send_connected(self, chat_id: str, reply_to_message_id: str) -> None:
-        self.client.send_message(chat_id, "tomo is connected. text me.", reply_to_message_id=reply_to_message_id)
-
-    def send_retry(self, chat_id: str, reply_to_message_id: str) -> None:
-        self.client.send_message(chat_id, "tomo is still setting up. try again in a moment.", reply_to_message_id=reply_to_message_id)
-
-    def dispatch(self, installation, envelope: InboundEnvelope) -> None:
+    def deliver_telegram(
+        self, installation: TelegramInstallation, update_id: int, envelope: InboundEnvelope
+    ) -> list[OutboundBubble]:
         runtime = self.instances.get(installation.tomo_id)
-        # A runtime session belongs to the Telegram sender, but Railway delivery
-        # must remain pinned to the installation's trusted chat.
         original_client = runtime.telegram.client
-        runtime.telegram.client = _BoundChatTelegramClient(self.client, installation.chat_id)
+        collector = _BubbleCollector()
+        runtime.telegram.client = collector
         try:
             runtime.handle_telegram_text(envelope)
         finally:
             runtime.telegram.client = original_client
+        return collector.bubbles
 
 
-@dataclass
-class HostedTelegramRuntimeDispatch:
-    """Keeps Telegram delivery on Railway while executing turns in Daytona."""
+class _BubbleCollector:
+    bubbles: list[OutboundBubble]
 
-    client: TelegramClient
-    supervisor: Any
-    sandbox_dispatch: Any
-
-    def send_setup(self, chat_id: str, tomo_id: str, reply_to_message_id: str) -> None:
-        self.client.send_message(chat_id, "tomo is setting up.", reply_to_message_id=reply_to_message_id)
-
-    def ensure_worker(self, tomo_id: str) -> None:
-        self.supervisor.reconcile(tomo_id)
-
-    def send_connected(self, chat_id: str, reply_to_message_id: str) -> None:
-        self.client.send_message(chat_id, "tomo is connected. text me.", reply_to_message_id=reply_to_message_id)
-
-    def send_retry(self, chat_id: str, reply_to_message_id: str) -> None:
-        self.client.send_message(chat_id, "tomo is still setting up. try again in a moment.", reply_to_message_id=reply_to_message_id)
-
-    def dispatch(self, installation, envelope: InboundEnvelope) -> None:
-        request_id = f"telegram:{installation.chat_id}:{envelope.message_id}"
-        for bubble in self.sandbox_dispatch(installation.tomo_id, request_id, envelope):
-            self.client.send_message(
-                installation.chat_id,
-                bubble.text,
-                reply_to_message_id=bubble.reply_to_message_id,
-            )
-
-
-@dataclass
-class _BoundChatTelegramClient:
-    client: TelegramClient
-    chat_id: str
+    def __init__(self) -> None:
+        self.bubbles = []
 
     def send_typing(self, actor_id: str) -> None:
-        self.client.send_typing(self.chat_id)
+        pass
 
     def send_message(self, actor_id: str, text: str, reply_to_message_id: str | None = None) -> None:
-        self.client.send_message(self.chat_id, text, reply_to_message_id=reply_to_message_id)
+        self.bubbles.append(OutboundBubble(text, reply_to_message_id))
 
 
 @dataclass
@@ -93,7 +68,7 @@ class SharedTelegramGateway:
         if self.dispatch is None:
             if self.instances is None:
                 raise ValueError("SharedTelegramGateway requires a TelegramRuntimeDispatch")
-            self.dispatch = TelegramRuntimeDispatch(client=self.client, instances=self.instances)
+            self.dispatch = InProcessTelegramRuntimeDispatch(instances=self.instances)
 
     def process_update(self, update: dict[str, Any]) -> bool:
         message = update.get("message")
@@ -120,21 +95,32 @@ class SharedTelegramGateway:
             self.client.send_message(chat_id, "open tomo from the dashboard first, then press start here.", reply_to_message_id=message_id)
             return True
 
-        self.dispatch.dispatch(
-            installation,
-            InboundEnvelope(
-                connector="telegram",
-                actor_id=actor_id,
-                message_id=message_id,
-                text=text,
-                native_metadata={
-                    "chat_id": chat_id,
-                    "delivery_chat_id": installation.chat_id,
-                    "from_id": actor_id,
-                    "tomo_id": installation.tomo_id,
-                },
-            ),
-        )
+        self.client.send_typing(installation.chat_id)
+        try:
+            bubbles = self.dispatch.deliver_telegram(
+                installation,
+                int(update.get("update_id", message_id)),
+                InboundEnvelope(
+                    connector="telegram",
+                    actor_id=actor_id,
+                    message_id=message_id,
+                    text=text,
+                    native_metadata={
+                        "chat_id": chat_id,
+                        "delivery_chat_id": installation.chat_id,
+                        "from_id": actor_id,
+                        "tomo_id": installation.tomo_id,
+                    },
+                ),
+            )
+        except (TelegramRuntimeDispatchError, SandboxSupervisorError):
+            return True
+        for index, bubble in enumerate(bubbles):
+            self.client.send_message(
+                installation.chat_id,
+                bubble.text,
+                reply_to_message_id=message_id if index == 0 else bubble.reply_to_message_id,
+            )
         return True
 
     def _handle_start(self, text: str, chat_id: str, actor_id: str, message_id: str) -> bool:
@@ -146,12 +132,12 @@ class SharedTelegramGateway:
         if installation is None:
             self.client.send_message(chat_id, "that tomo link expired. tap text tomo on the dashboard again.", reply_to_message_id=message_id)
             return True
-        self.dispatch.send_setup(chat_id, installation.tomo_id, message_id)
+        self.client.send_message(chat_id, "tomo is setting up.", reply_to_message_id=message_id)
         try:
-            self.dispatch.ensure_worker(installation.tomo_id)
-        except Exception:
+            self.dispatch.ensure_worker(installation)
+        except (TelegramRuntimeDispatchError, SandboxSupervisorError):
             # The installation is intentionally retained so a retry can resume setup.
-            self.dispatch.send_retry(chat_id, message_id)
+            self.client.send_message(chat_id, "tomo is still setting up. try again in a moment.", reply_to_message_id=message_id)
             return True
-        self.dispatch.send_connected(chat_id, message_id)
+        self.client.send_message(chat_id, "tomo is connected. text me.", reply_to_message_id=message_id)
         return True

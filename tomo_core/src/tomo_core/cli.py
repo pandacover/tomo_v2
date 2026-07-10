@@ -26,8 +26,7 @@ from .telegram import TelegramDeliverySink
 from .telegram_bot import TelegramBotApiClient, TelegramPollingBot
 from .onboarding_store import TelegramOnboardingStore
 from .telegram_router import TelegramUpdateRouter
-from .shared_gateway import SharedTelegramGateway
-from .shared_gateway import HostedTelegramRuntimeDispatch
+from .shared_gateway import InProcessTelegramRuntimeDispatch, SharedTelegramGateway
 from .sandbox_dispatch import SandboxDispatch
 from .sandbox_registry import SandboxRegistry
 from .sandbox_protocol import RESULT_MARKER, decode_inbound, encode_result
@@ -177,14 +176,14 @@ def run_shared_gateway_foreground(args: argparse.Namespace, config: HostedRuntim
         if config.runtime == "local":
             provider_factory = lambda _: StaticProvider(args.static_response) if args.static_response else build_provider(args, build_oauth_manager(args))
             instances = RuntimeInstanceRegistry(config.data_dir, provider_factory, client, soul_path=args.soul)
-            gateway = SharedTelegramGateway(client=client, store=store, instances=instances)
+            gateway = SharedTelegramGateway(client=client, store=store, dispatch=InProcessTelegramRuntimeDispatch(instances))
         else:
             auth = HostedGrokAuth.from_environment(auth_path=config.data_dir / "supergrok_auth.json")
             auth.bootstrap()
             registry = SandboxRegistry(config.data_dir)
             daytona = DaytonaClient()
             supervisor = DaytonaSupervisor(registry, daytona, snapshot=config.daytona_snapshot_name)
-            dispatch = HostedTelegramRuntimeDispatch(client, supervisor, SandboxDispatch(registry, daytona, auth.access_token).dispatch)
+            dispatch = SandboxDispatch(supervisor, daytona, auth)
             gateway = SharedTelegramGateway(client=client, store=store, dispatch=dispatch)
         print("shared telegram gateway polling started. press ctrl+c to stop.")
         TelegramUpdateRouter(

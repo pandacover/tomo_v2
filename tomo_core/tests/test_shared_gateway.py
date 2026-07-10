@@ -7,7 +7,8 @@ from tomo_core.instances import RuntimeInstanceRegistry
 from tomo_core.models import InboundEnvelope, OutboundBubble
 from tomo_core.onboarding_store import TelegramOnboardingStore
 from tomo_core.providers import StaticProvider
-from tomo_core.shared_gateway import HostedTelegramRuntimeDispatch, SharedTelegramGateway, TelegramRuntimeDispatch
+from tomo_core.shared_gateway import InProcessTelegramRuntimeDispatch, SharedTelegramGateway
+from tomo_core.sandbox_dispatch import SandboxDispatchError
 from tomo_core.telegram import FakeTelegramClient
 
 
@@ -27,8 +28,8 @@ class FakeRuntimeDispatch:
     def send_setup(self, chat_id, tomo_id, reply_to_message_id):
         self.calls.append(("setup", chat_id, tomo_id, reply_to_message_id))
 
-    def ensure_worker(self, tomo_id):
-        self.calls.append(("worker", tomo_id))
+    def ensure_worker(self, installation):
+        self.calls.append(("worker", installation))
         if self.worker_error:
             raise self.worker_error
 
@@ -38,8 +39,9 @@ class FakeRuntimeDispatch:
     def send_retry(self, chat_id, reply_to_message_id):
         self.calls.append(("retry", chat_id, reply_to_message_id))
 
-    def dispatch(self, installation, envelope):
-        self.calls.append(("dispatch", installation, envelope))
+    def deliver_telegram(self, installation, update_id, envelope):
+        self.calls.append(("dispatch", installation, update_id, envelope))
+        return [OutboundBubble("reply")]
 
 
 class SharedGatewayTests(unittest.TestCase):
@@ -47,23 +49,27 @@ class SharedGatewayTests(unittest.TestCase):
         with self._store() as store:
             link = store.create_install_link("user-1", "tmnvm_bot")
             dispatch = FakeRuntimeDispatch()
-            gateway = SharedTelegramGateway(client=FakeTelegramClient(), store=store, dispatch=dispatch)
+            client = FakeTelegramClient()
+            gateway = SharedTelegramGateway(client=client, store=store, dispatch=dispatch)
 
             gateway.process_update(private_update(f"/start {link.token}"))
 
             self.assertIsNotNone(store.installation_for_chat("123"))
-            self.assertEqual([call[0] for call in dispatch.calls], ["setup", "worker", "connected"])
+            self.assertEqual([call[0] for call in dispatch.calls], ["worker"])
+            self.assertEqual([message["text"] for message in client.sent_messages], ["tomo is setting up.", "tomo is connected. text me."])
 
     def test_start_keeps_binding_and_sends_retry_when_worker_setup_fails(self):
         with self._store() as store:
             link = store.create_install_link("user-1", "tmnvm_bot")
-            dispatch = FakeRuntimeDispatch(worker_error=RuntimeError("unavailable"))
-            gateway = SharedTelegramGateway(client=FakeTelegramClient(), store=store, dispatch=dispatch)
+            dispatch = FakeRuntimeDispatch(worker_error=SandboxDispatchError("unavailable"))
+            client = FakeTelegramClient()
+            gateway = SharedTelegramGateway(client=client, store=store, dispatch=dispatch)
 
             gateway.process_update(private_update(f"/start {link.token}"))
 
             self.assertIsNotNone(store.installation_for_chat("123"))
-            self.assertEqual([call[0] for call in dispatch.calls], ["setup", "worker", "retry"])
+            self.assertEqual([call[0] for call in dispatch.calls], ["worker"])
+            self.assertEqual([message["text"] for message in client.sent_messages], ["tomo is setting up.", "tomo is still setting up. try again in a moment."])
 
     def test_dm_routes_to_trusted_installation_with_sender_as_actor_and_bound_chat_as_target(self):
         with self._store() as store:
@@ -73,8 +79,9 @@ class SharedGatewayTests(unittest.TestCase):
 
             self.assertTrue(gateway.process_update(private_update("hi", chat_id="123", from_id="999", message_id=2)))
 
-            _, routed_installation, envelope = dispatch.calls[-1]
+            _, routed_installation, update_id, envelope = dispatch.calls[-1]
             self.assertEqual(routed_installation, installation)
+            self.assertEqual(update_id, 2)
             self.assertEqual(envelope.actor_id, "999")
             self.assertEqual(envelope.native_metadata["chat_id"], "123")
             self.assertEqual(envelope.native_metadata["delivery_chat_id"], "123")
@@ -95,7 +102,7 @@ class SharedGatewayTests(unittest.TestCase):
             gateway = SharedTelegramGateway(
                 client=client,
                 store=store,
-                dispatch=TelegramRuntimeDispatch(client=client, instances=instances),
+                dispatch=InProcessTelegramRuntimeDispatch(instances=instances),
             )
 
             gateway.process_update(private_update("hi", chat_id="123", from_id="999", message_id=2))
@@ -105,25 +112,19 @@ class SharedGatewayTests(unittest.TestCase):
             session = instances.get(installation.tomo_id).sessions.load("telegram:actor:999")
             self.assertEqual(session.model_history()[-2]["content"], "hi")
 
-    def test_hosted_runtime_dispatch_reconciles_and_sends_sandbox_bubbles_to_installation_chat(self):
+    def test_gateway_sends_bubbles_only_to_installation_chat_and_replies_to_the_trigger_first(self):
         with self._store() as store:
             installation = self._installation(store, chat_id="123", actor_id="999")
             client = FakeTelegramClient()
-            supervisor = Mock()
-            sandbox = Mock(return_value=[OutboundBubble("first", "2"), OutboundBubble("second")])
-            dispatch = HostedTelegramRuntimeDispatch(client, supervisor, sandbox)
+            dispatch = FakeRuntimeDispatch()
+            dispatch.deliver_telegram = Mock(return_value=[OutboundBubble("first"), OutboundBubble("second", "earlier")])
+            gateway = SharedTelegramGateway(client=client, store=store, dispatch=dispatch)
 
-            dispatch.send_setup("123", installation.tomo_id, "1")
-            dispatch.ensure_worker(installation.tomo_id)
-            dispatch.send_connected("123", "1")
-            dispatch.send_retry("123", "1")
-            dispatch.dispatch(installation, InboundEnvelope("telegram", "999", "2", "hello"))
+            gateway.process_update(private_update("hello", chat_id="123", from_id="999", message_id=2))
 
-            supervisor.reconcile.assert_called_once_with(installation.tomo_id)
-            sandbox.assert_called_once()
-            self.assertEqual([message["actor_id"] for message in client.sent_messages], ["123", "123", "123", "123", "123"])
-            self.assertEqual([message["text"] for message in client.sent_messages], ["tomo is setting up.", "tomo is connected. text me.", "tomo is still setting up. try again in a moment.", "first", "second"])
-            self.assertEqual(client.sent_messages[-2]["reply_to_message_id"], "2")
+            self.assertEqual([message["actor_id"] for message in client.sent_messages], ["123", "123"])
+            self.assertEqual([message["text"] for message in client.sent_messages], ["first", "second"])
+            self.assertEqual([message["reply_to_message_id"] for message in client.sent_messages], ["2", "earlier"])
 
     @staticmethod
     @contextmanager

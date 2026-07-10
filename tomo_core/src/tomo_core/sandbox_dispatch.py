@@ -1,78 +1,115 @@
-"""Host-side execution boundary for one sandboxed inbound turn."""
+"""Execution-only Telegram dispatch for a Daytona sandbox."""
 
 from __future__ import annotations
 
 from collections import defaultdict
 from threading import Lock
-from typing import Callable
+from typing import Protocol
 
 from .daytona_client import DaytonaClient, DaytonaClientError
-from .hosted_auth import HostedGrokAuth
+from .daytona_supervisor import DaytonaSupervisor
 from .models import InboundEnvelope, OutboundBubble
+from .onboarding_store import TelegramInstallation
 from .sandbox_protocol import SandboxProtocolError, encode_inbound, parse_result_marker
-from .sandbox_registry import SandboxRegistry
 
 
 DATA_DIR = "/home/daytona/.tomo"
 _COMMAND = "/opt/tomo/.venv/bin/tomo-core sandbox-inbound"
+_EXEC_TIMEOUT_SECONDS = 120
 
 
-class SandboxDispatchError(RuntimeError):
+class RailwayAuthBroker(Protocol):
+    def access_token(self) -> str:
+        ...
+
+    def refresh(self) -> None:
+        ...
+
+
+class TelegramRuntimeDispatchError(RuntimeError):
+    """A safe failure while dispatching a trusted Telegram update."""
+
     def __init__(self, code: str) -> None:
         self.code = code
-        super().__init__(f"sandbox dispatch failed: {code}")
+        super().__init__(f"telegram runtime dispatch failed: {code}")
+
+
+class SandboxDispatchError(TelegramRuntimeDispatchError):
+    pass
 
 
 class SandboxDispatch:
+    """Runs a trusted Telegram turn in Daytona without performing Telegram I/O."""
+
     _locks: defaultdict[str, Lock] = defaultdict(Lock)
 
     def __init__(
         self,
-        registry: SandboxRegistry,
-        daytona: DaytonaClient,
-        access_token: Callable[[], str] | None = None,
+        supervisor: DaytonaSupervisor,
+        client: DaytonaClient,
+        auth_broker: RailwayAuthBroker,
         *,
         data_dir: str = DATA_DIR,
     ) -> None:
-        self.registry = registry
-        self.daytona = daytona
-        self.access_token = access_token or _fresh_hosted_access_token
+        self.supervisor = supervisor
+        self.client = client
+        self.auth_broker = auth_broker
         self.data_dir = data_dir
 
-    def dispatch(self, tomo_id: str, request_id: str, inbound: InboundEnvelope) -> list[OutboundBubble]:
-        with self._locks[tomo_id]:
-            record = self.registry.get(tomo_id)
-            if record is None or record.status != "ready" or not record.sandbox_id:
+    def ensure_worker(self, installation: TelegramInstallation) -> None:
+        self.supervisor.reconcile(installation.tomo_id)
+
+    def deliver_telegram(
+        self, installation: TelegramInstallation, update_id: int, envelope: InboundEnvelope
+    ) -> list[OutboundBubble]:
+        request_id = f"telegram:update:{update_id}"
+        with self._locks[installation.tomo_id]:
+            record = self.supervisor.reconcile(installation.tomo_id)
+            if not record.sandbox_id:
                 raise SandboxDispatchError("sandbox_not_ready")
             try:
-                sandbox = self.daytona.get(record.sandbox_id)
-                token = self.access_token()
-                result = self.daytona.exec(
-                    sandbox,
-                    _COMMAND,
-                    env={
-                        "TOMO_INBOUND_JSON": encode_inbound(request_id, inbound),
-                        "TOMO_CORE_DATA_DIR": self.data_dir,
-                        "TOMO_INSTANCE_ID": tomo_id,
-                        "TOMO_SUPERGROK_ACCESS_TOKEN": token,
-                    },
-                )
-            except DaytonaClientError as error:
-                raise SandboxDispatchError("sandbox_exec_failed") from error
-            except Exception as error:
-                raise SandboxDispatchError("access_token_failed") from error
-            return self._parse(result.output, request_id)
+                bubbles = self._execute(record.sandbox_id, installation.tomo_id, request_id, envelope)
+            except SandboxProtocolError as error:
+                if error.code != "auth_expired":
+                    raise SandboxDispatchError(error.code) from error
+                try:
+                    self.auth_broker.refresh()
+                except Exception as refresh_error:
+                    raise SandboxDispatchError("auth_refresh_failed") from refresh_error
+                try:
+                    bubbles = self._execute(record.sandbox_id, installation.tomo_id, request_id, envelope)
+                except SandboxProtocolError as retry_error:
+                    raise SandboxDispatchError(retry_error.code) from retry_error
+            return bubbles
 
-    @staticmethod
-    def _parse(output: str, request_id: str) -> list[OutboundBubble]:
+    def _execute(self, sandbox_id: str, tomo_id: str, request_id: str, envelope: InboundEnvelope) -> list[OutboundBubble]:
         try:
-            return parse_result_marker(output, request_id)
-        except SandboxProtocolError as error:
-            raise SandboxDispatchError(error.code) from error
+            sandbox = self.client.get(sandbox_id)
+            token = self.auth_broker.access_token()
+            result = self.client.exec(
+                sandbox,
+                _COMMAND,
+                env={
+                    "TOMO_INBOUND_JSON": encode_inbound(request_id, envelope),
+                    "TOMO_CORE_DATA_DIR": self.data_dir,
+                    "TOMO_INSTANCE_ID": tomo_id,
+                    "TOMO_SUPERGROK_ACCESS_TOKEN": token,
+                },
+                timeout=_EXEC_TIMEOUT_SECONDS,
+            )
+        except TimeoutError as error:
+            raise SandboxDispatchError("sandbox_timeout") from error
+        except DaytonaClientError as error:
+            raise SandboxDispatchError("sandbox_exec_failed") from error
+        except SandboxDispatchError:
+            raise
+        except Exception as error:
+            raise SandboxDispatchError("access_token_failed") from error
+        if result.exit_code != 0:
+            raise SandboxDispatchError("sandbox_timeout" if result.exit_code == 124 else "sandbox_exec_failed")
+        try:
+            return parse_result_marker(result.output, request_id)
+        except SandboxProtocolError:
+            raise
         except ValueError as error:
             raise SandboxDispatchError("invalid_result") from error
-
-
-def _fresh_hosted_access_token() -> str:
-    """Refresh the host-managed credential immediately before a sandbox turn."""
-    return HostedGrokAuth.from_environment().access_token()

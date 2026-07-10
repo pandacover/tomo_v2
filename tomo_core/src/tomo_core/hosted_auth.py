@@ -89,6 +89,16 @@ class HostedGrokAuth:
             raise RuntimeError("hosted access token unavailable")
         return token["access_token"]
 
+    def refresh(self) -> None:
+        """Force one Railway-managed OAuth refresh after a sandbox rejection."""
+        if not self.bootstrap():
+            raise RuntimeError("hosted access token unavailable")
+        payload = self._read_auth()
+        if payload is None:
+            raise RuntimeError("hosted access token unavailable")
+        self._refresh_if_needed(payload, force=True)
+        self._write_auth(payload)
+
     def _decode(self) -> dict[str, Any]:
         try:
             raw = base64.b64decode(self.encoded_auth.encode("ascii"), validate=True)
@@ -113,7 +123,7 @@ class HostedGrokAuth:
         except OSError:
             return None
 
-    def _refresh_if_needed(self, payload: dict[str, Any]) -> bool:
+    def _refresh_if_needed(self, payload: dict[str, Any], *, force: bool = False) -> bool:
         token = _token_payload(payload)
         if token is None or not isinstance(token.get("refresh_token"), str):
             return False
@@ -121,7 +131,7 @@ class HostedGrokAuth:
             expires_at = int(token.get("expires_at", 0))
         except (TypeError, ValueError):
             expires_at = 0
-        if expires_at > time.time() + _REFRESH_WINDOW_SECONDS:
+        if not force and expires_at > time.time() + _REFRESH_WINDOW_SECONDS:
             return False
         config = OAuthManager.default_providers()["supergrok"]
         response = httpx.post(
