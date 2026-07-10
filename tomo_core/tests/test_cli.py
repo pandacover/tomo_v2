@@ -73,3 +73,10 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         provider_factory.assert_not_called()
+
+    def test_sandbox_health_succeeds_without_inbound_payload_or_model_credentials(self):
+        with patch.dict("os.environ", {}, clear=True), patch("sys.stdout", io.StringIO()) as stdout:
+            code = main(["sandbox-inbound", "--health"])
+
+        self.assertEqual(code, 0)
+        self.assertIn("TOMO_SANDBOX_RESULT=", stdout.getvalue())

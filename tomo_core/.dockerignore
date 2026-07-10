@@ -1,0 +1,6 @@
+.git
+.tomo_core
+.venv
+__pycache__
+*.py[cod]
+tests

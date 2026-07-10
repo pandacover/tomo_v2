@@ -318,19 +318,14 @@ def main(argv: list[str] | None = None) -> int:
         return start_shared_gateway_background(args)
 
     if args.command == "sandbox-inbound":
+        if args.health:
+            sys.stdout.write(f"{RESULT_MARKER}{encode_result('health-1', [OutboundBubble('healthy')])}\n")
+            sys.stdout.flush()
+            return 0
         payload = os.getenv("TOMO_INBOUND_JSON")
         if payload is None:
             emit_failure(sys.stdout, "missing_inbound")
             return 1
-        if args.health:
-            try:
-                request_id, _ = decode_inbound(payload)
-                sys.stdout.write(f"{RESULT_MARKER}{encode_result(request_id, [OutboundBubble('healthy')])}\n")
-                sys.stdout.flush()
-                return 0
-            except Exception:
-                emit_failure(sys.stdout, "invalid_inbound")
-                return 1
         access_token = os.getenv("TOMO_SUPERGROK_ACCESS_TOKEN")
         if not access_token:
             emit_failure(sys.stdout, "missing_access_token")
