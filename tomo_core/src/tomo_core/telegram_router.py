@@ -41,23 +41,37 @@ class TelegramUpdateRouter:
     idle_sleep_seconds: float = 0.2
     worker_count: int = 1
     max_attempts: int = 5
+    shutdown_timeout: float = 10.0
     on_error: Callable[[Exception], None] | None = None
     _stop_event: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
+    _workers: list[threading.Thread] = field(default_factory=list, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.store.reset_interrupted_updates()
 
     def run_forever(self) -> None:
-        workers = [threading.Thread(target=self._work_forever, daemon=True) for _ in range(self.worker_count)]
-        for worker in workers:
+        self._workers = [
+            threading.Thread(target=self._work_forever, name=f"telegram-update-worker-{index}", daemon=True)
+            for index in range(self.worker_count)
+        ]
+        for worker in self._workers:
             worker.start()
         offset: int | None = None
-        while not self._stop_event.is_set():
-            offset = self.poll_once(offset)
-            self._stop_event.wait(self.idle_sleep_seconds)
+        try:
+            while not self._stop_event.is_set():
+                offset = self.poll_once(offset)
+                self._stop_event.wait(self.idle_sleep_seconds)
+        finally:
+            self.stop()
 
     def stop(self) -> None:
         self._stop_event.set()
+        deadline = time.monotonic() + self.shutdown_timeout
+        current = threading.current_thread()
+        for worker in self._workers:
+            if worker is current or not worker.is_alive():
+                continue
+            worker.join(timeout=max(0, deadline - time.monotonic()))
 
     def poll_once(self, offset: int | None = None) -> int | None:
         next_offset = offset
@@ -67,8 +81,9 @@ class TelegramUpdateRouter:
                 update_id, chat_id, payload = compact
                 # Do not acknowledge this Telegram update until SQLite durably accepts it.
                 self.store.enqueue_update(update_id, chat_id, payload)
-            if "update_id" in update:
-                next_offset = int(update["update_id"]) + 1
+            update_id = update.get("update_id")
+            if isinstance(update_id, int):
+                next_offset = update_id + 1
         return next_offset
 
     def process_next(self, *, now: int | None = None) -> bool:

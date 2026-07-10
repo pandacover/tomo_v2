@@ -1,4 +1,6 @@
 import tempfile
+import threading
+import time
 import unittest
 
 from tomo_core.onboarding_store import TelegramOnboardingStore
@@ -53,6 +55,17 @@ class TelegramUpdateRouterTests(unittest.TestCase):
 
             self.assertEqual(store.claim_next_update().payload, '{"callback_query":{"message":{"chat":{"id":123,"type":"private"}}},"update_id":7}')
 
+    def test_duplicate_delivery_does_not_create_a_second_inbox_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TelegramOnboardingStore(tmp)
+            update = private_update(7)
+            router = TelegramUpdateRouter(client=FakeTelegramClient([update]), store=store, process_update=lambda _: None)
+
+            self.assertEqual(router.poll_once(), 8)
+            self.assertEqual(router.poll_once(7), 8)
+            self.assertEqual(store.claim_next_update().update_id, 7)
+            self.assertIsNone(store.claim_next_update())
+
     def test_startup_recovers_interrupted_work_and_worker_completes_it(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = TelegramOnboardingStore(tmp)
@@ -100,6 +113,28 @@ class TelegramUpdateRouterTests(unittest.TestCase):
             store.retry_update(retry.update_id, retry.error_code, now=1)
             self.assertTrue(router.process_next(now=3))
             self.assertIsNone(store.claim_next_update(now=999))
+
+    def test_stop_joins_idle_workers_within_the_shutdown_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            router = TelegramUpdateRouter(
+                client=FakeTelegramClient([]),
+                store=TelegramOnboardingStore(tmp),
+                process_update=lambda _: None,
+                idle_sleep_seconds=10,
+                shutdown_timeout=0.2,
+            )
+            runner = threading.Thread(target=router.run_forever)
+            runner.start()
+            deadline = time.monotonic() + 1
+            while not any(thread.name.startswith("telegram-update-worker") for thread in threading.enumerate()):
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.01)
+
+            router.stop()
+            runner.join(timeout=0.5)
+
+            self.assertFalse(runner.is_alive())
+            self.assertFalse(any(thread.name.startswith("telegram-update-worker") for thread in threading.enumerate()))
 
 
 if __name__ == "__main__":

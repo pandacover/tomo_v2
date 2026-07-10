@@ -86,6 +86,26 @@ class TelegramBotTests(unittest.TestCase):
             self.assertEqual(client.sent_messages[0]["chat_id"], "99")
             self.assertEqual(client.sent_messages[0]["reply_to_message_id"], "5")
 
+    def test_process_update_propagates_runtime_failures_for_durable_retry(self):
+        class FailingRuntime:
+            def handle_telegram_text(self, envelope):
+                raise RuntimeError("temporary dispatch failure")
+
+        reported = []
+        with self.assertRaisesRegex(RuntimeError, "temporary dispatch failure"):
+            TelegramPollingBot(client=FakeBotApiClient([]), runtime=FailingRuntime(), on_error=reported.append).process_update(
+                {
+                    "update_id": 42,
+                    "message": {
+                        "message_id": 5,
+                        "from": {"id": 99},
+                        "chat": {"id": 99, "type": "private"},
+                        "text": "yo",
+                    },
+                }
+            )
+        self.assertEqual(len(reported), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

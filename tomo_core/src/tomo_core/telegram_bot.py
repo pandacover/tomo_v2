@@ -134,8 +134,9 @@ class TelegramPollingBot:
         except Exception as exc:
             if self.on_error:
                 self.on_error(exc)
-            else:
-                raise
+            # The durable router owns retry policy, so it must observe failures
+            # even when a caller also wants them reported.
+            raise
 
     def _handle_connect_update(self, update: dict[str, Any]) -> bool:
         if "callback_query" in update:
