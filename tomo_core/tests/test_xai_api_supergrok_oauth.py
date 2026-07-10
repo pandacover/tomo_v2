@@ -48,7 +48,7 @@ class NamingMigrationTests(unittest.TestCase):
             static_response=None,
             xai_api_key="api-key",
             xai_access_token=None,
-            model="grok-composer-2.5-fast",
+            model="grok-4.5",
         )
 
         provider = build_provider(args, OAuthManager(data_dir=tempfile.mkdtemp(), providers={}))
@@ -61,7 +61,7 @@ class NamingMigrationTests(unittest.TestCase):
             static_response=None,
             xai_api_key=None,
             xai_access_token=None,
-            model="grok-composer-2.5-fast",
+            model="grok-4.5",
         )
 
         provider = build_provider(args, OAuthManager(data_dir=tempfile.mkdtemp(), providers={}))
@@ -86,7 +86,9 @@ class NamingMigrationTests(unittest.TestCase):
 
             self.assertEqual(reply, "supergrok reply")
             self.assertEqual(post.call_args.kwargs["headers"]["Authorization"], "Bearer supergrok-access")
-            self.assertEqual(post.call_args.kwargs["json"]["reasoning"], {"effort": "high"})
+            request_body = post.call_args.kwargs["json"]
+            self.assertEqual(request_body["reasoning_effort"], "high")
+            self.assertNotIn("reasoning", request_body)
 
     def test_supergrok_fixed_token_provider_does_not_delegate_to_xai_api_provider(self):
         class FakeResponse:

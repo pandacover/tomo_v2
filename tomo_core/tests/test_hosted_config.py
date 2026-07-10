@@ -20,6 +20,8 @@ class HostedRuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config.runtime, "local")
         self.assertEqual(config.worker_count, 4)
         self.assertEqual(config.poll_timeout, 30)
+        self.assertEqual(config.xai_model, "grok-4.5")
+        self.assertEqual(config.xai_reasoning_effort, "high")
 
     def test_local_mode_rejects_each_daytona_hosted_variable(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -75,6 +77,27 @@ class HostedRuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config.daytona_sandbox_data_dir, "/var/lib/tomo")
         self.assertEqual(config.poll_timeout, 45)
         self.assertEqual(config.worker_count, 8)
+        self.assertEqual(config.xai_model, "grok-4.5")
+        self.assertEqual(config.xai_reasoning_effort, "high")
+
+    def test_daytona_mode_loads_xai_model_and_reasoning_effort_overrides(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = HostedRuntimeConfig.from_env(
+                {
+                    "TOMO_HOSTED_RUNTIME": "daytona",
+                    "TOMO_TELEGRAM_GLOBAL_BOT_TOKEN": "bot-token",
+                    "TOMO_CORE_DATA_DIR": tmp,
+                    "DAYTONA_API_KEY": "daytona-key",
+                    "TOMO_DAYTONA_SNAPSHOT": "tomo-snapshot",
+                    "TOMO_DAYTONA_SANDBOX_DATA_DIR": "/var/lib/tomo",
+                    "TOMO_SUPERGROK_OAUTH_JSON_B64": base64.b64encode(b"{}").decode("ascii"),
+                    "TOMO_XAI_MODEL": "grok-test-next",
+                    "TOMO_XAI_REASONING_EFFORT": "low",
+                }
+            )
+
+        self.assertEqual(config.xai_model, "grok-test-next")
+        self.assertEqual(config.xai_reasoning_effort, "low")
 
     def test_daytona_missing_configuration_reports_names_not_secret_values(self):
         with tempfile.TemporaryDirectory() as tmp:

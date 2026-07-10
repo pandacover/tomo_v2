@@ -11,6 +11,8 @@ from typing import Mapping
 
 _MAX_POLL_TIMEOUT = 60
 _MAX_ROUTER_WORKERS = 32
+_DEFAULT_XAI_MODEL = "grok-4.5"
+_DEFAULT_XAI_REASONING_EFFORT = "high"
 _DAYTONA_HOSTED_VARIABLES = (
     "DAYTONA_API_KEY",
     "DAYTONA_API_URL",
@@ -32,6 +34,8 @@ class HostedRuntimeConfig:
     oauth_json_b64: str | None
     poll_timeout: int
     worker_count: int
+    xai_model: str
+    xai_reasoning_effort: str
 
     @classmethod
     def from_env(
@@ -107,6 +111,8 @@ class HostedRuntimeConfig:
             oauth_json_b64=values.get("TOMO_SUPERGROK_OAUTH_JSON_B64") if runtime == "daytona" else None,
             poll_timeout=resolved_poll_timeout,
             worker_count=worker_count,
+            xai_model=values.get("TOMO_XAI_MODEL", _DEFAULT_XAI_MODEL),
+            xai_reasoning_effort=values.get("TOMO_XAI_REASONING_EFFORT", _DEFAULT_XAI_REASONING_EFFORT),
         )
 
 

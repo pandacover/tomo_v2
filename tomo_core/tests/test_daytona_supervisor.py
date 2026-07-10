@@ -20,7 +20,15 @@ class DaytonaSupervisorTests(unittest.TestCase):
         self.daytona.exec.return_value.output = f"{RESULT_MARKER}{encode_result('health-1', [OutboundBubble('healthy')])}\n"
         self.auth = Mock()
         self.auth.access_token.return_value = "fresh-token"
-        self.supervisor = DaytonaSupervisor(self.registry, self.daytona, self.auth, snapshot="base-v1", data_dir="/var/lib/tomo")
+        self.supervisor = DaytonaSupervisor(
+            self.registry,
+            self.daytona,
+            self.auth,
+            snapshot="base-v1",
+            data_dir="/var/lib/tomo",
+            xai_model="grok-4.5",
+            xai_reasoning_effort="high",
+        )
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -37,12 +45,22 @@ class DaytonaSupervisorTests(unittest.TestCase):
         env = self.daytona.exec.call_args.kwargs["env"]
         self.assertEqual(
             set(env),
-            {"TOMO_CORE_DATA_DIR", "TOMO_INSTANCE_ID", "TOMO_INBOUND_JSON", "TOMO_SUPERGROK_ACCESS_TOKEN", "TOMO_CORE_SOUL"},
+            {
+                "TOMO_CORE_DATA_DIR",
+                "TOMO_INSTANCE_ID",
+                "TOMO_INBOUND_JSON",
+                "TOMO_SUPERGROK_ACCESS_TOKEN",
+                "TOMO_CORE_SOUL",
+                "TOMO_XAI_MODEL",
+                "TOMO_XAI_REASONING_EFFORT",
+            },
         )
         self.assertEqual(env["TOMO_CORE_DATA_DIR"], "/var/lib/tomo")
         self.assertEqual(env["TOMO_INSTANCE_ID"], "tomo-alice@example.com-42")
         self.assertEqual(env["TOMO_SUPERGROK_ACCESS_TOKEN"], "fresh-token")
         self.assertEqual(env["TOMO_CORE_SOUL"], "/opt/tomo/SOUL.md")
+        self.assertEqual(env["TOMO_XAI_MODEL"], "grok-4.5")
+        self.assertEqual(env["TOMO_XAI_REASONING_EFFORT"], "high")
         self.assertIn("TOMO_INBOUND_JSON", env)
 
     def test_reconcile_creates_the_deterministic_volume_when_it_is_missing(self):

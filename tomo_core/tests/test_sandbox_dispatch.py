@@ -1,6 +1,6 @@
 import tempfile
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from tomo_core.daytona_client import ExecResult, SandboxHandle
 from tomo_core.models import InboundEnvelope
@@ -22,7 +22,14 @@ class SandboxDispatchTests(unittest.TestCase):
         self.supervisor.reconcile.return_value = self.registry.get("tomo-a")
         self.auth = Mock()
         self.auth.access_token.return_value = "fresh-token"
-        self.dispatch = SandboxDispatch(self.supervisor, self.daytona, self.auth, data_dir="/var/lib/tomo")
+        self.dispatch = SandboxDispatch(
+            self.supervisor,
+            self.daytona,
+            self.auth,
+            data_dir="/var/lib/tomo",
+            xai_model="grok-4.5",
+            xai_reasoning_effort="high",
+        )
         self.installation = TelegramInstallation("user", "tomo-a", "chat", "user", 0)
         self.inbound = InboundEnvelope(connector="telegram", actor_id="user", message_id="message", text="hello")
 
@@ -44,12 +51,22 @@ class SandboxDispatchTests(unittest.TestCase):
         env = self.daytona.exec.call_args.kwargs["env"]
         self.assertEqual(
             set(env),
-            {"TOMO_INBOUND_JSON", "TOMO_CORE_DATA_DIR", "TOMO_INSTANCE_ID", "TOMO_SUPERGROK_ACCESS_TOKEN", "TOMO_CORE_SOUL"},
+            {
+                "TOMO_INBOUND_JSON",
+                "TOMO_CORE_DATA_DIR",
+                "TOMO_INSTANCE_ID",
+                "TOMO_SUPERGROK_ACCESS_TOKEN",
+                "TOMO_CORE_SOUL",
+                "TOMO_XAI_MODEL",
+                "TOMO_XAI_REASONING_EFFORT",
+            },
         )
         self.assertEqual(env["TOMO_CORE_DATA_DIR"], "/var/lib/tomo")
         self.assertEqual(env["TOMO_INSTANCE_ID"], "tomo-a")
         self.assertEqual(env["TOMO_SUPERGROK_ACCESS_TOKEN"], "fresh-token")
         self.assertEqual(env["TOMO_CORE_SOUL"], "/opt/tomo/SOUL.md")
+        self.assertEqual(env["TOMO_XAI_MODEL"], "grok-4.5")
+        self.assertEqual(env["TOMO_XAI_REASONING_EFFORT"], "high")
         self.assertIn('"text":"hello"', env["TOMO_INBOUND_JSON"])
         self.assertNotIn("hello", command)
         self.assertEqual(self.daytona.exec.call_args.kwargs["timeout"], 120)
@@ -76,6 +93,25 @@ class SandboxDispatchTests(unittest.TestCase):
         self.auth.refresh.assert_not_called()
         self.auth.access_token.assert_has_calls([unittest.mock.call(force_refresh=False), unittest.mock.call(force_refresh=True)])
         self.assertEqual(self.daytona.exec.call_count, 2)
+
+    def test_deliver_reads_xai_environment_overrides_on_each_turn(self):
+        first = encode_result("telegram:update:1", [OutboundBubble("first")])
+        second = encode_result("telegram:update:2", [OutboundBubble("second")])
+        self.daytona.exec.side_effect = [
+            ExecResult(0, f"{RESULT_MARKER}{first}\n"),
+            ExecResult(0, f"{RESULT_MARKER}{second}\n"),
+        ]
+
+        self.dispatch.deliver_telegram(self.installation, 1, self.inbound)
+        with patch.dict("os.environ", {"TOMO_XAI_MODEL": "grok-next", "TOMO_XAI_REASONING_EFFORT": "low"}):
+            self.dispatch.deliver_telegram(self.installation, 2, self.inbound)
+
+        first_env = self.daytona.exec.call_args_list[0].kwargs["env"]
+        second_env = self.daytona.exec.call_args_list[1].kwargs["env"]
+        self.assertEqual(first_env["TOMO_XAI_MODEL"], "grok-4.5")
+        self.assertEqual(first_env["TOMO_XAI_REASONING_EFFORT"], "high")
+        self.assertEqual(second_env["TOMO_XAI_MODEL"], "grok-next")
+        self.assertEqual(second_env["TOMO_XAI_REASONING_EFFORT"], "low")
 
     def test_deliver_refreshes_once_when_auth_expired_result_exits_nonzero(self):
         expired = encode_error("telegram:update:42", "auth_expired")

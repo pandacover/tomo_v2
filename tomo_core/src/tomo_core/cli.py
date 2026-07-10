@@ -183,9 +183,22 @@ def run_shared_gateway_foreground(args: argparse.Namespace, config: HostedRuntim
             registry = SandboxRegistry(config.data_dir)
             daytona = DaytonaClient()
             supervisor = DaytonaSupervisor(
-                registry, daytona, auth, snapshot=config.daytona_snapshot, data_dir=config.daytona_sandbox_data_dir
+                registry,
+                daytona,
+                auth,
+                snapshot=config.daytona_snapshot,
+                data_dir=config.daytona_sandbox_data_dir,
+                xai_model=config.xai_model,
+                xai_reasoning_effort=config.xai_reasoning_effort,
             )
-            dispatch = SandboxDispatch(supervisor, daytona, auth, data_dir=config.daytona_sandbox_data_dir)
+            dispatch = SandboxDispatch(
+                supervisor,
+                daytona,
+                auth,
+                data_dir=config.daytona_sandbox_data_dir,
+                xai_model=config.xai_model,
+                xai_reasoning_effort=config.xai_reasoning_effort,
+            )
             gateway = SharedTelegramGateway(client=client, store=store, dispatch=dispatch)
         print("shared telegram gateway polling started. press ctrl+c to stop.")
         TelegramUpdateRouter(
@@ -210,7 +223,7 @@ def main(argv: list[str] | None = None) -> int:
     start.add_argument("--token", default=os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TOMO_TELEGRAM_BOT_TOKEN"))
     start.add_argument("--data-dir", default=os.getenv("TOMO_CORE_DATA_DIR", ".tomo_core"))
     start.add_argument("--soul", default=os.getenv("TOMO_CORE_SOUL", "SOUL.md"))
-    start.add_argument("--model", default=os.getenv("TOMO_XAI_MODEL", "grok-composer-2.5-fast"))
+    start.add_argument("--model", default=os.getenv("TOMO_XAI_MODEL", "grok-4.5"))
     start.add_argument("--xai-api-key", default=None)
     start.add_argument("--use-grok-login", action="store_true", help="use ~/.grok/auth.json from `grok login`")
     start.add_argument("--supergrok-client-id", default=None)
@@ -237,7 +250,7 @@ def main(argv: list[str] | None = None) -> int:
     shared_start.add_argument("--bot-username", default=os.getenv("TOMO_TELEGRAM_GLOBAL_BOT_USERNAME"))
     shared_start.add_argument("--data-dir", default=os.getenv("TOMO_CORE_DATA_DIR", ".tomo_core"))
     shared_start.add_argument("--soul", default=os.getenv("TOMO_CORE_SOUL", "SOUL.md"))
-    shared_start.add_argument("--model", default=os.getenv("TOMO_XAI_MODEL", "grok-composer-2.5-fast"))
+    shared_start.add_argument("--model", default=os.getenv("TOMO_XAI_MODEL", "grok-4.5"))
     shared_start.add_argument("--xai-api-key", default=None)
     shared_start.add_argument("--use-grok-login", action="store_true", help="use ~/.grok/auth.json from `grok login`")
     shared_start.add_argument("--supergrok-client-id", default=None)
@@ -256,7 +269,7 @@ def main(argv: list[str] | None = None) -> int:
     shared_restart.add_argument("--bot-username", default=os.getenv("TOMO_TELEGRAM_GLOBAL_BOT_USERNAME"))
     shared_restart.add_argument("--data-dir", default=os.getenv("TOMO_CORE_DATA_DIR", ".tomo_core"))
     shared_restart.add_argument("--soul", default=os.getenv("TOMO_CORE_SOUL", "SOUL.md"))
-    shared_restart.add_argument("--model", default=os.getenv("TOMO_XAI_MODEL", "grok-composer-2.5-fast"))
+    shared_restart.add_argument("--model", default=os.getenv("TOMO_XAI_MODEL", "grok-4.5"))
     shared_restart.add_argument("--xai-api-key", default=None)
     shared_restart.add_argument("--use-grok-login", action="store_true", help="use ~/.grok/auth.json from `grok login`")
     shared_restart.add_argument("--supergrok-client-id", default=None)
@@ -329,7 +342,11 @@ def main(argv: list[str] | None = None) -> int:
             emit_failure(sys.stdout, "missing_data_dir")
             return 1
         try:
-            provider = supergrok_oauth_provider_from_access_token(access_token)
+            provider = supergrok_oauth_provider_from_access_token(
+                access_token,
+                model=os.getenv("TOMO_XAI_MODEL", "grok-4.5"),
+                reasoning_effort=os.getenv("TOMO_XAI_REASONING_EFFORT", "high"),
+            )
             return run_once(
                 io.StringIO(payload),
                 sys.stdout,

@@ -19,6 +19,8 @@ Set these variables on the core service. Values marked required are required for
 | `TOMO_CONTROL_PORT` | no | Defaults to Railway `$PORT`, or `8787` if `PORT` is absent. |
 | `TOMO_TELEGRAM_POLL_TIMEOUT` | no | Long-poll seconds, default `30`; valid range is `1..60`. |
 | `TOMO_ROUTER_WORKERS` | no | Durable inbox worker count, default `4`; valid range is `1..32`. |
+| `TOMO_XAI_MODEL` | no | Model used for hosted Daytona sandbox turns and local model providers, default `grok-4.5`. Changes are included in the sandbox environment on the next turn. |
+| `TOMO_XAI_REASONING_EFFORT` | no | Reasoning effort passed to SuperGrok/xAI chat completions in hosted Daytona sandboxes, default `high`. Changes are included in the sandbox environment on the next turn. |
 | `DAYTONA_API_KEY` | `daytona` | Daytona API credential. |
 | `TOMO_DAYTONA_SNAPSHOT` | `daytona` | Active, immutable Daytona snapshot name. |
 | `TOMO_DAYTONA_SANDBOX_DATA_DIR` | `daytona` | Absolute POSIX path for the mounted per-user volume, normally `/var/lib/tomo`. |
@@ -49,6 +51,8 @@ uv run python scripts/create_daytona_snapshot.py --name tomo-core-20260710-1
 ```
 
 The script builds `Dockerfile.daytona` and succeeds only when Daytona reports `active`. Put that exact name in `TOMO_DAYTONA_SNAPSHOT`, then redeploy Railway. On a user's next setup or message, reconciliation deletes that user's sandbox if its recorded or reported snapshot differs and creates a replacement with the existing named volume mounted at `TOMO_DAYTONA_SANDBOX_DATA_DIR`.
+
+The first rollout of model environment support requires a snapshot containing that code. After every sandbox is on such a snapshot, changing only `TOMO_XAI_MODEL` or `TOMO_XAI_REASONING_EFFORT` requires a Railway redeploy but no new Daytona snapshot; the new values are passed on each turn.
 
 Never reuse a name for changed content. If an accidental name must be rebuilt, the explicit destructive command is:
 
@@ -82,4 +86,4 @@ For a non-Railway background listener, `telegram-shared start --background` writ
 
 ## Security boundary
 
-Railway alone receives and retains `TOMO_TELEGRAM_GLOBAL_BOT_TOKEN`, `DAYTONA_API_KEY`, optional `XAI_API_KEY`, and the SuperGrok bootstrap JSON/refresh token. The sandbox execution environment receives only `TOMO_INBOUND_JSON`, `TOMO_CORE_DATA_DIR`, `TOMO_INSTANCE_ID`, `TOMO_CORE_SOUL`, and the current `TOMO_SUPERGROK_ACCESS_TOKEN` for that one command. Sandboxes receive no Telegram credentials, API keys, bootstrap JSON, or refresh token. Treat Railway volume backups and service-variable access as credential-sensitive.
+Railway alone receives and retains `TOMO_TELEGRAM_GLOBAL_BOT_TOKEN`, `DAYTONA_API_KEY`, optional `XAI_API_KEY`, and the SuperGrok bootstrap JSON/refresh token. The sandbox execution environment receives only `TOMO_INBOUND_JSON`, `TOMO_CORE_DATA_DIR`, `TOMO_INSTANCE_ID`, `TOMO_CORE_SOUL`, `TOMO_XAI_MODEL`, `TOMO_XAI_REASONING_EFFORT`, and the current `TOMO_SUPERGROK_ACCESS_TOKEN` for that one command. Sandboxes receive no Telegram credentials, API keys, bootstrap JSON, or refresh token. Treat Railway volume backups and service-variable access as credential-sensitive.

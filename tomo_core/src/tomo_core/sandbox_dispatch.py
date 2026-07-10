@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections import defaultdict
 from threading import Lock
 from typing import Protocol
@@ -46,11 +47,15 @@ class SandboxDispatch:
         auth_broker: RailwayAuthBroker,
         *,
         data_dir: str,
+        xai_model: str,
+        xai_reasoning_effort: str,
     ) -> None:
         self.supervisor = supervisor
         self.client = client
         self.auth_broker = auth_broker
         self.data_dir = data_dir
+        self.xai_model = xai_model
+        self.xai_reasoning_effort = xai_reasoning_effort
 
     def ensure_worker(self, installation: TelegramInstallation) -> None:
         self.supervisor.reconcile(installation.tomo_id)
@@ -89,6 +94,8 @@ class SandboxDispatch:
                     "TOMO_INSTANCE_ID": tomo_id,
                     "TOMO_SUPERGROK_ACCESS_TOKEN": token,
                     "TOMO_CORE_SOUL": "/opt/tomo/SOUL.md",
+                    "TOMO_XAI_MODEL": os.getenv("TOMO_XAI_MODEL", self.xai_model),
+                    "TOMO_XAI_REASONING_EFFORT": os.getenv("TOMO_XAI_REASONING_EFFORT", self.xai_reasoning_effort),
                 },
                 timeout=_EXEC_TIMEOUT_SECONDS,
             )

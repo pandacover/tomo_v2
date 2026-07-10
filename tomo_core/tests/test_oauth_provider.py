@@ -39,7 +39,9 @@ class OAuthBackedProviderTests(unittest.TestCase):
 
             self.assertEqual(reply, "real supergrok reply")
             self.assertEqual(post.call_args.kwargs["headers"]["Authorization"], "Bearer actor-access")
-            self.assertEqual(post.call_args.kwargs["json"]["reasoning"], {"effort": "high"})
+            request_body = post.call_args.kwargs["json"]
+            self.assertEqual(request_body["reasoning_effort"], "high")
+            self.assertNotIn("reasoning", request_body)
 
     def test_missing_supergrok_token_returns_connect_guidance(self):
         with tempfile.TemporaryDirectory() as tmp:

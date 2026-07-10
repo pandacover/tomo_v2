@@ -59,11 +59,34 @@ class CliTests(unittest.TestCase):
             code = main(["sandbox-inbound"])
 
         self.assertEqual(code, 0)
-        provider_factory.assert_called_once_with(token)
+        provider_factory.assert_called_once_with(token, model="grok-4.5", reasoning_effort="high")
         runtime_config.assert_called_once_with(data_dir="/data", soul_path="/soul")
         self.assertEqual(run_once.call_args.args[0].read(), "payload")
         self.assertIs(run_once.call_args.kwargs["config"], runtime_config.return_value)
         self.assertEqual(run_once.call_args.kwargs["secret_values"], (token,))
+
+    def test_sandbox_inbound_uses_xai_model_and_reasoning_effort_environment_overrides(self):
+        token = "supergrok-access-token"
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "TOMO_SUPERGROK_ACCESS_TOKEN": token,
+                    "TOMO_INBOUND_JSON": "payload",
+                    "TOMO_CORE_DATA_DIR": "/data",
+                    "TOMO_XAI_MODEL": "grok-test-next",
+                    "TOMO_XAI_REASONING_EFFORT": "low",
+                },
+                clear=True,
+            ),
+            patch("tomo_core.cli.supergrok_oauth_provider_from_access_token") as provider_factory,
+            patch("tomo_core.cli.run_once", return_value=0),
+            patch("sys.stdout", io.StringIO()),
+        ):
+            code = main(["sandbox-inbound"])
+
+        self.assertEqual(code, 0)
+        provider_factory.assert_called_once_with(token, model="grok-test-next", reasoning_effort="low")
 
     def test_sandbox_health_reads_environment_payload_without_constructing_a_provider(self):
         with (

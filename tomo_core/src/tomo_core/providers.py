@@ -23,7 +23,7 @@ class ProviderAdapter(Protocol):
 @dataclass
 class XaiApiProvider:
     api_key: str
-    model: str = "grok-composer-2.5-fast"
+    model: str = "grok-4.5"
     base_url: str = "https://api.x.ai/v1"
     reasoning_effort: str | None = None
 
@@ -35,7 +35,7 @@ class XaiApiProvider:
     def complete(self, messages: list[dict[str, str]], actor_id: str | None = None) -> str:
         request_body = {"model": self.model, "messages": messages}
         if self.reasoning_effort:
-            request_body["reasoning"] = {"effort": self.reasoning_effort}
+            request_body["reasoning_effort"] = self.reasoning_effort
         response = httpx.post(
             f"{self.base_url}/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}"},
@@ -55,7 +55,7 @@ class SuperGrokTokenStore:
 @dataclass
 class SuperGrokOAuthProvider:
     token_store: SuperGrokTokenStore
-    model: str = "grok-composer-2.5-fast"
+    model: str = "grok-4.5"
     base_url: str = "https://api.x.ai/v1"
     reasoning_effort: str = "high"
 
@@ -68,24 +68,26 @@ class SuperGrokOAuthProvider:
         response = httpx.post(
             f"{self.base_url}/chat/completions",
             headers={"Authorization": f"Bearer {self.token_store.access_token}"},
-            json={"model": self.model, "messages": messages, "reasoning": {"effort": self.reasoning_effort}},
+            json={"model": self.model, "messages": messages, "reasoning_effort": self.reasoning_effort},
             timeout=60,
         )
         response.raise_for_status()
         return response.json()["choices"][0]["message"]["content"]
 
 
-def supergrok_oauth_provider_from_access_token(access_token: str) -> SuperGrokOAuthProvider:
+def supergrok_oauth_provider_from_access_token(
+    access_token: str, *, model: str = "grok-4.5", reasoning_effort: str = "high"
+) -> SuperGrokOAuthProvider:
     """Build a fixed-token provider without retaining the token in repr output."""
     if not access_token:
         raise ValueError("SuperGrok access token is required")
-    return SuperGrokOAuthProvider(token_store=SuperGrokTokenStore(access_token=access_token))
+    return SuperGrokOAuthProvider(token_store=SuperGrokTokenStore(access_token=access_token), model=model, reasoning_effort=reasoning_effort)
 
 
 @dataclass
 class OAuthBackedSuperGrokProvider:
     oauth: OAuthManager
-    model: str = "grok-composer-2.5-fast"
+    model: str = "grok-4.5"
     base_url: str = "https://api.x.ai/v1"
     reasoning_effort: str = "high"
 
@@ -115,7 +117,7 @@ class OAuthBackedSuperGrokProvider:
 @dataclass
 class GrokAuthProvider:
     auth_store: GrokAuthStore
-    model: str = "grok-composer-2.5-fast"
+    model: str = "grok-4.5"
     base_url: str = "https://api.x.ai/v1"
 
     name: str = "grok_login_auth"

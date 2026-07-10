@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections import defaultdict
 from threading import Lock
 from typing import Protocol
@@ -32,13 +33,23 @@ class DaytonaSupervisor:
     _locks: defaultdict[str, Lock] = defaultdict(Lock)
 
     def __init__(
-        self, registry: SandboxRegistry, daytona: DaytonaClient, auth_broker: SandboxAuthBroker, *, snapshot: str, data_dir: str
+        self,
+        registry: SandboxRegistry,
+        daytona: DaytonaClient,
+        auth_broker: SandboxAuthBroker,
+        *,
+        snapshot: str,
+        data_dir: str,
+        xai_model: str,
+        xai_reasoning_effort: str,
     ) -> None:
         self.registry = registry
         self.daytona = daytona
         self.auth_broker = auth_broker
         self.snapshot = snapshot
         self.data_dir = data_dir
+        self.xai_model = xai_model
+        self.xai_reasoning_effort = xai_reasoning_effort
 
     def reconcile(self, tomo_id: str) -> SandboxRecord:
         """Return the ready persistent sandbox for ``tomo_id``, creating it when absent."""
@@ -130,6 +141,8 @@ class DaytonaSupervisor:
                     "TOMO_INSTANCE_ID": tomo_id,
                     "TOMO_SUPERGROK_ACCESS_TOKEN": self.auth_broker.access_token(),
                     "TOMO_CORE_SOUL": "/opt/tomo/SOUL.md",
+                    "TOMO_XAI_MODEL": os.getenv("TOMO_XAI_MODEL", self.xai_model),
+                    "TOMO_XAI_REASONING_EFFORT": os.getenv("TOMO_XAI_REASONING_EFFORT", self.xai_reasoning_effort),
                 },
             ).output
         except DaytonaClientError as error:
