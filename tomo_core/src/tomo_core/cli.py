@@ -182,8 +182,10 @@ def run_shared_gateway_foreground(args: argparse.Namespace, config: HostedRuntim
             auth.access_token()
             registry = SandboxRegistry(config.data_dir)
             daytona = DaytonaClient()
-            supervisor = DaytonaSupervisor(registry, daytona, snapshot=config.daytona_snapshot_name)
-            dispatch = SandboxDispatch(supervisor, daytona, auth)
+            supervisor = DaytonaSupervisor(
+                registry, daytona, auth, snapshot=config.daytona_snapshot, data_dir=config.daytona_sandbox_data_dir
+            )
+            dispatch = SandboxDispatch(supervisor, daytona, auth, data_dir=config.daytona_sandbox_data_dir)
             gateway = SharedTelegramGateway(client=client, store=store, dispatch=dispatch)
         print("shared telegram gateway polling started. press ctrl+c to stop.")
         TelegramUpdateRouter(
@@ -322,13 +324,17 @@ def main(argv: list[str] | None = None) -> int:
         if not access_token:
             emit_failure(sys.stdout, "missing_access_token")
             return 1
+        data_dir = os.getenv("TOMO_CORE_DATA_DIR")
+        if not data_dir:
+            emit_failure(sys.stdout, "missing_data_dir")
+            return 1
         try:
             provider = supergrok_oauth_provider_from_access_token(access_token)
             return run_once(
                 io.StringIO(payload),
                 sys.stdout,
                 config=RuntimeConfig(
-                    data_dir=os.getenv("TOMO_CORE_DATA_DIR", "/home/daytona/.tomo"),
+                    data_dir=data_dir,
                     soul_path=os.getenv("TOMO_CORE_SOUL", "SOUL.md"),
                 ),
                 provider=provider,

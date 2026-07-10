@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from threading import Lock
+from typing import Protocol
 
 from .daytona_client import DaytonaClient, DaytonaClientError, SandboxHandle
 from .sandbox_registry import SandboxRecord, SandboxRegistry
@@ -11,8 +12,12 @@ from .models import InboundEnvelope, OutboundBubble
 from .sandbox_protocol import encode_inbound, parse_result_marker
 
 
-DATA_DIR = "/home/daytona/.tomo"
 SMOKE_COMMAND = "/opt/tomo/.venv/bin/tomo-core sandbox-inbound --health"
+
+
+class SandboxAuthBroker(Protocol):
+    def access_token(self, force_refresh: bool = False) -> str:
+        ...
 
 
 class SandboxSupervisorError(RuntimeError):
@@ -26,9 +31,12 @@ class SandboxSupervisorError(RuntimeError):
 class DaytonaSupervisor:
     _locks: defaultdict[str, Lock] = defaultdict(Lock)
 
-    def __init__(self, registry: SandboxRegistry, daytona: DaytonaClient, *, snapshot: str, data_dir: str = DATA_DIR) -> None:
+    def __init__(
+        self, registry: SandboxRegistry, daytona: DaytonaClient, auth_broker: SandboxAuthBroker, *, snapshot: str, data_dir: str
+    ) -> None:
         self.registry = registry
         self.daytona = daytona
+        self.auth_broker = auth_broker
         self.snapshot = snapshot
         self.data_dir = data_dir
 
@@ -120,6 +128,8 @@ class DaytonaSupervisor:
                     "TOMO_INBOUND_JSON": encode_inbound(request_id, health_inbound),
                     "TOMO_CORE_DATA_DIR": self.data_dir,
                     "TOMO_INSTANCE_ID": tomo_id,
+                    "TOMO_SUPERGROK_ACCESS_TOKEN": self.auth_broker.access_token(),
+                    "TOMO_CORE_SOUL": "/opt/tomo/SOUL.md",
                 },
             ).output
         except DaytonaClientError as error:

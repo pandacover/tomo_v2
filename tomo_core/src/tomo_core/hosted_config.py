@@ -19,7 +19,8 @@ class HostedRuntimeConfig:
     bot_token: str | None
     data_dir: Path
     daytona_api_key: str | None
-    daytona_snapshot_name: str | None
+    daytona_snapshot: str
+    daytona_sandbox_data_dir: str
     oauth_json_b64: str | None
     poll_timeout: int
     worker_count: int
@@ -53,13 +54,16 @@ class HostedRuntimeConfig:
         if not resolved_data_dir:
             missing.append("TOMO_CORE_DATA_DIR")
         if runtime == "daytona":
-            for name in ("DAYTONA_API_KEY", "TOMO_DAYTONA_SNAPSHOT_NAME", "TOMO_SUPERGROK_OAUTH_JSON_B64"):
+            for name in ("DAYTONA_API_KEY", "TOMO_DAYTONA_SNAPSHOT", "TOMO_DAYTONA_SANDBOX_DATA_DIR", "TOMO_SUPERGROK_OAUTH_JSON_B64"):
                 if not values.get(name):
                     missing.append(name)
         if missing:
             raise ValueError(f"missing hosted runtime configuration: {', '.join(missing)}")
 
         if runtime == "daytona":
+            sandbox_data_dir = values["TOMO_DAYTONA_SANDBOX_DATA_DIR"]
+            if not _is_absolute_posix_path(sandbox_data_dir):
+                raise ValueError("invalid TOMO_DAYTONA_SANDBOX_DATA_DIR")
             try:
                 oauth_payload = json.loads(base64.b64decode(values["TOMO_SUPERGROK_OAUTH_JSON_B64"].encode("ascii"), validate=True))
             except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
@@ -86,7 +90,8 @@ class HostedRuntimeConfig:
             bot_token=resolved_token,
             data_dir=root,
             daytona_api_key=values.get("DAYTONA_API_KEY") if runtime == "daytona" else None,
-            daytona_snapshot_name=values.get("TOMO_DAYTONA_SNAPSHOT_NAME") if runtime == "daytona" else None,
+            daytona_snapshot=values.get("TOMO_DAYTONA_SNAPSHOT", ""),
+            daytona_sandbox_data_dir=values.get("TOMO_DAYTONA_SANDBOX_DATA_DIR", ""),
             oauth_json_b64=values.get("TOMO_SUPERGROK_OAUTH_JSON_B64") if runtime == "daytona" else None,
             poll_timeout=resolved_poll_timeout,
             worker_count=worker_count,
@@ -101,3 +106,7 @@ def _parse_positive(value: str, name: str, maximum: int) -> int:
     if not 1 <= parsed <= maximum:
         raise ValueError(f"invalid {name}")
     return parsed
+
+
+def _is_absolute_posix_path(value: str) -> bool:
+    return value.startswith("/") and value.strip() == value

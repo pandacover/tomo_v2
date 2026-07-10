@@ -43,7 +43,8 @@ class HostedRuntimeConfigTests(unittest.TestCase):
                     "TOMO_TELEGRAM_GLOBAL_BOT_TOKEN": "bot-token",
                     "TOMO_CORE_DATA_DIR": tmp,
                     "DAYTONA_API_KEY": "daytona-key",
-                    "TOMO_DAYTONA_SNAPSHOT_NAME": "tomo-snapshot",
+                    "TOMO_DAYTONA_SNAPSHOT": "tomo-snapshot",
+                    "TOMO_DAYTONA_SANDBOX_DATA_DIR": "/var/lib/tomo",
                     "TOMO_SUPERGROK_OAUTH_JSON_B64": base64.b64encode(b"{}").decode("ascii"),
                     "TOMO_TELEGRAM_POLL_TIMEOUT": "45",
                     "TOMO_ROUTER_WORKERS": "8",
@@ -51,6 +52,8 @@ class HostedRuntimeConfigTests(unittest.TestCase):
             )
 
         self.assertEqual(config.runtime, "daytona")
+        self.assertEqual(config.daytona_snapshot, "tomo-snapshot")
+        self.assertEqual(config.daytona_sandbox_data_dir, "/var/lib/tomo")
         self.assertEqual(config.poll_timeout, 45)
         self.assertEqual(config.worker_count, 8)
 
@@ -62,7 +65,8 @@ class HostedRuntimeConfigTests(unittest.TestCase):
                 )
 
         self.assertIn("TOMO_TELEGRAM_GLOBAL_BOT_TOKEN", str(raised.exception))
-        self.assertIn("TOMO_DAYTONA_SNAPSHOT_NAME", str(raised.exception))
+        self.assertIn("TOMO_DAYTONA_SNAPSHOT", str(raised.exception))
+        self.assertIn("TOMO_DAYTONA_SANDBOX_DATA_DIR", str(raised.exception))
         self.assertIn("TOMO_SUPERGROK_OAUTH_JSON_B64", str(raised.exception))
         self.assertNotIn("secret-value", str(raised.exception))
 
@@ -84,7 +88,8 @@ class HostedRuntimeConfigTests(unittest.TestCase):
                 "TOMO_TELEGRAM_GLOBAL_BOT_TOKEN": "bot-token",
                 "TOMO_CORE_DATA_DIR": tmp,
                 "DAYTONA_API_KEY": "daytona-key",
-                "TOMO_DAYTONA_SNAPSHOT_NAME": "tomo-snapshot",
+                "TOMO_DAYTONA_SNAPSHOT": "tomo-snapshot",
+                "TOMO_DAYTONA_SANDBOX_DATA_DIR": "/var/lib/tomo",
                 "TOMO_SUPERGROK_OAUTH_JSON_B64": base64.b64encode(b"{}").decode("ascii"),
                 "TOMO_ROUTER_WORKERS": "0",
             }

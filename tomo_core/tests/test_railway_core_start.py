@@ -49,7 +49,8 @@ class RailwayCoreStartTests(unittest.TestCase):
             "TOMO_TELEGRAM_GLOBAL_BOT_TOKEN": "secret-token",
             "TOMO_CORE_DATA_DIR": data_dir,
             "DAYTONA_API_KEY": "daytona-key",
-            "TOMO_DAYTONA_SNAPSHOT_NAME": "snapshot",
+            "TOMO_DAYTONA_SNAPSHOT": "snapshot",
+            "TOMO_DAYTONA_SANDBOX_DATA_DIR": "/var/lib/tomo",
             "TOMO_SUPERGROK_OAUTH_JSON_B64": "e30=",
         }
 

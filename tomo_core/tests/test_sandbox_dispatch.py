@@ -22,7 +22,7 @@ class SandboxDispatchTests(unittest.TestCase):
         self.supervisor.reconcile.return_value = self.registry.get("tomo-a")
         self.auth = Mock()
         self.auth.access_token.return_value = "fresh-token"
-        self.dispatch = SandboxDispatch(self.supervisor, self.daytona, self.auth)
+        self.dispatch = SandboxDispatch(self.supervisor, self.daytona, self.auth, data_dir="/var/lib/tomo")
         self.installation = TelegramInstallation("user", "tomo-a", "chat", "user", 0)
         self.inbound = InboundEnvelope(connector="telegram", actor_id="user", message_id="message", text="hello")
 
@@ -42,10 +42,14 @@ class SandboxDispatchTests(unittest.TestCase):
         command = self.daytona.exec.call_args.args[1]
         self.assertEqual(command, "/opt/tomo/.venv/bin/tomo-core sandbox-inbound")
         env = self.daytona.exec.call_args.kwargs["env"]
-        self.assertEqual(set(env), {"TOMO_INBOUND_JSON", "TOMO_CORE_DATA_DIR", "TOMO_INSTANCE_ID", "TOMO_SUPERGROK_ACCESS_TOKEN"})
-        self.assertEqual(env["TOMO_CORE_DATA_DIR"], "/home/daytona/.tomo")
+        self.assertEqual(
+            set(env),
+            {"TOMO_INBOUND_JSON", "TOMO_CORE_DATA_DIR", "TOMO_INSTANCE_ID", "TOMO_SUPERGROK_ACCESS_TOKEN", "TOMO_CORE_SOUL"},
+        )
+        self.assertEqual(env["TOMO_CORE_DATA_DIR"], "/var/lib/tomo")
         self.assertEqual(env["TOMO_INSTANCE_ID"], "tomo-a")
         self.assertEqual(env["TOMO_SUPERGROK_ACCESS_TOKEN"], "fresh-token")
+        self.assertEqual(env["TOMO_CORE_SOUL"], "/opt/tomo/SOUL.md")
         self.assertIn('"text":"hello"', env["TOMO_INBOUND_JSON"])
         self.assertNotIn("hello", command)
         self.assertEqual(self.daytona.exec.call_args.kwargs["timeout"], 120)

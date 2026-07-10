@@ -18,7 +18,9 @@ class DaytonaSupervisorTests(unittest.TestCase):
         self.daytona.get_volume.return_value = VolumeHandle("vol-1", "tomo-volume-7af1f042458a784e")
         self.daytona.create_snapshot.return_value = SandboxHandle("sbx-1", "tomo-sandbox-7af1f042458a784e")
         self.daytona.exec.return_value.output = f"{RESULT_MARKER}{encode_result('health-1', [OutboundBubble('healthy')])}\n"
-        self.supervisor = DaytonaSupervisor(self.registry, self.daytona, snapshot="base-v1")
+        self.auth = Mock()
+        self.auth.access_token.return_value = "fresh-token"
+        self.supervisor = DaytonaSupervisor(self.registry, self.daytona, self.auth, snapshot="base-v1", data_dir="/var/lib/tomo")
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -29,14 +31,19 @@ class DaytonaSupervisorTests(unittest.TestCase):
         self.assertEqual(record.sandbox_id, "sbx-1")
         self.assertEqual(record.status, "ready")
         self.daytona.get_volume.assert_called_once_with(record.volume_name)
-        self.daytona.create_snapshot.assert_called_once_with(record.sandbox_name, "base-v1", "vol-1", "/home/daytona/.tomo")
+        self.daytona.create_snapshot.assert_called_once_with(record.sandbox_name, "base-v1", "vol-1", "/var/lib/tomo")
         self.daytona.start.assert_called_once_with(SandboxHandle("sbx-1", record.sandbox_name))
         self.assertEqual(self.daytona.exec.call_args.args[1], "/opt/tomo/.venv/bin/tomo-core sandbox-inbound --health")
         env = self.daytona.exec.call_args.kwargs["env"]
-        self.assertEqual(env["TOMO_CORE_DATA_DIR"], "/home/daytona/.tomo")
+        self.assertEqual(
+            set(env),
+            {"TOMO_CORE_DATA_DIR", "TOMO_INSTANCE_ID", "TOMO_INBOUND_JSON", "TOMO_SUPERGROK_ACCESS_TOKEN", "TOMO_CORE_SOUL"},
+        )
+        self.assertEqual(env["TOMO_CORE_DATA_DIR"], "/var/lib/tomo")
         self.assertEqual(env["TOMO_INSTANCE_ID"], "tomo-alice@example.com-42")
+        self.assertEqual(env["TOMO_SUPERGROK_ACCESS_TOKEN"], "fresh-token")
+        self.assertEqual(env["TOMO_CORE_SOUL"], "/opt/tomo/SOUL.md")
         self.assertIn("TOMO_INBOUND_JSON", env)
-        self.assertNotIn("TOMO_SUPERGROK_ACCESS_TOKEN", env)
 
     def test_reconcile_creates_the_deterministic_volume_when_it_is_missing(self):
         self.daytona.get_volume.side_effect = DaytonaClientError("get_volume")
@@ -122,7 +129,7 @@ class DaytonaSupervisorTests(unittest.TestCase):
 
         self.assertEqual(record.snapshot, "base-v1")
         self.daytona.delete.assert_called_once_with(old)
-        self.daytona.create_snapshot.assert_called_once_with(existing.sandbox_name, "base-v1", "vol-1", "/home/daytona/.tomo")
+        self.daytona.create_snapshot.assert_called_once_with(existing.sandbox_name, "base-v1", "vol-1", "/var/lib/tomo")
         self.daytona.create_volume.assert_not_called()
 
     def test_reconcile_keeps_users_on_distinct_deterministic_resources(self):

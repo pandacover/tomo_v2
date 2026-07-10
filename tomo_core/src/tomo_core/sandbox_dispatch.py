@@ -13,7 +13,6 @@ from .onboarding_store import TelegramInstallation
 from .sandbox_protocol import SandboxProtocolError, encode_inbound, parse_result_marker
 
 
-DATA_DIR = "/home/daytona/.tomo"
 _COMMAND = "/opt/tomo/.venv/bin/tomo-core sandbox-inbound"
 _EXEC_TIMEOUT_SECONDS = 120
 
@@ -46,7 +45,7 @@ class SandboxDispatch:
         client: DaytonaClient,
         auth_broker: RailwayAuthBroker,
         *,
-        data_dir: str = DATA_DIR,
+        data_dir: str,
     ) -> None:
         self.supervisor = supervisor
         self.client = client
@@ -89,6 +88,7 @@ class SandboxDispatch:
                     "TOMO_CORE_DATA_DIR": self.data_dir,
                     "TOMO_INSTANCE_ID": tomo_id,
                     "TOMO_SUPERGROK_ACCESS_TOKEN": token,
+                    "TOMO_CORE_SOUL": "/opt/tomo/SOUL.md",
                 },
                 timeout=_EXEC_TIMEOUT_SECONDS,
             )
