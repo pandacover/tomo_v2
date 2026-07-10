@@ -4,9 +4,11 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from tomo_core.models import InboundEnvelope
+import httpx
+
+from tomo_core.models import InboundEnvelope, OutboundBubble, RuntimeConfig
 from tomo_core.providers import StaticProvider
-from tomo_core.sandbox_inbound import SandboxInboundError, build_runtime, run_once
+from tomo_core.sandbox_inbound import CollectingTelegramSink, SandboxInboundError, build_runtime, run_once
 from tomo_core.sandbox_protocol import RESULT_MARKER, encode_inbound
 
 
@@ -16,19 +18,19 @@ class SandboxInboundTests(unittest.TestCase):
         stdout = io.StringIO()
         provider = Mock()
         runtime = Mock()
-        runtime.handle_telegram_text.return_value = [{"text": "hello back", "reply_to_message_id": "message-1"}]
+        runtime.telegram.bubbles = [OutboundBubble(text="hello back", reply_to_message_id="message-1")]
 
         with tempfile.TemporaryDirectory() as data_dir:
             with patch("tomo_core.sandbox_inbound.build_runtime", return_value=runtime) as build_runtime:
                 result = run_once(
                     io.StringIO(encode_inbound("request-1", envelope)),
                     stdout,
-                    data_dir=data_dir,
+                    config=RuntimeConfig(data_dir=data_dir),
                     provider=provider,
                 )
 
         self.assertEqual(result, 0)
-        build_runtime.assert_called_once_with(provider, data_dir)
+        build_runtime.assert_called_once_with(provider, RuntimeConfig(data_dir=data_dir))
         runtime.handle_telegram_text.assert_called_once_with(envelope)
         self.assertEqual(
             stdout.getvalue(),
@@ -41,13 +43,13 @@ class SandboxInboundTests(unittest.TestCase):
         provider = Mock()
 
         with self.assertRaises(SandboxInboundError) as raised:
-            run_once(io.StringIO("not json"), stdout, data_dir="/tmp/data", provider=provider, secret_values=(token,))
+            run_once(io.StringIO("not json"), stdout, config=RuntimeConfig(data_dir="/tmp/data"), provider=provider, secret_values=(token,))
 
-        self.assertEqual(raised.exception.code, "invalid_inbound")
+        self.assertEqual(raised.exception.code, "invalid_request")
         self.assertNotIn(token, str(raised.exception))
         self.assertEqual(
             stdout.getvalue(),
-            f'{RESULT_MARKER}{json.dumps({"version": 1, "request_id": "unknown", "ok": False, "error": {"code": "invalid_inbound"}}, separators=(",", ":"))}\n',
+            f'{RESULT_MARKER}{json.dumps({"version": 1, "request_id": "unknown", "ok": False, "error": {"code": "invalid_request"}}, separators=(",", ":"))}\n',
         )
 
     def test_run_once_wraps_runtime_failures_without_exposing_the_access_token(self):
@@ -62,7 +64,7 @@ class SandboxInboundTests(unittest.TestCase):
                 run_once(
                     io.StringIO(encode_inbound("request-1", envelope)),
                     stdout,
-                    data_dir="/tmp/data",
+                    config=RuntimeConfig(data_dir="/tmp/data"),
                     provider=Mock(),
                     secret_values=(token,),
                 )
@@ -76,18 +78,41 @@ class SandboxInboundTests(unittest.TestCase):
         stdout = io.StringIO()
 
         with tempfile.TemporaryDirectory() as data_dir:
-            runtime = build_runtime(StaticProvider("hello back"), data_dir)
-            self.assertEqual(runtime.telegram.__class__.__name__, "_NoopTelegramSink")
+            runtime = build_runtime(StaticProvider("hello back"), RuntimeConfig(data_dir=data_dir))
+            self.assertIsInstance(runtime.telegram, CollectingTelegramSink)
 
             result = run_once(
                 io.StringIO(encode_inbound("request-1", envelope)),
                 stdout,
-                data_dir=data_dir,
+                config=RuntimeConfig(data_dir=data_dir),
                 provider=StaticProvider("hello back"),
             )
 
         self.assertEqual(result, 0)
         self.assertIn('"text":"hello back"', stdout.getvalue())
+
+    def test_run_once_maps_http_401_to_auth_expired_without_exception_text(self):
+        envelope = InboundEnvelope(connector="telegram", actor_id="user-1", message_id="message-1", text="hello")
+        token = "secret-access-token"
+        stdout = io.StringIO()
+        response = httpx.Response(401, request=httpx.Request("POST", "https://api.x.ai/v1/chat/completions"))
+        runtime = Mock()
+        runtime.handle_telegram_text.side_effect = httpx.HTTPStatusError(f"unauthorized: {token}", request=response.request, response=response)
+
+        with patch("tomo_core.sandbox_inbound.build_runtime", return_value=runtime):
+            with self.assertRaises(SandboxInboundError) as raised:
+                run_once(
+                    io.StringIO(encode_inbound("request-1", envelope)),
+                    stdout,
+                    config=RuntimeConfig(data_dir="/tmp/data"),
+                    provider=Mock(),
+                    secret_values=(token,),
+                )
+
+        self.assertEqual(raised.exception.code, "auth_expired")
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertNotIn(token, stdout.getvalue())
+        self.assertEqual(stdout.getvalue().count(RESULT_MARKER), 1)
 
 
 if __name__ == "__main__":

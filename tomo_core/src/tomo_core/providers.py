@@ -65,12 +65,14 @@ class SuperGrokOAuthProvider:
     supports_tool_calls: bool = True
 
     def complete(self, messages: list[dict[str, str]], actor_id: str | None = None) -> str:
-        return XaiApiProvider(
-            api_key=self.token_store.access_token,
-            model=self.model,
-            base_url=self.base_url,
-            reasoning_effort=self.reasoning_effort,
-        ).complete(messages, actor_id=actor_id)
+        response = httpx.post(
+            f"{self.base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {self.token_store.access_token}"},
+            json={"model": self.model, "messages": messages, "reasoning": {"effort": self.reasoning_effort}},
+            timeout=60,
+        )
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"]
 
 
 def supergrok_oauth_provider_from_access_token(access_token: str) -> SuperGrokOAuthProvider:

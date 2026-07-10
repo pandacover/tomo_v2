@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from tomo_core.cli import build_oauth_manager, build_provider
 from tomo_core.oauth import OAuthManager, OAuthProviderConfig
-from tomo_core.providers import OAuthBackedSuperGrokProvider, XaiApiProvider
+from tomo_core.providers import OAuthBackedSuperGrokProvider, SuperGrokOAuthProvider, SuperGrokTokenStore, XaiApiProvider
 from tomo_core.telegram_bot import TelegramPollingBot
 
 
@@ -87,6 +87,23 @@ class NamingMigrationTests(unittest.TestCase):
             self.assertEqual(reply, "supergrok reply")
             self.assertEqual(post.call_args.kwargs["headers"]["Authorization"], "Bearer supergrok-access")
             self.assertEqual(post.call_args.kwargs["json"]["reasoning"], {"effort": "high"})
+
+    def test_supergrok_fixed_token_provider_does_not_delegate_to_xai_api_provider(self):
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"choices": [{"message": {"content": "supergrok reply"}}]}
+
+        provider = SuperGrokOAuthProvider(token_store=SuperGrokTokenStore("supergrok-access"))
+        with patch("tomo_core.providers.XaiApiProvider.complete", side_effect=AssertionError("must not use API-key provider semantics")), patch(
+            "tomo_core.providers.httpx.post", return_value=FakeResponse()
+        ) as post:
+            reply = provider.complete([{"role": "user", "content": "hi"}])
+
+        self.assertEqual(reply, "supergrok reply")
+        self.assertEqual(post.call_args.kwargs["headers"]["Authorization"], "Bearer supergrok-access")
 
 
 class FakeTelegramClient:

@@ -50,17 +50,19 @@ class CliTests(unittest.TestCase):
     def test_sandbox_inbound_reads_environment_payload_and_uses_only_the_supergrok_access_token(self):
         token = "supergrok-access-token"
         with (
-            patch.dict("os.environ", {"TOMO_SUPERGROK_ACCESS_TOKEN": token, "TOMO_INBOUND_JSON": "payload", "TOMO_CORE_DATA_DIR": "/data"}, clear=True),
+            patch.dict("os.environ", {"TOMO_SUPERGROK_ACCESS_TOKEN": token, "TOMO_INBOUND_JSON": "payload", "TOMO_CORE_DATA_DIR": "/data", "TOMO_CORE_SOUL": "/soul"}, clear=True),
             patch("tomo_core.cli.supergrok_oauth_provider_from_access_token") as provider_factory,
             patch("tomo_core.cli.run_once", return_value=0) as run_once,
+            patch("tomo_core.cli.RuntimeConfig") as runtime_config,
             patch("sys.stdout", io.StringIO()),
         ):
             code = main(["sandbox-inbound"])
 
         self.assertEqual(code, 0)
         provider_factory.assert_called_once_with(token)
+        runtime_config.assert_called_once_with(data_dir="/data", soul_path="/soul")
         self.assertEqual(run_once.call_args.args[0].read(), "payload")
-        self.assertEqual(run_once.call_args.kwargs["data_dir"], "/data")
+        self.assertIs(run_once.call_args.kwargs["config"], runtime_config.return_value)
         self.assertEqual(run_once.call_args.kwargs["secret_values"], (token,))
 
     def test_sandbox_health_reads_environment_payload_without_constructing_a_provider(self):

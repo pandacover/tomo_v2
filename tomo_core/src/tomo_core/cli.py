@@ -327,7 +327,10 @@ def main(argv: list[str] | None = None) -> int:
             return run_once(
                 io.StringIO(payload),
                 sys.stdout,
-                data_dir=os.getenv("TOMO_CORE_DATA_DIR", "/home/daytona/.tomo"),
+                config=RuntimeConfig(
+                    data_dir=os.getenv("TOMO_CORE_DATA_DIR", "/home/daytona/.tomo"),
+                    soul_path=os.getenv("TOMO_CORE_SOUL", "SOUL.md"),
+                ),
                 provider=provider,
                 secret_values=(access_token,),
             )
