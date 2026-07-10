@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import signal
 import tempfile
 import unittest
@@ -76,6 +77,69 @@ class RailwayCoreStartTests(unittest.TestCase):
             ],
         )
         self.assertTrue(all(call.kwargs.get("shell") is False for call in popen.call_args_list))
+
+    def test_clean_child_exit_terminates_sibling_and_forces_railway_restart(self):
+        control = FakeProcess([0])
+        telegram = FakeProcess([None, None])
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(railway_core_start.subprocess, "Popen", side_effect=[control, telegram]),
+            patch.object(railway_core_start.time, "sleep"),
+            patch.object(railway_core_start.signal, "signal"),
+        ):
+            code = railway_core_start.start(self.hosted_env(tmp))
+
+        self.assertEqual(code, 1)
+        self.assertTrue(telegram.terminated)
+
+    def test_production_preflight_rejects_missing_bot_before_spawning(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(railway_core_start.subprocess, "Popen") as popen,
+            patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            code = railway_core_start.start(
+                {
+                    "RAILWAY_ENVIRONMENT_NAME": "production",
+                    "TOMO_CORE_DATA_DIR": tmp,
+                    "DAYTONA_API_KEY": "daytona-api-key",
+                    "TOMO_DAYTONA_SNAPSHOT": "snapshot",
+                    "TOMO_DAYTONA_SANDBOX_DATA_DIR": "/var/lib/tomo",
+                    "TOMO_SUPERGROK_OAUTH_JSON_B64": "e30=",
+                }
+            )
+
+        self.assertEqual(code, 2)
+        popen.assert_not_called()
+        self.assertIn("TOMO_TELEGRAM_GLOBAL_BOT_TOKEN", stderr.getvalue())
+        self.assertNotIn("daytona-api-key", stderr.getvalue())
+
+    def test_control_only_requires_explicit_local_runtime(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(railway_core_start.subprocess, "Popen") as popen,
+        ):
+            code = railway_core_start.start({"TOMO_CORE_DATA_DIR": tmp})
+
+        self.assertEqual(code, 2)
+        popen.assert_not_called()
+
+    def test_spawn_failure_stops_already_started_child_without_logging_error_details(self):
+        control = FakeProcess([None, None])
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(
+                railway_core_start.subprocess,
+                "Popen",
+                side_effect=[control, OSError("listener-secret")],
+            ),
+            patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            code = railway_core_start.start(self.hosted_env(tmp))
+
+        self.assertEqual(code, 1)
+        self.assertTrue(control.terminated)
+        self.assertNotIn("listener-secret", stderr.getvalue())
 
     def test_without_bot_token_supervises_control_api_only(self):
         control = FakeProcess([0])

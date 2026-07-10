@@ -75,7 +75,14 @@ def start(env: dict[str, str]) -> int:
     else:
         print("TOMO_TELEGRAM_GLOBAL_BOT_TOKEN is not set; starting control api only.", flush=True)
 
-    processes = [subprocess.Popen(command, env=env, shell=False) for command in commands]
+    processes: list[subprocess.Popen[object]] = []
+    try:
+        for command in commands:
+            processes.append(subprocess.Popen(command, env=env, shell=False))
+    except OSError:
+        _stop_children(processes)
+        print("unable to start a supervised child process.", file=sys.stderr)
+        return 1
     shutdown_signal: int | None = None
 
     def forward_signal(signum: int, _frame: object) -> None:
