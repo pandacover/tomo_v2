@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import os
 import signal
 import subprocess
@@ -14,7 +15,7 @@ from .instances import RuntimeInstanceRegistry
 from .daytona_client import DaytonaClient
 from .daytona_supervisor import DaytonaSupervisor
 from .hosted_auth import HostedGrokAuth
-from .models import RuntimeConfig
+from .models import OutboundBubble, RuntimeConfig
 from .oauth import OAuthManager
 from .grok_auth import GrokAuthStore
 from .providers import GrokAuthProvider, OAuthBackedSuperGrokProvider, StaticProvider, XaiApiProvider, supergrok_oauth_provider_from_access_token
@@ -28,6 +29,7 @@ from .shared_gateway import SharedTelegramGateway
 from .shared_gateway import HostedTelegramRuntimeDispatch
 from .sandbox_dispatch import SandboxDispatch
 from .sandbox_registry import SandboxRegistry
+from .sandbox_protocol import RESULT_MARKER, decode_inbound, encode_result
 
 
 def build_provider(args: argparse.Namespace, oauth: OAuthManager):
@@ -280,10 +282,8 @@ def main(argv: list[str] | None = None) -> int:
     shared_restart.add_argument("--static-response")
     shared_restart.add_argument("--poll-timeout", type=int, default=30)
 
-    sandbox = sub.add_parser("sandbox", help="sandbox runtime commands")
-    sandbox_sub = sandbox.add_subparsers(dest="sandbox_command", required=True)
-    sandbox_inbound = sandbox_sub.add_parser("inbound", help="handle one sandbox protocol envelope from stdin")
-    sandbox_inbound.add_argument("--once", action="store_true", required=True)
+    sandbox_inbound = sub.add_parser("sandbox-inbound", help="handle one sandbox protocol envelope from TOMO_INBOUND_JSON")
+    sandbox_inbound.add_argument("--health", action="store_true", help="validate the sandbox boundary without calling a model")
 
     args = parser.parse_args(argv)
     if args.command == "telegram" and args.telegram_command == "start":
@@ -317,7 +317,20 @@ def main(argv: list[str] | None = None) -> int:
         stop_shared_gateway(args.data_dir)
         return start_shared_gateway_background(args)
 
-    if args.command == "sandbox" and args.sandbox_command == "inbound":
+    if args.command == "sandbox-inbound":
+        payload = os.getenv("TOMO_INBOUND_JSON")
+        if payload is None:
+            emit_failure(sys.stdout, "missing_inbound")
+            return 1
+        if args.health:
+            try:
+                request_id, _ = decode_inbound(payload)
+                sys.stdout.write(f"{RESULT_MARKER}{encode_result(request_id, [OutboundBubble('healthy')])}\n")
+                sys.stdout.flush()
+                return 0
+            except Exception:
+                emit_failure(sys.stdout, "invalid_inbound")
+                return 1
         access_token = os.getenv("TOMO_SUPERGROK_ACCESS_TOKEN")
         if not access_token:
             emit_failure(sys.stdout, "missing_access_token")
@@ -325,9 +338,9 @@ def main(argv: list[str] | None = None) -> int:
         try:
             provider = supergrok_oauth_provider_from_access_token(access_token)
             return run_once(
-                sys.stdin,
+                io.StringIO(payload),
                 sys.stdout,
-                data_dir=os.getenv("TOMO_DATA_DIR", "/home/daytona/.tomo"),
+                data_dir=os.getenv("TOMO_CORE_DATA_DIR", "/home/daytona/.tomo"),
                 provider=provider,
                 secret_values=(access_token,),
             )

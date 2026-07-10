@@ -7,10 +7,12 @@ from threading import Lock
 
 from .daytona_client import DaytonaClient, DaytonaClientError, SandboxHandle
 from .sandbox_registry import SandboxRecord, SandboxRegistry
+from .models import InboundEnvelope, OutboundBubble
+from .sandbox_protocol import encode_inbound, parse_result_marker
 
 
 DATA_DIR = "/home/daytona/.tomo"
-SMOKE_COMMAND = "tomo-core sandbox inbound --once"
+SMOKE_COMMAND = "/opt/tomo/.venv/bin/tomo-core sandbox-inbound --health"
 
 
 class SandboxSupervisorError(RuntimeError):
@@ -54,19 +56,31 @@ class DaytonaSupervisor:
         try:
             sandbox = self.daytona.create_snapshot(record.sandbox_name, self.snapshot, volume.id, self.data_dir)
             self.daytona.start(sandbox)
-            self._smoke_test(sandbox)
+            self._smoke_test(sandbox, tomo_id)
         except DaytonaClientError:
             return self._fail(tomo_id, "sandbox_create_failed")
         except SandboxSupervisorError as error:
             return self._fail(tomo_id, error.code)
         return self.registry.upsert(tomo_id, sandbox.id, self.snapshot, "ready")
 
-    def _smoke_test(self, sandbox: SandboxHandle) -> None:
+    def _smoke_test(self, sandbox: SandboxHandle, tomo_id: str) -> None:
+        request_id = "health-1"
+        health_inbound = InboundEnvelope(connector="telegram", actor_id="health", message_id="health", text="health")
         try:
-            output = self.daytona.exec(sandbox, SMOKE_COMMAND, env={"TOMO_DATA_DIR": self.data_dir}).output
+            output = self.daytona.exec(
+                sandbox,
+                SMOKE_COMMAND,
+                env={
+                    "TOMO_INBOUND_JSON": encode_inbound(request_id, health_inbound),
+                    "TOMO_CORE_DATA_DIR": self.data_dir,
+                    "TOMO_INSTANCE_ID": tomo_id,
+                },
+            ).output
         except DaytonaClientError as error:
             raise SandboxSupervisorError("sandbox_smoke_failed") from error
-        if not any(line.startswith("TOMO_SANDBOX_RESULT:") for line in output.splitlines()):
+        try:
+            parse_result_marker(output, request_id)
+        except ValueError:
             raise SandboxSupervisorError("sandbox_smoke_failed")
 
     def _fail(self, tomo_id: str, code: str) -> SandboxRecord:

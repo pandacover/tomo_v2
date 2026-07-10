@@ -5,6 +5,8 @@ from unittest.mock import Mock
 from tomo_core.daytona_client import DaytonaClientError, SandboxHandle, VolumeHandle
 from tomo_core.daytona_supervisor import DaytonaSupervisor, SandboxSupervisorError
 from tomo_core.sandbox_registry import SandboxRegistry
+from tomo_core.sandbox_protocol import RESULT_MARKER, encode_result
+from tomo_core.models import InboundEnvelope, OutboundBubble
 
 
 class DaytonaSupervisorTests(unittest.TestCase):
@@ -14,7 +16,7 @@ class DaytonaSupervisorTests(unittest.TestCase):
         self.daytona = Mock()
         self.daytona.get_volume.return_value = VolumeHandle("vol-1", "tomo-volume-7af1f042458a784e")
         self.daytona.create_snapshot.return_value = SandboxHandle("sbx-1", "tomo-sandbox-7af1f042458a784e")
-        self.daytona.exec.return_value.output = "TOMO_SANDBOX_RESULT:{\"ok\":false,\"error\":{\"code\":\"invalid_inbound\"}}\n"
+        self.daytona.exec.return_value.output = f"{RESULT_MARKER}{encode_result('health-1', [OutboundBubble('healthy')])}\n"
         self.supervisor = DaytonaSupervisor(self.registry, self.daytona, snapshot="base-v1")
 
     def tearDown(self):
@@ -28,8 +30,12 @@ class DaytonaSupervisorTests(unittest.TestCase):
         self.daytona.get_volume.assert_called_once_with(record.volume_name)
         self.daytona.create_snapshot.assert_called_once_with(record.sandbox_name, "base-v1", "vol-1", "/home/daytona/.tomo")
         self.daytona.start.assert_called_once_with(SandboxHandle("sbx-1", record.sandbox_name))
-        self.assertEqual(self.daytona.exec.call_args.args[1], "tomo-core sandbox inbound --once")
-        self.assertEqual(self.daytona.exec.call_args.kwargs["env"], {"TOMO_DATA_DIR": "/home/daytona/.tomo"})
+        self.assertEqual(self.daytona.exec.call_args.args[1], "/opt/tomo/.venv/bin/tomo-core sandbox-inbound --health")
+        env = self.daytona.exec.call_args.kwargs["env"]
+        self.assertEqual(env["TOMO_CORE_DATA_DIR"], "/home/daytona/.tomo")
+        self.assertEqual(env["TOMO_INSTANCE_ID"], "tomo-alice@example.com-42")
+        self.assertIn("TOMO_INBOUND_JSON", env)
+        self.assertNotIn("TOMO_SUPERGROK_ACCESS_TOKEN", env)
 
     def test_reconcile_creates_the_deterministic_volume_when_it_is_missing(self):
         self.daytona.get_volume.side_effect = DaytonaClientError("get_volume")

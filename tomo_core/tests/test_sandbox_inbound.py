@@ -6,8 +6,8 @@ from unittest.mock import Mock, patch
 
 from tomo_core.models import InboundEnvelope
 from tomo_core.providers import StaticProvider
-from tomo_core.sandbox_inbound import RESULT_MARKER, SandboxInboundError, build_runtime, run_once
-from tomo_core.sandbox_protocol import encode_inbound
+from tomo_core.sandbox_inbound import SandboxInboundError, build_runtime, run_once
+from tomo_core.sandbox_protocol import RESULT_MARKER, encode_inbound
 
 
 class SandboxInboundTests(unittest.TestCase):
@@ -32,7 +32,7 @@ class SandboxInboundTests(unittest.TestCase):
         runtime.handle_telegram_text.assert_called_once_with(envelope)
         self.assertEqual(
             stdout.getvalue(),
-            f'{RESULT_MARKER}{json.dumps({"ok": True, "request_id": "request-1", "bubbles": [{"text": "hello back", "reply_to_message_id": "message-1"}]}, separators=(",", ":"))}\n',
+            f'{RESULT_MARKER}{json.dumps({"version": 1, "request_id": "request-1", "ok": True, "bubbles": [{"text": "hello back", "reply_to_message_id": "message-1"}]}, separators=(",", ":"))}\n',
         )
 
     def test_run_once_returns_a_typed_secret_safe_failure(self):
@@ -47,7 +47,7 @@ class SandboxInboundTests(unittest.TestCase):
         self.assertNotIn(token, str(raised.exception))
         self.assertEqual(
             stdout.getvalue(),
-            f'{RESULT_MARKER}{json.dumps({"ok": False, "error": {"code": "invalid_inbound"}}, separators=(",", ":"))}\n',
+            f'{RESULT_MARKER}{json.dumps({"version": 1, "request_id": "unknown", "ok": False, "error": {"code": "invalid_inbound"}}, separators=(",", ":"))}\n',
         )
 
     def test_run_once_wraps_runtime_failures_without_exposing_the_access_token(self):

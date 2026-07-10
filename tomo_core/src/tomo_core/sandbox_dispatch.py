@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-import shlex
 from collections import defaultdict
 from threading import Lock
 from typing import Callable
@@ -11,13 +9,12 @@ from typing import Callable
 from .daytona_client import DaytonaClient, DaytonaClientError
 from .hosted_auth import HostedGrokAuth
 from .models import InboundEnvelope, OutboundBubble
-from .sandbox_protocol import encode_inbound
+from .sandbox_protocol import SandboxProtocolError, encode_inbound, parse_result_marker
 from .sandbox_registry import SandboxRegistry
 
 
 DATA_DIR = "/home/daytona/.tomo"
-RESULT_MARKER = "TOMO_SANDBOX_RESULT:"
-_COMMAND = "tomo-core sandbox inbound --once"
+_COMMAND = "/opt/tomo/.venv/bin/tomo-core sandbox-inbound"
 
 
 class SandboxDispatchError(RuntimeError):
@@ -52,8 +49,13 @@ class SandboxDispatch:
                 token = self.access_token()
                 result = self.daytona.exec(
                     sandbox,
-                    self._command(encode_inbound(request_id, inbound)),
-                    env={"TOMO_DATA_DIR": self.data_dir, "TOMO_SUPERGROK_ACCESS_TOKEN": token},
+                    _COMMAND,
+                    env={
+                        "TOMO_INBOUND_JSON": encode_inbound(request_id, inbound),
+                        "TOMO_CORE_DATA_DIR": self.data_dir,
+                        "TOMO_INSTANCE_ID": tomo_id,
+                        "TOMO_SUPERGROK_ACCESS_TOKEN": token,
+                    },
                 )
             except DaytonaClientError as error:
                 raise SandboxDispatchError("sandbox_exec_failed") from error
@@ -62,28 +64,13 @@ class SandboxDispatch:
             return self._parse(result.output, request_id)
 
     @staticmethod
-    def _command(payload: str) -> str:
-        # Daytona's process API accepts a command string, so quote untrusted JSON before piping it to fixed argv.
-        return f"printf %s {shlex.quote(payload)} | {_COMMAND}"
-
-    @staticmethod
     def _parse(output: str, request_id: str) -> list[OutboundBubble]:
-        marked = [line[len(RESULT_MARKER) :] for line in output.splitlines() if line.startswith(RESULT_MARKER)]
-        if len(marked) != 1:
-            raise SandboxDispatchError("invalid_result")
         try:
-            message = json.loads(marked[0])
-            if not isinstance(message, dict) or message.get("ok") is not True or message.get("request_id") != request_id:
-                raise ValueError
-            raw_bubbles = message["bubbles"]
-            if not isinstance(raw_bubbles, list):
-                raise ValueError
-            bubbles = [OutboundBubble(**bubble) for bubble in raw_bubbles]
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            return parse_result_marker(output, request_id)
+        except SandboxProtocolError as error:
+            raise SandboxDispatchError(error.code) from error
+        except ValueError as error:
             raise SandboxDispatchError("invalid_result") from error
-        if not 1 <= len(bubbles) <= 4 or any(not bubble.text or len(bubble.text) > 4096 for bubble in bubbles):
-            raise SandboxDispatchError("invalid_result")
-        return bubbles
 
 
 def _fresh_hosted_access_token() -> str:

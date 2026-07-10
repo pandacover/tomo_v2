@@ -1,4 +1,3 @@
-import json
 import tempfile
 import unittest
 from unittest.mock import Mock
@@ -7,6 +6,8 @@ from tomo_core.daytona_client import ExecResult, SandboxHandle
 from tomo_core.models import InboundEnvelope
 from tomo_core.sandbox_dispatch import SandboxDispatch, SandboxDispatchError
 from tomo_core.sandbox_registry import SandboxRegistry
+from tomo_core.sandbox_protocol import RESULT_MARKER, encode_result
+from tomo_core.models import OutboundBubble
 
 
 class SandboxDispatchTests(unittest.TestCase):
@@ -24,23 +25,24 @@ class SandboxDispatchTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_dispatch_uses_a_fresh_token_and_returns_marked_bubbles(self):
-        result = {"ok": True, "request_id": "request-1", "bubbles": [{"text": "hello", "reply_to_message_id": "message"}]}
-        self.daytona.exec.return_value = ExecResult(0, f"TOMO_SANDBOX_RESULT:{json.dumps(result, separators=(',', ':'))}\n")
+        result = encode_result("request-1", [OutboundBubble("hello", reply_to_message_id="message")])
+        self.daytona.exec.return_value = ExecResult(0, f"{RESULT_MARKER}{result}\n")
 
         bubbles = self.dispatch.dispatch("tomo-a", "request-1", self.inbound)
 
         self.assertEqual(bubbles[0].text, "hello")
         self.tokens.assert_called_once_with()
         command = self.daytona.exec.call_args.args[1]
-        self.assertIn("tomo-core sandbox inbound --once", command)
+        self.assertEqual(command, "/opt/tomo/.venv/bin/tomo-core sandbox-inbound")
         env = self.daytona.exec.call_args.kwargs["env"]
-        self.assertEqual(env["TOMO_DATA_DIR"], "/home/daytona/.tomo")
+        self.assertEqual(set(env), {"TOMO_INBOUND_JSON", "TOMO_CORE_DATA_DIR", "TOMO_INSTANCE_ID", "TOMO_SUPERGROK_ACCESS_TOKEN"})
+        self.assertEqual(env["TOMO_CORE_DATA_DIR"], "/home/daytona/.tomo")
+        self.assertEqual(env["TOMO_INSTANCE_ID"], "tomo-a")
         self.assertEqual(env["TOMO_SUPERGROK_ACCESS_TOKEN"], "fresh-token")
-        self.assertNotIn("TELEGRAM_BOT_TOKEN", env)
 
     def test_dispatch_rejects_a_result_with_the_wrong_request_id(self):
-        result = {"ok": True, "request_id": "other", "bubbles": [{"text": "hello"}]}
-        self.daytona.exec.return_value = ExecResult(0, f"TOMO_SANDBOX_RESULT:{json.dumps(result)}\n")
+        result = encode_result("other", [OutboundBubble("hello")])
+        self.daytona.exec.return_value = ExecResult(0, f"{RESULT_MARKER}{result}\n")
 
         with self.assertRaises(SandboxDispatchError) as raised:
             self.dispatch.dispatch("tomo-a", "request-1", self.inbound)

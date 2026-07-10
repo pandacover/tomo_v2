@@ -5,7 +5,9 @@ from tomo_core.models import InboundEnvelope, OutboundBubble
 from tomo_core.sandbox_protocol import (
     PROTOCOL_VERSION,
     RESULT_MARKER,
+    SandboxProtocolError,
     decode_inbound,
+    encode_error,
     encode_inbound,
     encode_result,
     parse_result_marker,
@@ -49,6 +51,21 @@ class SandboxProtocolTests(unittest.TestCase):
             encode_result("request-7", [OutboundBubble("ok")] * 5)
         with self.assertRaises(ValueError):
             encode_result("request-7", [OutboundBubble("x" * 4097)])
+
+    def test_result_marker_requires_exactly_one_versioned_success_or_typed_error(self):
+        result = encode_result("request-7", [OutboundBubble("ok")])
+        self.assertEqual(RESULT_MARKER, "TOMO_SANDBOX_RESULT=")
+        self.assertIn('"version":1', result)
+        self.assertIn('"ok":true', result)
+        self.assertEqual(parse_result_marker(f"{RESULT_MARKER}{result}\n", "request-7"), [OutboundBubble("ok")])
+
+        error = encode_error("request-7", "runtime_failed")
+        with self.assertRaises(SandboxProtocolError) as raised:
+            parse_result_marker(f"{RESULT_MARKER}{error}\n", "request-7")
+        self.assertEqual(raised.exception.code, "runtime_failed")
+
+        with self.assertRaises(ValueError):
+            parse_result_marker(f"{RESULT_MARKER}{result}\n{RESULT_MARKER}{result}\n", "request-7")
 
 
 if __name__ == "__main__":

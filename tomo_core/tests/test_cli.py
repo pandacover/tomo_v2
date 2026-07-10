@@ -47,18 +47,29 @@ class CliTests(unittest.TestCase):
         with patch.dict("os.environ", {"TOMO_CORE_STATIC_RESPONSE": "test"}, clear=True):
             self.assertEqual(main(["telegram-shared", "start", "--token", "token"]), 2)
 
-    def test_sandbox_inbound_uses_only_the_supergrok_access_token_and_daytona_data_dir(self):
+    def test_sandbox_inbound_reads_environment_payload_and_uses_only_the_supergrok_access_token(self):
         token = "supergrok-access-token"
         with (
-            patch.dict("os.environ", {"TOMO_SUPERGROK_ACCESS_TOKEN": token}, clear=True),
+            patch.dict("os.environ", {"TOMO_SUPERGROK_ACCESS_TOKEN": token, "TOMO_INBOUND_JSON": "payload", "TOMO_CORE_DATA_DIR": "/data"}, clear=True),
             patch("tomo_core.cli.supergrok_oauth_provider_from_access_token") as provider_factory,
             patch("tomo_core.cli.run_once", return_value=0) as run_once,
-            patch("sys.stdin", io.StringIO()),
             patch("sys.stdout", io.StringIO()),
         ):
-            code = main(["sandbox", "inbound", "--once"])
+            code = main(["sandbox-inbound"])
 
         self.assertEqual(code, 0)
         provider_factory.assert_called_once_with(token)
-        self.assertEqual(run_once.call_args.kwargs["data_dir"], "/home/daytona/.tomo")
+        self.assertEqual(run_once.call_args.args[0].read(), "payload")
+        self.assertEqual(run_once.call_args.kwargs["data_dir"], "/data")
         self.assertEqual(run_once.call_args.kwargs["secret_values"], (token,))
+
+    def test_sandbox_health_reads_environment_payload_without_constructing_a_provider(self):
+        with (
+            patch.dict("os.environ", {"TOMO_INBOUND_JSON": '{"version":1,"type":"inbound","request_id":"health-1","inbound":{"connector":"telegram","actor_id":"health","message_id":"health","text":"health","timestamp":"2026-01-01T00:00:00+00:00"}}'}, clear=True),
+            patch("tomo_core.cli.supergrok_oauth_provider_from_access_token") as provider_factory,
+            patch("sys.stdout", io.StringIO()),
+        ):
+            code = main(["sandbox-inbound", "--health"])
+
+        self.assertEqual(code, 0)
+        provider_factory.assert_not_called()
