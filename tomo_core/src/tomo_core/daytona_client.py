@@ -18,6 +18,8 @@ class DaytonaClientError(RuntimeError):
 class SandboxHandle:
     id: str
     name: str
+    state: str | None = None
+    snapshot: str | None = None
     _sandbox: Any = field(default=None, compare=False, repr=False)
 
 
@@ -73,7 +75,13 @@ class DaytonaClient:
 
     def _handle(self, operation: str, action: Any) -> SandboxHandle:
         sandbox = self._run(operation, action)
-        return SandboxHandle(id=sandbox.id, name=sandbox.name, _sandbox=sandbox)
+        return SandboxHandle(
+            id=sandbox.id,
+            name=sandbox.name,
+            state=getattr(sandbox, "state", None),
+            snapshot=getattr(sandbox, "snapshot", None),
+            _sandbox=sandbox,
+        )
 
     def _volume_handle(self, operation: str, action: Any) -> VolumeHandle:
         volume = self._run(operation, action)

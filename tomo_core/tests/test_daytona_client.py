@@ -10,6 +10,8 @@ class DaytonaClientTests(unittest.TestCase):
         self.sandbox = Mock()
         self.sandbox.id = "sandbox-123"
         self.sandbox.name = "agent"
+        self.sandbox.state = "started"
+        self.sandbox.snapshot = "python-base"
         self.sdk.get.return_value = self.sandbox
         self.sdk.create.return_value = self.sandbox
         self.client = DaytonaClient(self.sdk)
@@ -22,7 +24,9 @@ class DaytonaClientTests(unittest.TestCase):
             mount_path="/workspace",
         )
 
-        self.assertEqual(handle, SandboxHandle(id="sandbox-123", name="agent"))
+        self.assertEqual(handle, SandboxHandle(id="sandbox-123", name="agent", state="started", snapshot="python-base"))
+        self.assertEqual(handle.state, "started")
+        self.assertEqual(handle.snapshot, "python-base")
         params = self.sdk.create.call_args.args[0]
         self.assertEqual(params.name, "agent")
         self.assertEqual(params.snapshot, "python-base")
@@ -39,7 +43,7 @@ class DaytonaClientTests(unittest.TestCase):
 
         result = self.client.exec(handle, "exit 7", cwd="/workspace", timeout=10)
 
-        self.assertEqual(handle, SandboxHandle(id="sandbox-123", name="agent"))
+        self.assertEqual(handle, SandboxHandle(id="sandbox-123", name="agent", state="started", snapshot="python-base"))
         self.assertEqual((result.exit_code, result.output), (7, "out"))
         self.sdk.start.assert_called_once_with(self.sandbox)
         self.sdk.delete.assert_called_once_with(self.sandbox)
@@ -73,3 +77,10 @@ class DaytonaClientTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.operation, "exec")
         self.assertNotIn("sensitive-value", str(raised.exception))
+
+    def test_get_returns_safe_state_and_snapshot_without_exposing_the_sdk_sandbox(self):
+        handle = self.client.get("agent")
+
+        self.assertEqual(handle.state, "started")
+        self.assertEqual(handle.snapshot, "python-base")
+        self.assertNotIn("_sandbox", repr(handle))

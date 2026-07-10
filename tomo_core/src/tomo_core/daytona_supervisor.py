@@ -36,15 +36,31 @@ class DaytonaSupervisor:
         """Return the ready persistent sandbox for ``tomo_id``, creating it when absent."""
         with self._locks[tomo_id]:
             record = self.registry.get(tomo_id)
-            if record is not None and record.status == "ready" and record.snapshot == self.snapshot and record.sandbox_id:
-                try:
-                    self.daytona.get(record.sandbox_id)
-                    return record
-                except DaytonaClientError:
-                    pass
-            return self._create(tomo_id, record)
+            if record is not None and record.snapshot != self.snapshot:
+                self._delete_recorded_sandbox(record)
+                return self._create(tomo_id)
+            if record is not None and record.status == "ready" and record.sandbox_id:
+                sandbox = self._recorded_sandbox(record)
+                if sandbox is not None:
+                    if sandbox.snapshot is not None and sandbox.snapshot != self.snapshot:
+                        self._delete(sandbox)
+                        return self._create(tomo_id)
+                    if sandbox.state == "stopped":
+                        try:
+                            self.daytona.start(sandbox)
+                            self._smoke_test(sandbox, tomo_id)
+                        except SandboxSupervisorError as error:
+                            self._delete(sandbox)
+                            return self._fail(tomo_id, error.code)
+                        except DaytonaClientError:
+                            return self._fail(tomo_id, "sandbox_create_failed")
+                    elif sandbox.state not in (None, "started"):
+                        self._delete(sandbox)
+                        return self._create(tomo_id)
+                    return self.registry.upsert(tomo_id, sandbox.id, self.snapshot, "ready")
+            return self._create(tomo_id)
 
-    def _create(self, tomo_id: str, existing: SandboxRecord | None) -> SandboxRecord:
+    def _create(self, tomo_id: str) -> SandboxRecord:
         record = self.registry.upsert(tomo_id, None, self.snapshot, "provisioning")
         try:
             volume = self.daytona.get_volume(record.volume_name)
@@ -55,13 +71,43 @@ class DaytonaSupervisor:
                 return self._fail(tomo_id, "volume_create_failed")
         try:
             sandbox = self.daytona.create_snapshot(record.sandbox_name, self.snapshot, volume.id, self.data_dir)
-            self.daytona.start(sandbox)
+        except DaytonaClientError:
+            sandbox = self._sandbox_named(record.sandbox_name)
+            if sandbox is None:
+                return self._fail(tomo_id, "sandbox_create_failed")
+        try:
+            if sandbox.state == "stopped" or sandbox.snapshot is None:
+                self.daytona.start(sandbox)
             self._smoke_test(sandbox, tomo_id)
         except DaytonaClientError:
             return self._fail(tomo_id, "sandbox_create_failed")
         except SandboxSupervisorError as error:
+            self._delete(sandbox)
             return self._fail(tomo_id, error.code)
         return self.registry.upsert(tomo_id, sandbox.id, self.snapshot, "ready")
+
+    def _recorded_sandbox(self, record: SandboxRecord) -> SandboxHandle | None:
+        try:
+            return self.daytona.get(record.sandbox_id)
+        except DaytonaClientError:
+            return self._sandbox_named(record.sandbox_name)
+
+    def _sandbox_named(self, name: str) -> SandboxHandle | None:
+        try:
+            return self.daytona.get(name)
+        except DaytonaClientError:
+            return None
+
+    def _delete_recorded_sandbox(self, record: SandboxRecord) -> None:
+        sandbox = self._recorded_sandbox(record) if record.sandbox_id else self._sandbox_named(record.sandbox_name)
+        if sandbox is not None:
+            self._delete(sandbox)
+
+    def _delete(self, sandbox: SandboxHandle) -> None:
+        try:
+            self.daytona.delete(sandbox)
+        except DaytonaClientError:
+            pass
 
     def _smoke_test(self, sandbox: SandboxHandle, tomo_id: str) -> None:
         request_id = "health-1"
