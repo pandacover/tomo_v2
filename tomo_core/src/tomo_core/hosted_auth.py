@@ -6,13 +6,12 @@ import json
 import os
 import tempfile
 import time
-from dataclasses import dataclass
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import httpx
 
-from .grok_auth import default_grok_auth_path
 from .oauth import OAuthManager
 
 
@@ -22,7 +21,16 @@ _KEYS = {
     "expiresAt": "expires_at",
     "expiry": "expires_at",
 }
-_REFRESH_WINDOW_SECONDS = 300
+_REFRESH_WINDOW_SECONDS = 120
+_DEFAULT_TOKEN_URL = "https://auth.x.ai/oauth2/token"
+
+
+class HostedAuthError(RuntimeError):
+    """A hosted-auth failure that is safe to show in operational logs."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(f"hosted authentication failed: {code}")
 
 
 def _normalize(value: Any) -> Any:
@@ -41,7 +49,7 @@ def _token_payload(value: Any) -> dict[str, Any] | None:
             found = _token_payload(child)
             if found is not None:
                 return found
-    if isinstance(value, list):
+    elif isinstance(value, list):
         for child in value:
             found = _token_payload(child)
             if found is not None:
@@ -49,106 +57,99 @@ def _token_payload(value: Any) -> dict[str, Any] | None:
     return None
 
 
-@dataclass(frozen=True)
-class HostedGrokAuth:
-    encoded_auth: str | None
-    auth_path: Path
+class HostedSuperGrokTokenBroker:
+    def __init__(
+        self,
+        data_dir: str | Path,
+        bootstrap_b64: str | None,
+        token_url: str = _DEFAULT_TOKEN_URL,
+    ) -> None:
+        self.data_dir = Path(data_dir)
+        self.bootstrap_b64 = bootstrap_b64
+        self.token_url = token_url
+        self.auth_path = self.data_dir / "hosted-auth" / "supergrok.json"
+        self.fingerprint_path = self.auth_path.parent / ".supergrok.json.bootstrap"
+        self.lock_path = self.auth_path.parent / ".supergrok.json.lock"
 
-    @classmethod
-    def from_environment(cls, *, auth_path: Path | None = None) -> HostedGrokAuth:
-        return cls(
-            encoded_auth=(
-                os.getenv("TOMO_SUPERGROK_OAUTH_JSON_B64")
-                or os.getenv("TOMO_GROK_AUTH_B64")
-                or os.getenv("GROK_AUTH_B64")
-            ),
-            auth_path=auth_path or default_grok_auth_path(),
-        )
+    def access_token(self, force_refresh: bool = False) -> str:
+        """Return a current access token without revealing credential material on errors."""
+        bootstrap = self._decode_bootstrap()
+        fingerprint = hashlib.sha256(self.bootstrap_b64.encode("ascii")).hexdigest()
+        with self._process_lock():
+            payload = self._read_auth()
+            if self._read_fingerprint() != fingerprint or payload is None:
+                payload = bootstrap
+                self._write_auth(payload)
+                self._write_private(self.fingerprint_path, fingerprint)
 
-    def bootstrap(self) -> bool:
-        if not self.encoded_auth:
-            return False
-        bootstrap = self._decode()
-        fingerprint = hashlib.sha256(self.encoded_auth.encode("ascii")).hexdigest()
-        fingerprint_path = self.auth_path.parent / f".{self.auth_path.name}.bootstrap"
-        current = self._read_auth()
-        if self._read_fingerprint(fingerprint_path) != fingerprint or current is None:
-            current = bootstrap
-            self._write_auth(current)
-            self._write_private(fingerprint_path, fingerprint)
-        if self._refresh_if_needed(current):
-            self._write_auth(current)
-        return True
+            token = _token_payload(payload)
+            if token is None or not isinstance(token.get("access_token"), str) or not token["access_token"]:
+                raise HostedAuthError("access_token_unavailable")
+            if self._needs_refresh(token, force_refresh):
+                self._refresh(token)
+                self._write_auth(payload)
+            return token["access_token"]
 
-    def access_token(self) -> str:
-        """Refresh and return the host-held token immediately before sandbox use."""
-        if not self.bootstrap():
-            raise RuntimeError("hosted access token unavailable")
-        token = _token_payload(self._read_auth())
-        if token is None or not isinstance(token.get("access_token"), str) or not token["access_token"]:
-            raise RuntimeError("hosted access token unavailable")
-        return token["access_token"]
-
-    def refresh(self) -> None:
-        """Force one Railway-managed OAuth refresh after a sandbox rejection."""
-        if not self.bootstrap():
-            raise RuntimeError("hosted access token unavailable")
-        payload = self._read_auth()
-        if payload is None:
-            raise RuntimeError("hosted access token unavailable")
-        self._refresh_if_needed(payload, force=True)
-        self._write_auth(payload)
-
-    def _decode(self) -> dict[str, Any]:
+    def _decode_bootstrap(self) -> dict[str, Any]:
+        if not isinstance(self.bootstrap_b64, str) or not self.bootstrap_b64:
+            raise HostedAuthError("invalid_bootstrap")
         try:
-            raw = base64.b64decode(self.encoded_auth.encode("ascii"), validate=True)
+            raw = base64.b64decode(self.bootstrap_b64.encode("ascii"), validate=True)
             payload = json.loads(raw)
-        except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise ValueError("invalid hosted Grok authentication configuration") from error
+        except (ValueError, UnicodeDecodeError, UnicodeEncodeError, json.JSONDecodeError):
+            raise HostedAuthError("invalid_bootstrap") from None
         if not isinstance(payload, dict):
-            raise ValueError("invalid hosted Grok authentication configuration")
+            raise HostedAuthError("invalid_bootstrap")
         return _normalize(payload)
 
     def _read_auth(self) -> dict[str, Any] | None:
         try:
             payload = json.loads(self.auth_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             return None
-        return payload if isinstance(payload, dict) else None
+        return _normalize(payload) if isinstance(payload, dict) else None
 
-    @staticmethod
-    def _read_fingerprint(path: Path) -> str | None:
+    def _read_fingerprint(self) -> str | None:
         try:
-            return path.read_text(encoding="ascii").strip()
+            return self.fingerprint_path.read_text(encoding="ascii").strip()
         except OSError:
             return None
 
-    def _refresh_if_needed(self, payload: dict[str, Any], *, force: bool = False) -> bool:
-        token = _token_payload(payload)
-        if token is None or not isinstance(token.get("refresh_token"), str):
-            return False
+    @staticmethod
+    def _needs_refresh(token: dict[str, Any], force_refresh: bool) -> bool:
+        if force_refresh:
+            return True
         try:
             expires_at = int(token.get("expires_at", 0))
         except (TypeError, ValueError):
             expires_at = 0
-        if not force and expires_at > time.time() + _REFRESH_WINDOW_SECONDS:
-            return False
-        config = OAuthManager.default_providers()["supergrok"]
-        response = httpx.post(
-            config.token_url,
-            data={"grant_type": "refresh_token", "client_id": config.client_id, "refresh_token": token["refresh_token"]},
-            timeout=60,
-        )
-        response.raise_for_status()
-        refreshed = _normalize(response.json())
-        if not isinstance(refreshed, dict) or not isinstance(refreshed.get("access_token"), str):
-            raise ValueError("hosted Grok authentication refresh returned an invalid response")
-        old_refresh_token = token["refresh_token"]
+        return expires_at <= time.time() + _REFRESH_WINDOW_SECONDS
+
+    def _refresh(self, token: dict[str, Any]) -> None:
+        refresh_token = token.get("refresh_token")
+        if not isinstance(refresh_token, str) or not refresh_token:
+            raise HostedAuthError("refresh_unavailable")
+        client_id = OAuthManager.default_providers()["supergrok"].client_id
+        try:
+            response = httpx.post(
+                self.token_url,
+                data={"grant_type": "refresh_token", "client_id": client_id, "refresh_token": refresh_token},
+                timeout=60,
+            )
+            response.raise_for_status()
+            refreshed = _normalize(response.json())
+        except Exception:
+            raise HostedAuthError("refresh_failed") from None
+        if not isinstance(refreshed, dict) or not isinstance(refreshed.get("access_token"), str) or not refreshed["access_token"]:
+            raise HostedAuthError("refresh_failed")
         token.update(refreshed)
-        token.setdefault("refresh_token", old_refresh_token)
+        if not isinstance(token.get("refresh_token"), str) or not token["refresh_token"]:
+            token["refresh_token"] = refresh_token
         if "expires_in" in refreshed:
-            token["expires_at"] = int(time.time()) + int(refreshed["expires_in"])
-        return True
+            try:
+                token["expires_at"] = int(time.time()) + int(refreshed["expires_in"])
+            except (TypeError, ValueError):
+                raise HostedAuthError("refresh_failed") from None
 
     def _write_auth(self, payload: dict[str, Any]) -> None:
         self._write_private(self.auth_path, json.dumps(payload, separators=(",", ":")))
@@ -168,3 +169,29 @@ class HostedGrokAuth:
         except BaseException:
             Path(temporary).unlink(missing_ok=True)
             raise
+
+    @contextmanager
+    def _process_lock(self) -> Iterator[None]:
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.lock_path.open("a+b") as lock:
+            if os.name == "nt":
+                import msvcrt
+
+                lock.seek(0)
+                lock.write(b"0")
+                lock.flush()
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+                try:
+                    yield
+                finally:
+                    lock.seek(0)
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)

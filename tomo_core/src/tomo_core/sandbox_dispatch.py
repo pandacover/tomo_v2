@@ -19,10 +19,7 @@ _EXEC_TIMEOUT_SECONDS = 120
 
 
 class RailwayAuthBroker(Protocol):
-    def access_token(self) -> str:
-        ...
-
-    def refresh(self) -> None:
+    def access_token(self, force_refresh: bool = False) -> str:
         ...
 
 
@@ -73,19 +70,17 @@ class SandboxDispatch:
                 if error.code != "auth_expired":
                     raise SandboxDispatchError(error.code) from error
                 try:
-                    self.auth_broker.refresh()
-                except Exception as refresh_error:
-                    raise SandboxDispatchError("auth_refresh_failed") from refresh_error
-                try:
-                    bubbles = self._execute(record.sandbox_id, installation.tomo_id, request_id, envelope)
+                    bubbles = self._execute(record.sandbox_id, installation.tomo_id, request_id, envelope, force_refresh=True)
                 except SandboxProtocolError as retry_error:
                     raise SandboxDispatchError(retry_error.code) from retry_error
             return bubbles
 
-    def _execute(self, sandbox_id: str, tomo_id: str, request_id: str, envelope: InboundEnvelope) -> list[OutboundBubble]:
+    def _execute(
+        self, sandbox_id: str, tomo_id: str, request_id: str, envelope: InboundEnvelope, *, force_refresh: bool = False
+    ) -> list[OutboundBubble]:
         try:
             sandbox = self.client.get(sandbox_id)
-            token = self.auth_broker.access_token()
+            token = self.auth_broker.access_token(force_refresh=force_refresh)
             result = self.client.exec(
                 sandbox,
                 _COMMAND,

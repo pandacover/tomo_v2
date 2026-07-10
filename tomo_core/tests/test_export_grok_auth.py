@@ -10,6 +10,12 @@ from scripts import export_grok_auth
 
 
 class ExportGrokAuthTests(unittest.TestCase):
+    def test_defaults_to_the_standard_grok_auth_path_and_names_the_hosted_variable(self):
+        parser = export_grok_auth.build_parser()
+
+        self.assertEqual(parser.parse_args([]).auth_path, Path.home() / ".grok" / "auth.json")
+        self.assertIn("TOMO_SUPERGROK_OAUTH_JSON_B64", parser.description)
+
     def test_exports_auth_json_as_base64_without_printing_the_token(self):
         with tempfile.TemporaryDirectory() as tmp:
             auth_path = Path(tmp) / "auth.json"

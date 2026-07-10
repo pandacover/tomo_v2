@@ -37,7 +37,7 @@ class SandboxDispatchTests(unittest.TestCase):
 
         self.assertEqual(bubbles[0].text, "hello")
         self.supervisor.reconcile.assert_called_once_with("tomo-a")
-        self.auth.access_token.assert_called_once_with()
+        self.auth.access_token.assert_called_once_with(force_refresh=False)
         self.daytona.get.assert_called_once_with("sbx-1")
         command = self.daytona.exec.call_args.args[1]
         self.assertEqual(command, "/opt/tomo/.venv/bin/tomo-core sandbox-inbound")
@@ -69,8 +69,8 @@ class SandboxDispatchTests(unittest.TestCase):
 
         self.assertEqual(self.dispatch.deliver_telegram(self.installation, 42, self.inbound), [OutboundBubble("hello")])
 
-        self.auth.refresh.assert_called_once_with()
-        self.assertEqual(self.auth.access_token.call_count, 2)
+        self.auth.refresh.assert_not_called()
+        self.auth.access_token.assert_has_calls([unittest.mock.call(force_refresh=False), unittest.mock.call(force_refresh=True)])
         self.assertEqual(self.daytona.exec.call_count, 2)
 
     def test_deliver_rejects_a_nonzero_exit_with_a_safe_code(self):

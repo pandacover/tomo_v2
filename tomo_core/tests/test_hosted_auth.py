@@ -8,52 +8,54 @@ import unittest
 from pathlib import Path
 from unittest.mock import call, patch
 
-from tomo_core.hosted_auth import HostedGrokAuth
+from tomo_core.hosted_auth import HostedAuthError, HostedSuperGrokTokenBroker
 
 
-class HostedGrokAuthTests(unittest.TestCase):
-    def test_bootstrap_decodes_normalizes_and_writes_private_auth_file_atomically(self):
+class HostedSuperGrokTokenBrokerTests(unittest.TestCase):
+    def test_access_token_strictly_decodes_normalizes_and_writes_private_auth_file(self):
         with tempfile.TemporaryDirectory() as tmp:
-            auth_path = Path(tmp) / "auth.json"
             encoded = base64.b64encode(
                 json.dumps({"session": {"accessToken": "access", "refreshToken": "refresh", "expiresAt": 2_000_000_000}}).encode()
             ).decode()
 
             with patch("tomo_core.hosted_auth.os.chmod", wraps=os.chmod) as chmod:
-                with patch.dict(os.environ, {"TOMO_GROK_AUTH_B64": encoded, "GROK_AUTH_JSON": str(auth_path)}, clear=True):
-                    HostedGrokAuth.from_environment().bootstrap()
+                token = HostedSuperGrokTokenBroker(tmp, encoded).access_token()
 
+            auth_path = Path(tmp) / "hosted-auth" / "supergrok.json"
             saved = json.loads(auth_path.read_text(encoding="utf-8"))
+            self.assertEqual(token, "access")
             self.assertEqual(saved["session"]["access_token"], "access")
             self.assertEqual(saved["session"]["refresh_token"], "refresh")
             self.assertEqual(saved["session"]["expires_at"], 2_000_000_000)
             self.assertIn(call(auth_path, 0o600), chmod.call_args_list)
-            self.assertTrue((Path(tmp) / ".auth.json.bootstrap").exists())
+            self.assertEqual(
+                (auth_path.parent / ".supergrok.json.bootstrap").read_text(encoding="ascii"),
+                hashlib.sha256(encoded.encode("ascii")).hexdigest(),
+            )
 
     def test_bootstrap_keeps_refreshed_token_until_the_broker_value_changes(self):
         with tempfile.TemporaryDirectory() as tmp:
-            auth_path = Path(tmp) / "auth.json"
+            auth_path = Path(tmp) / "hosted-auth" / "supergrok.json"
+            auth_path.parent.mkdir()
             original = {"access_token": "bootstrap", "refresh_token": "refresh", "expires_at": 2_000_000_000}
             encoded = base64.b64encode(json.dumps(original).encode()).decode()
             auth_path.write_text(json.dumps({**original, "access_token": "refreshed"}), encoding="utf-8")
-            (Path(tmp) / ".auth.json.bootstrap").write_text(
+            (auth_path.parent / ".supergrok.json.bootstrap").write_text(
                 hashlib.sha256(encoded.encode("ascii")).hexdigest(), encoding="ascii"
             )
 
-            with patch.dict(os.environ, {"TOMO_GROK_AUTH_B64": encoded, "GROK_AUTH_JSON": str(auth_path)}, clear=True):
-                HostedGrokAuth.from_environment().bootstrap()
+            HostedSuperGrokTokenBroker(tmp, encoded).access_token()
 
             self.assertEqual(json.loads(auth_path.read_text(encoding="utf-8"))["access_token"], "refreshed")
 
             replacement = base64.b64encode(json.dumps({**original, "access_token": "replacement"}).encode()).decode()
-            with patch.dict(os.environ, {"TOMO_GROK_AUTH_B64": replacement, "GROK_AUTH_JSON": str(auth_path)}, clear=True):
-                HostedGrokAuth.from_environment().bootstrap()
+            HostedSuperGrokTokenBroker(tmp, replacement).access_token()
 
             self.assertEqual(json.loads(auth_path.read_text(encoding="utf-8"))["access_token"], "replacement")
 
     def test_bootstrap_refreshes_near_expiry_and_keeps_omitted_refresh_token(self):
         with tempfile.TemporaryDirectory() as tmp:
-            auth_path = Path(tmp) / "auth.json"
+            auth_path = Path(tmp) / "hosted-auth" / "supergrok.json"
             encoded = base64.b64encode(
                 json.dumps({"access_token": "old", "refresh_token": "refresh", "expires_at": int(time.time()) + 10}).encode()
             ).decode()
@@ -65,9 +67,8 @@ class HostedGrokAuthTests(unittest.TestCase):
                 def json(self):
                     return {"access_token": "new", "expires_in": 3600}
 
-            with patch.dict(os.environ, {"TOMO_GROK_AUTH_B64": encoded, "GROK_AUTH_JSON": str(auth_path)}, clear=True):
-                with patch("tomo_core.hosted_auth.httpx.post", return_value=Response()) as post:
-                    HostedGrokAuth.from_environment().bootstrap()
+            with patch("tomo_core.hosted_auth.httpx.post", return_value=Response()) as post:
+                HostedSuperGrokTokenBroker(tmp, encoded).access_token()
 
             saved = json.loads(auth_path.read_text(encoding="utf-8"))
             self.assertEqual(saved["access_token"], "new")
@@ -75,16 +76,42 @@ class HostedGrokAuthTests(unittest.TestCase):
             self.assertGreater(saved["expires_at"], int(time.time()))
             self.assertEqual(post.call_args.kwargs["data"]["client_id"], "b1a00492-073a-47ea-816f-4c329264a828")
 
-    def test_access_token_bootstraps_the_explicit_host_data_path(self):
+    def test_access_token_force_refreshes_even_when_unexpired(self):
         with tempfile.TemporaryDirectory() as tmp:
-            auth_path = Path(tmp) / "hosted" / "supergrok.json"
-            encoded = base64.b64encode(json.dumps({"access_token": "fresh"}).encode()).decode()
+            encoded = base64.b64encode(
+                json.dumps({"access_token": "old", "refresh_token": "refresh", "expires_at": int(time.time()) + 3600}).encode()
+            ).decode()
 
-            with patch.dict(os.environ, {"TOMO_SUPERGROK_OAUTH_JSON_B64": encoded}, clear=True):
-                token = HostedGrokAuth.from_environment(auth_path=auth_path).access_token()
+            class Response:
+                def raise_for_status(self):
+                    pass
 
-            self.assertEqual(token, "fresh")
-            self.assertTrue(auth_path.exists())
+                def json(self):
+                    return {"access_token": "new", "expires_in": 3600}
+
+            with patch("tomo_core.hosted_auth.httpx.post", return_value=Response()) as post:
+                token = HostedSuperGrokTokenBroker(tmp, encoded).access_token(force_refresh=True)
+
+            self.assertEqual(token, "new")
+            post.assert_called_once()
+
+    def test_access_token_raises_a_safe_refresh_unavailable_error_without_refresh_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            secret = "secret-access"
+            encoded = base64.b64encode(json.dumps({"access_token": secret, "expires_at": 0}).encode()).decode()
+
+            with self.assertRaises(HostedAuthError) as raised:
+                HostedSuperGrokTokenBroker(tmp, encoded).access_token()
+
+            self.assertEqual(raised.exception.code, "refresh_unavailable")
+            self.assertNotIn(secret, str(raised.exception))
+
+    def test_access_token_rejects_invalid_base64_with_a_safe_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(HostedAuthError) as raised:
+                HostedSuperGrokTokenBroker(tmp, "not base64").access_token()
+
+            self.assertEqual(raised.exception.code, "invalid_bootstrap")
 
 
 if __name__ == "__main__":

@@ -9,9 +9,14 @@ from pathlib import Path
 from tomo_core.grok_auth import default_grok_auth_path
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="encode Grok OAuth JSON for TOMO_GROK_AUTH_B64")
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="encode Grok OAuth JSON for TOMO_SUPERGROK_OAUTH_JSON_B64")
     parser.add_argument("auth_path", nargs="?", type=Path, default=default_grok_auth_path())
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
     try:
         raw = args.auth_path.read_bytes()

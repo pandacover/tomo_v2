@@ -14,7 +14,7 @@ import uvicorn
 from .instances import RuntimeInstanceRegistry
 from .daytona_client import DaytonaClient
 from .daytona_supervisor import DaytonaSupervisor
-from .hosted_auth import HostedGrokAuth
+from .hosted_auth import HostedSuperGrokTokenBroker
 from .hosted_config import HostedRuntimeConfig
 from .models import OutboundBubble, RuntimeConfig
 from .oauth import OAuthManager
@@ -178,8 +178,8 @@ def run_shared_gateway_foreground(args: argparse.Namespace, config: HostedRuntim
             instances = RuntimeInstanceRegistry(config.data_dir, provider_factory, client, soul_path=args.soul)
             gateway = SharedTelegramGateway(client=client, store=store, dispatch=InProcessTelegramRuntimeDispatch(instances))
         else:
-            auth = HostedGrokAuth.from_environment(auth_path=config.data_dir / "supergrok_auth.json")
-            auth.bootstrap()
+            auth = HostedSuperGrokTokenBroker(config.data_dir, os.getenv("TOMO_SUPERGROK_OAUTH_JSON_B64"))
+            auth.access_token()
             registry = SandboxRegistry(config.data_dir)
             daytona = DaytonaClient()
             supervisor = DaytonaSupervisor(registry, daytona, snapshot=config.daytona_snapshot_name)
