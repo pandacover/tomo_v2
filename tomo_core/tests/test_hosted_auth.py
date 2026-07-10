@@ -12,6 +12,27 @@ from tomo_core.hosted_auth import HostedAuthError, HostedSuperGrokTokenBroker
 
 
 class HostedSuperGrokTokenBrokerTests(unittest.TestCase):
+    def test_accepts_current_grok_cli_key_and_iso_expiry_schema(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            encoded = base64.b64encode(
+                json.dumps(
+                    {
+                        "https://auth.x.ai::client": {
+                            "key": "access",
+                            "refresh_token": "refresh",
+                            "expires_at": "2099-01-01T00:00:00Z",
+                            "oidc_issuer": "https://auth.x.ai",
+                        }
+                    }
+                ).encode()
+            ).decode()
+
+            with patch("tomo_core.hosted_auth.httpx.post") as post:
+                token = HostedSuperGrokTokenBroker(tmp, encoded).access_token()
+
+            self.assertEqual(token, "access")
+            post.assert_not_called()
+
     def test_access_token_strictly_decodes_normalizes_and_writes_private_auth_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             encoded = base64.b64encode(

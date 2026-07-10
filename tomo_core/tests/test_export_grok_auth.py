@@ -2,6 +2,7 @@ import base64
 import contextlib
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -28,6 +29,13 @@ class ExportGrokAuthTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(json.loads(base64.b64decode(output.getvalue()).decode()), {"access_token": "secret-access"})
             self.assertNotIn("secret-access", output.getvalue())
+
+    @unittest.skipUnless(os.name == "nt", "MSYS paths are Windows-specific")
+    def test_normalizes_a_git_bash_msys_path(self):
+        self.assertEqual(
+            export_grok_auth.normalize_auth_path(Path("/c/Users/example/.grok/auth.json")),
+            Path("C:/Users/example/.grok/auth.json"),
+        )
 
 
 if __name__ == "__main__":

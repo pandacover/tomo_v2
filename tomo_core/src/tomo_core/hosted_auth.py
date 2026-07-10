@@ -7,6 +7,7 @@ import os
 import tempfile
 import time
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -35,7 +36,14 @@ class HostedAuthError(RuntimeError):
 
 def _normalize(value: Any) -> Any:
     if isinstance(value, dict):
-        return {_KEYS.get(key, key): _normalize(child) for key, child in value.items()}
+        normalized = {_KEYS.get(key, key): _normalize(child) for key, child in value.items()}
+        if (
+            "access_token" not in normalized
+            and isinstance(normalized.get("key"), str)
+            and isinstance(normalized.get("refresh_token"), str)
+        ):
+            normalized["access_token"] = normalized["key"]
+        return normalized
     if isinstance(value, list):
         return [_normalize(child) for child in value]
     return value
@@ -119,11 +127,15 @@ class HostedSuperGrokTokenBroker:
     def _needs_refresh(token: dict[str, Any], force_refresh: bool) -> bool:
         if force_refresh:
             return True
+        expires_at = token.get("expires_at", 0)
         try:
-            expires_at = int(token.get("expires_at", 0))
+            expiry = float(expires_at)
         except (TypeError, ValueError):
-            expires_at = 0
-        return expires_at <= time.time() + _REFRESH_WINDOW_SECONDS
+            try:
+                expiry = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                expiry = 0
+        return expiry <= time.time() + _REFRESH_WINDOW_SECONDS
 
     def _refresh(self, token: dict[str, Any]) -> None:
         refresh_token = token.get("refresh_token")
