@@ -15,6 +15,7 @@ from .instances import RuntimeInstanceRegistry
 from .daytona_client import DaytonaClient
 from .daytona_supervisor import DaytonaSupervisor
 from .hosted_auth import HostedGrokAuth
+from .hosted_config import HostedRuntimeConfig
 from .models import OutboundBubble, RuntimeConfig
 from .oauth import OAuthManager
 from .grok_auth import GrokAuthStore
@@ -135,11 +136,7 @@ def _append_arg(argv: list[str], name: str, value: object | None) -> None:
         argv.extend([name, str(value)])
 
 
-def start_shared_gateway_background(args: argparse.Namespace) -> int:
-    missing = _missing_shared_gateway_configuration(args)
-    if missing:
-        print(f"missing shared hosted gateway configuration: {', '.join(missing)}", file=sys.stderr)
-        return 2
+def start_shared_gateway_background(args: argparse.Namespace, config: HostedRuntimeConfig) -> int:
     pid_path = _shared_pid_path(args.data_dir)
     existing_pid = _read_pid(pid_path)
     if existing_pid is not None and _pid_is_running(existing_pid):
@@ -153,7 +150,7 @@ def start_shared_gateway_background(args: argparse.Namespace) -> int:
     _append_arg(child_argv, "--soul", args.soul)
     _append_arg(child_argv, "--model", args.model)
     _append_arg(child_argv, "--static-response", args.static_response)
-    _append_arg(child_argv, "--poll-timeout", args.poll_timeout)
+    _append_arg(child_argv, "--poll-timeout", config.poll_timeout)
 
     log_path = _shared_log_path(args.data_dir)
     popen_kwargs: dict[str, object] = {
@@ -171,25 +168,22 @@ def start_shared_gateway_background(args: argparse.Namespace) -> int:
     return 0
 
 
-def run_shared_gateway_foreground(args: argparse.Namespace) -> int:
-    missing = _missing_shared_gateway_configuration(args)
-    if missing:
-        print(f"missing shared hosted gateway configuration: {', '.join(missing)}", file=sys.stderr)
-        return 2
+def run_shared_gateway_foreground(args: argparse.Namespace, config: HostedRuntimeConfig) -> int:
     pid_path = _shared_pid_path(args.data_dir)
     pid_path.write_text(str(os.getpid()), encoding="utf-8")
     try:
-        client = TelegramBotApiClient(token=args.token)
-        store = TelegramOnboardingStore(args.data_dir)
-        if args.static_response:
-            instances = RuntimeInstanceRegistry(args.data_dir, lambda _: StaticProvider(args.static_response), client, soul_path=args.soul)
+        client = TelegramBotApiClient(token=config.bot_token)
+        store = TelegramOnboardingStore(config.data_dir)
+        if config.runtime == "local":
+            provider_factory = lambda _: StaticProvider(args.static_response) if args.static_response else build_provider(args, build_oauth_manager(args))
+            instances = RuntimeInstanceRegistry(config.data_dir, provider_factory, client, soul_path=args.soul)
             gateway = SharedTelegramGateway(client=client, store=store, instances=instances)
         else:
-            auth = HostedGrokAuth.from_environment(auth_path=Path(args.data_dir) / "supergrok_auth.json")
+            auth = HostedGrokAuth.from_environment(auth_path=config.data_dir / "supergrok_auth.json")
             auth.bootstrap()
-            registry = SandboxRegistry(args.data_dir)
+            registry = SandboxRegistry(config.data_dir)
             daytona = DaytonaClient()
-            supervisor = DaytonaSupervisor(registry, daytona, snapshot=os.environ["TOMO_DAYTONA_SNAPSHOT_NAME"])
+            supervisor = DaytonaSupervisor(registry, daytona, snapshot=config.daytona_snapshot_name)
             dispatch = HostedTelegramRuntimeDispatch(client, supervisor, SandboxDispatch(registry, daytona, auth.access_token).dispatch)
             gateway = SharedTelegramGateway(client=client, store=store, dispatch=dispatch)
         print("shared telegram gateway polling started. press ctrl+c to stop.")
@@ -197,23 +191,12 @@ def run_shared_gateway_foreground(args: argparse.Namespace) -> int:
             client=client,
             store=store,
             process_update=gateway.process_update,
-            poll_timeout=args.poll_timeout,
+            poll_timeout=config.poll_timeout,
+            worker_count=config.worker_count,
         ).run_forever()
     finally:
         if _read_pid(pid_path) == os.getpid():
             pid_path.unlink(missing_ok=True)
-
-
-def _missing_shared_gateway_configuration(args: argparse.Namespace) -> list[str]:
-    if args.static_response:
-        return [] if args.token else ["TOMO_TELEGRAM_GLOBAL_BOT_TOKEN or --token"]
-    required = {
-        "DAYTONA_API_KEY": os.getenv("DAYTONA_API_KEY"),
-        "TOMO_DAYTONA_SNAPSHOT_NAME": os.getenv("TOMO_DAYTONA_SNAPSHOT_NAME"),
-        "TOMO_SUPERGROK_OAUTH_JSON_B64": os.getenv("TOMO_SUPERGROK_OAUTH_JSON_B64"),
-        "TOMO_TELEGRAM_GLOBAL_BOT_TOKEN or --token": args.token,
-    }
-    return [name for name, value in required.items() if not value]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -261,7 +244,7 @@ def main(argv: list[str] | None = None) -> int:
     shared_start.add_argument("--google-client-id", default=None)
     shared_start.add_argument("--google-client-secret", default=None)
     shared_start.add_argument("--static-response")
-    shared_start.add_argument("--poll-timeout", type=int, default=30)
+    shared_start.add_argument("--poll-timeout", type=int)
     shared_start.add_argument("--background", action="store_true", help="start poller in the background and return")
 
     shared_stop = shared_sub.add_parser("stop", help="stop background shared telegram polling")
@@ -280,7 +263,7 @@ def main(argv: list[str] | None = None) -> int:
     shared_restart.add_argument("--google-client-id", default=None)
     shared_restart.add_argument("--google-client-secret", default=None)
     shared_restart.add_argument("--static-response")
-    shared_restart.add_argument("--poll-timeout", type=int, default=30)
+    shared_restart.add_argument("--poll-timeout", type=int)
 
     sandbox_inbound = sub.add_parser("sandbox-inbound", help="handle one sandbox protocol envelope from TOMO_INBOUND_JSON")
     sandbox_inbound.add_argument("--health", action="store_true", help="validate the sandbox boundary without calling a model")
@@ -306,16 +289,26 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "telegram-shared" and args.shared_command == "start":
+        try:
+            config = HostedRuntimeConfig.from_env(token=args.token, data_dir=args.data_dir, static_response=args.static_response, poll_timeout=args.poll_timeout)
+        except ValueError as error:
+            print(error, file=sys.stderr)
+            return 2
         if args.background:
-            return start_shared_gateway_background(args)
-        return run_shared_gateway_foreground(args)
+            return start_shared_gateway_background(args, config)
+        return run_shared_gateway_foreground(args, config)
 
     if args.command == "telegram-shared" and args.shared_command == "stop":
         return stop_shared_gateway(args.data_dir)
 
     if args.command == "telegram-shared" and args.shared_command == "restart":
+        try:
+            config = HostedRuntimeConfig.from_env(token=args.token, data_dir=args.data_dir, static_response=args.static_response, poll_timeout=args.poll_timeout)
+        except ValueError as error:
+            print(error, file=sys.stderr)
+            return 2
         stop_shared_gateway(args.data_dir)
-        return start_shared_gateway_background(args)
+        return start_shared_gateway_background(args, config)
 
     if args.command == "sandbox-inbound":
         if args.health:

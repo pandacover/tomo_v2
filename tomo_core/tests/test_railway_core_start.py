@@ -1,5 +1,6 @@
 import importlib.util
 import signal
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -42,15 +43,26 @@ class FakeProcess:
 
 
 class RailwayCoreStartTests(unittest.TestCase):
+    def hosted_env(self, data_dir: str) -> dict[str, str]:
+        return {
+            "TOMO_HOSTED_RUNTIME": "daytona",
+            "TOMO_TELEGRAM_GLOBAL_BOT_TOKEN": "secret-token",
+            "TOMO_CORE_DATA_DIR": data_dir,
+            "DAYTONA_API_KEY": "daytona-key",
+            "TOMO_DAYTONA_SNAPSHOT_NAME": "snapshot",
+            "TOMO_SUPERGROK_OAUTH_JSON_B64": "e30=",
+        }
+
     def test_child_failure_terminates_sibling_and_returns_failure(self):
         control = FakeProcess([None, None])
         telegram = FakeProcess([7])
         with (
+            tempfile.TemporaryDirectory() as tmp,
             patch.object(railway_core_start.subprocess, "Popen", side_effect=[control, telegram]) as popen,
             patch.object(railway_core_start.time, "sleep"),
             patch.object(railway_core_start.signal, "signal"),
         ):
-            code = railway_core_start.start({"TOMO_TELEGRAM_GLOBAL_BOT_TOKEN": "secret-token"})
+            code = railway_core_start.start(self.hosted_env(tmp))
 
         self.assertEqual(code, 7)
         self.assertTrue(control.terminated)
@@ -67,13 +79,14 @@ class RailwayCoreStartTests(unittest.TestCase):
     def test_without_bot_token_supervises_control_api_only(self):
         control = FakeProcess([0])
         with (
+            tempfile.TemporaryDirectory() as tmp,
             patch.object(railway_core_start.subprocess, "Popen", return_value=control) as popen,
             patch.object(railway_core_start.time, "sleep"),
             patch.object(railway_core_start.signal, "signal"),
         ):
-            code = railway_core_start.start({"TOMO_CONTROL_HOST": "127.0.0.1", "TOMO_CONTROL_PORT": "9999"})
+            code = railway_core_start.start({"TOMO_HOSTED_RUNTIME": "local", "TOMO_CORE_DATA_DIR": tmp, "TOMO_CONTROL_HOST": "127.0.0.1", "TOMO_CONTROL_PORT": "9999"})
 
-        self.assertEqual(code, 0)
+        self.assertEqual(code, 1)
         self.assertEqual(popen.call_count, 1)
         self.assertNotIn("secret-token", str(popen.call_args_list))
 
@@ -89,11 +102,12 @@ class RailwayCoreStartTests(unittest.TestCase):
             handlers[signal.SIGTERM](signal.SIGTERM, None)
 
         with (
+            tempfile.TemporaryDirectory() as tmp,
             patch.object(railway_core_start.subprocess, "Popen", side_effect=[control, telegram]),
             patch.object(railway_core_start.time, "sleep", side_effect=interrupt_supervisor),
             patch.object(railway_core_start.signal, "signal", side_effect=register_signal),
         ):
-            code = railway_core_start.start({"TOMO_TELEGRAM_GLOBAL_BOT_TOKEN": "secret-token"})
+            code = railway_core_start.start(self.hosted_env(tmp))
 
         self.assertEqual(code, 128 + signal.SIGTERM)
         self.assertTrue(control.terminated)

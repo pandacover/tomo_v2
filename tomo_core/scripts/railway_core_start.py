@@ -7,6 +7,8 @@ import sys
 import time
 from pathlib import Path
 
+from tomo_core.hosted_config import HostedRuntimeConfig
+
 
 def _default_data_dir() -> str:
     if os.getenv("TOMO_CORE_DATA_DIR"):
@@ -60,8 +62,14 @@ def _stop_children(processes: list[subprocess.Popen[object]]) -> None:
 
 
 def start(env: dict[str, str]) -> int:
+    explicit_local_control_only = env.get("TOMO_HOSTED_RUNTIME", "").lower() == "local" and not env.get("TOMO_TELEGRAM_GLOBAL_BOT_TOKEN")
+    try:
+        config = HostedRuntimeConfig.from_env(env, require_bot=not explicit_local_control_only)
+    except ValueError as error:
+        print(error, file=sys.stderr)
+        return 2
     commands = [_control_command(env)]
-    if env.get("TOMO_TELEGRAM_GLOBAL_BOT_TOKEN"):
+    if config.bot_token:
         commands.append(["uv", "run", "tomo-core", "telegram-shared", "start"])
         print("starting control api and shared telegram listener.", flush=True)
     else:
@@ -83,7 +91,7 @@ def start(env: dict[str, str]) -> int:
             code = process.poll()
             if code is not None:
                 _stop_children(processes)
-                return code if code != 0 else 0
+                return code if code != 0 else 1
         time.sleep(0.1)
 
     return 128 + shutdown_signal
