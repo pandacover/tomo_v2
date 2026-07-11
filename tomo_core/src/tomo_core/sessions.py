@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import threading
@@ -98,55 +99,112 @@ class JsonSessionStore:
 
     def load(self, session_key: str) -> ConversationSession:
         path = self._path(session_key)
-        if not path.exists():
-            return ConversationSession(session_key=session_key)
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        return ConversationSession(
-            session_key=session_key,
-            messages=[StoredMessage(**item) for item in payload.get("messages", [])],
-            accepted_generation_ids=tuple(payload.get("accepted_generation_ids", ())),
-        )
+        with _exclusive_file_lock(self._lock_path(path)):
+            return self._load_unlocked(session_key, path)
 
     def save(self, session: ConversationSession) -> None:
         self.save_atomic(session)
 
     def save_atomic(self, session: ConversationSession) -> None:
         path = self._path(session.session_key)
-        lock_path = path.with_suffix(f"{path.suffix}.lock")
-        with _exclusive_file_lock(lock_path):
+        with _exclusive_file_lock(self._lock_path(path)):
             merged = self._merge_with_disk(session, path)
             payload = {
                 "session_key": merged.session_key,
                 "messages": [asdict(m) for m in merged.messages],
                 "accepted_generation_ids": list(merged.accepted_generation_ids),
             }
+            content = json.dumps(payload, indent=2, ensure_ascii=False)
             tmp_path = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp")
             try:
-                tmp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-                tmp_path.replace(path)
+                tmp_path.write_text(content, encoding="utf-8")
+                try:
+                    tmp_path.replace(path)
+                except OSError as error:
+                    if error.errno != errno.ENOSYS:
+                        raise
+                    self._save_without_replace(path, content)
             finally:
                 tmp_path.unlink(missing_ok=True)
             session.messages = merged.messages
             session.accepted_generation_ids = merged.accepted_generation_ids
 
-    @staticmethod
-    def _merge_with_disk(session: ConversationSession, path: Path) -> ConversationSession:
-        if not path.exists():
-            return session
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        existing = [StoredMessage(**item) for item in payload.get("messages", [])]
+    def _merge_with_disk(self, session: ConversationSession, path: Path) -> ConversationSession:
+        existing_session = self._load_unlocked(session.session_key, path)
+        existing = existing_session.messages
         seen = {_message_identity(message) for message in existing}
         for message in session.messages:
             identity = _message_identity(message)
             if identity not in seen:
                 existing.append(message)
                 seen.add(identity)
-        accepted = tuple(sorted(set(payload.get("accepted_generation_ids", ())) | set(session.accepted_generation_ids)))
+        accepted = tuple(sorted(set(existing_session.accepted_generation_ids) | set(session.accepted_generation_ids)))
         return ConversationSession(session.session_key, existing, accepted)
+
+    def _load_unlocked(self, session_key: str, path: Path) -> ConversationSession:
+        recovery_path = self._recovery_path(path)
+        if not path.exists():
+            if recovery_path.exists():
+                return _read_session(recovery_path, session_key)
+            return ConversationSession(session_key=session_key)
+        try:
+            return _read_session(path, session_key)
+        except _INVALID_SESSION_DATA as primary_error:
+            if not recovery_path.exists():
+                raise
+            try:
+                return _read_session(recovery_path, session_key)
+            except _INVALID_SESSION_DATA:
+                raise primary_error
+
+    @staticmethod
+    def _save_without_replace(path: Path, content: str) -> None:
+        recovery_path = JsonSessionStore._recovery_path(path)
+        _write_and_fsync(recovery_path, content)
+        _fsync_directory(recovery_path.parent)
+        _write_and_fsync(path, content)
+        _fsync_directory(path.parent)
+
+    @staticmethod
+    def _lock_path(path: Path) -> Path:
+        return path.with_suffix(f"{path.suffix}.lock")
+
+    @staticmethod
+    def _recovery_path(path: Path) -> Path:
+        return path.with_suffix(f"{path.suffix}.recovery")
 
     def _path(self, session_key: str) -> Path:
         safe = session_key.replace(":", "_").replace("/", "_")
         return self.sessions_dir / f"{safe}.json"
+
+
+_INVALID_SESSION_DATA = (json.JSONDecodeError, UnicodeDecodeError, TypeError, AttributeError, ValueError)
+
+
+def _read_session(path: Path, session_key: str) -> ConversationSession:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return ConversationSession(
+        session_key=session_key,
+        messages=[StoredMessage(**item) for item in payload.get("messages", [])],
+        accepted_generation_ids=tuple(payload.get("accepted_generation_ids", ())),
+    )
+
+
+def _write_and_fsync(path: Path, content: str) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _message_identity(message: StoredMessage) -> tuple:
