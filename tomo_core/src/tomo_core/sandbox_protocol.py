@@ -18,8 +18,12 @@ EVENT_MARKER = "TOMO_SANDBOX_EVENT="
 RESULT_MARKER = "TOMO_SANDBOX_RESULT="
 MAX_BUBBLES = 4
 MAX_BUBBLE_CHARS = 4096
+MAX_ERROR_TRACEBACK_FRAMES = 12
 _REQUEST_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _PTY_PREFIX_RE = re.compile(r"(?:[\x00-\x08\x0b-\x1a\x1c-\x1f\x7f]+|\x1b\[[0-?]*[ -/]*[@-~]|\x1b[ -/]*[@-~])*\Z")
+_EXCEPTION_CLASS_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}\Z")
+_TRACEBACK_BASENAME_RE = re.compile(r"[A-Za-z0-9_.-]{1,255}\Z")
+_TRACEBACK_FUNCTION_RE = re.compile(r"(?:[A-Za-z_][A-Za-z0-9_]{0,127}|<[A-Za-z_][A-Za-z0-9_]{0,127}>)\Z")
 
 
 @dataclass(frozen=True)
@@ -36,9 +40,18 @@ class SandboxCompletedEvent:
 
 
 @dataclass(frozen=True)
+class SandboxTracebackFrame:
+    basename: str
+    function: str
+    line: int
+
+
+@dataclass(frozen=True)
 class SandboxErrorEvent:
     sequence: int
     code: str
+    exception_class: str | None = None
+    traceback: tuple[SandboxTracebackFrame, ...] = ()
 
 
 SandboxEvent: TypeAlias = SandboxUtteranceEvent | SandboxCompletedEvent | SandboxErrorEvent
@@ -118,7 +131,13 @@ def encode_event(request_id: str, generation_id: str, sequence: int, event: obje
     elif isinstance(event, SandboxErrorEvent):
         if not event.code.strip():
             raise ValueError("error code must be non-empty")
-        payload.update({"type": "error", "error": {"code": event.code}})
+        error = {"code": event.code}
+        _validate_error_diagnostics(event.exception_class, event.traceback)
+        if event.exception_class is not None:
+            error["exception_class"] = event.exception_class
+        if event.traceback:
+            error["traceback"] = [asdict(frame) for frame in event.traceback]
+        payload.update({"type": "error", "error": error})
     else:
         raise TypeError("unsupported sandbox event")
     return _encode(payload)
@@ -368,7 +387,30 @@ def _event_from_message(message: dict[str, Any], contract: ResponseContract) -> 
     error = message.get("error")
     if not isinstance(error, dict) or not isinstance(error.get("code"), str) or not error["code"].strip():
         raise ValueError("error event requires a code")
-    return SandboxErrorEvent(sequence=sequence, code=error["code"])
+    if set(error) - {"code", "exception_class", "traceback"}:
+        raise ValueError("error event contains unsupported diagnostic fields")
+    exception_class = error.get("exception_class")
+    raw_traceback = error.get("traceback", [])
+    if not isinstance(raw_traceback, list):
+        raise ValueError("error traceback must be an array")
+    try:
+        traceback = tuple(
+            SandboxTracebackFrame(
+                basename=frame["basename"],
+                function=frame["function"],
+                line=frame["line"],
+            )
+            for frame in raw_traceback
+            if isinstance(frame, dict)
+        )
+    except (KeyError, TypeError) as decode_error:
+        raise ValueError("invalid error traceback frame") from decode_error
+    if len(traceback) != len(raw_traceback):
+        raise ValueError("error traceback frames must be objects")
+    if any(set(frame) != {"basename", "function", "line"} for frame in raw_traceback):
+        raise ValueError("error traceback frames contain unsupported fields")
+    _validate_error_diagnostics(exception_class, traceback)
+    return SandboxErrorEvent(sequence=sequence, code=error["code"], exception_class=exception_class, traceback=traceback)
 
 
 def _completed_result_parts(result: dict[str, Any], contract: ResponseContract) -> tuple[tuple[str, ...], tuple[ConversationMove, ...]]:
@@ -460,6 +502,24 @@ def _validate_request_id(request_id: object) -> None:
 def _validate_generation_id(generation_id: object) -> None:
     if not isinstance(generation_id, str) or not generation_id.strip():
         raise ValueError("generation_id must be non-empty")
+
+
+def _validate_error_diagnostics(exception_class: object, traceback: object) -> None:
+    if exception_class is not None and (
+        not isinstance(exception_class, str) or not _EXCEPTION_CLASS_RE.fullmatch(exception_class)
+    ):
+        raise ValueError("error exception_class must be a safe class name")
+    if not isinstance(traceback, tuple) or len(traceback) > MAX_ERROR_TRACEBACK_FRAMES:
+        raise ValueError("error traceback must contain at most 12 frames")
+    for frame in traceback:
+        if not isinstance(frame, SandboxTracebackFrame):
+            raise ValueError("error traceback frames must be SandboxTracebackFrame values")
+        if not isinstance(frame.basename, str) or not _TRACEBACK_BASENAME_RE.fullmatch(frame.basename):
+            raise ValueError("error traceback basename must be a filename")
+        if not isinstance(frame.function, str) or not _TRACEBACK_FUNCTION_RE.fullmatch(frame.function):
+            raise ValueError("error traceback function must be a safe function name")
+        if not isinstance(frame.line, int) or isinstance(frame.line, bool) or frame.line < 1:
+            raise ValueError("error traceback line must be positive")
 
 
 def _required_string(message: dict[str, Any], name: str) -> str:

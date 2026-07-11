@@ -1,5 +1,6 @@
 import io
 import tempfile
+import traceback
 import unittest
 from unittest.mock import Mock, patch
 
@@ -67,7 +68,8 @@ class SandboxInboundTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "invalid_request")
         self.assertNotIn(token, str(raised.exception))
         self.assertEqual(stdout.getvalue().count(EVENT_MARKER), 1)
-        self.assertEqual(list(iter_event_markers([stdout.getvalue()], "unknown", "unknown")), [SandboxErrorEvent(0, "invalid_request")])
+        event = list(iter_event_markers([stdout.getvalue()], "unknown", "unknown"))[0]
+        self.assertEqual((event.sequence, event.code), (0, "invalid_request"))
 
     def test_run_once_wraps_runtime_failures_without_exposing_the_access_token(self):
         burst = self._burst()
@@ -89,6 +91,46 @@ class SandboxInboundTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "runtime_failed")
         self.assertNotIn(token, str(raised.exception))
         self.assertNotIn(token, stdout.getvalue())
+        event = list(iter_event_markers([stdout.getvalue()], "request-1", "gen-1"))[0]
+        self.assertEqual(event.exception_class, "RuntimeError")
+        self.assertTrue(event.traceback)
+        self.assertTrue(all("/" not in frame.basename and "\\" not in frame.basename for frame in event.traceback))
+        self.assertNotIn("authorization failed", stdout.getvalue())
+
+    def test_run_once_bounds_and_sanitizes_long_unsafe_traceback_diagnostics(self):
+        burst = self._burst()
+        stdout = io.StringIO()
+        runtime = Mock()
+        runtime.handle_telegram_burst_iter.side_effect = RuntimeError("secret-access-token")
+        summaries = [
+            traceback.FrameSummary(
+                f"/private/path/secret-access-token-{'x' * 400} {index}.py",
+                index + 1,
+                "<string>" if index == 11 else f"<function name {'y' * 400} {index}>",
+            )
+            for index in range(12)
+        ]
+
+        with patch("tomo_core.sandbox_inbound.build_runtime", return_value=runtime):
+            with patch("tomo_core.sandbox_inbound.traceback.extract_tb", return_value=summaries):
+                with self.assertRaises(SandboxInboundError) as raised:
+                    run_once(
+                        io.StringIO(encode_inbound("request-1", burst)),
+                        stdout,
+                        config=RuntimeConfig(data_dir="/tmp/data"),
+                        provider=Mock(),
+                        secret_values=("secret-access-token",),
+                    )
+
+        self.assertEqual(raised.exception.code, "runtime_failed")
+        self.assertLessEqual(len(stdout.getvalue().rstrip("\n")), 900)
+        event = list(iter_event_markers([stdout.getvalue()], "request-1", "gen-1"))[0]
+        self.assertEqual(event.code, "runtime_failed")
+        self.assertEqual(event.exception_class, "RuntimeError")
+        self.assertLess(len(event.traceback), 12)
+        self.assertTrue(all("<" not in frame.function and " " not in frame.function for frame in event.traceback))
+        self.assertEqual(event.traceback[-1].function, "_string_")
+        self.assertNotIn("secret-access-token", stdout.getvalue())
 
     def test_run_once_uses_a_local_delivery_sink_for_a_real_runtime_turn(self):
         burst = self._burst()
@@ -157,7 +199,7 @@ class SandboxInboundTests(unittest.TestCase):
                 )
 
         parsed = list(iter_event_markers(stdout.getvalue().splitlines(keepends=True), "request-1", "gen-1"))
-        self.assertEqual(parsed[-1], SandboxErrorEvent(1, "auth_expired"))
+        self.assertEqual((parsed[-1].sequence, parsed[-1].code), (1, "auth_expired"))
 
     def test_run_once_flushes_each_incremental_event(self):
         class RecordingStdout(io.StringIO):

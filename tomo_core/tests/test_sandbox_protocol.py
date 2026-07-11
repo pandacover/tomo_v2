@@ -11,6 +11,7 @@ from tomo_core.sandbox_protocol import (
     SandboxCompletedEvent,
     SandboxErrorEvent,
     SandboxProtocolError,
+    SandboxTracebackFrame,
     SandboxUtteranceEvent,
     decode_inbound,
     encode_event,
@@ -171,6 +172,42 @@ class SandboxProtocolTests(unittest.TestCase):
         self.assertEqual(list(iter_event_markers([EVENT_MARKER + error], "request-7", "gen-1")), [SandboxErrorEvent(0, "auth_expired")])
         with self.assertRaises(ValueError):
             list(iter_event_markers([EVENT_MARKER + error + "\n" + EVENT_MARKER + first], "request-7", "gen-1"))
+
+    def test_error_event_round_trips_safe_diagnostics_and_accepts_legacy_shape(self):
+        diagnostic = SandboxErrorEvent(
+            0,
+            "runtime_failed",
+            exception_class="RuntimeError",
+            traceback=(SandboxTracebackFrame("runtime.py", "handle_turn", 42),),
+        )
+        encoded = encode_event("request-7", "gen-1", 0, diagnostic)
+
+        self.assertEqual(
+            list(iter_event_markers([EVENT_MARKER + encoded], "request-7", "gen-1")),
+            [diagnostic],
+        )
+        legacy = json.loads(encoded)
+        legacy["error"] = {"code": "runtime_failed"}
+        self.assertEqual(
+            list(iter_event_markers([EVENT_MARKER + json.dumps(legacy)], "request-7", "gen-1")),
+            [SandboxErrorEvent(0, "runtime_failed")],
+        )
+
+    def test_error_event_rejects_malformed_diagnostics(self):
+        event = json.loads(encode_event("request-7", "gen-1", 0, SandboxErrorEvent(0, "runtime_failed")))
+        cases = [
+            {"exception_class": "RuntimeError: secret"},
+            {"traceback": "not-a-list"},
+            {"traceback": [{"basename": "/secret/path.py", "function": "run", "line": 1}]},
+            {"traceback": [{"basename": "run.py", "function": "run", "line": 0}]},
+            {"traceback": [{"basename": "run.py", "function": "run", "line": 1}] * 13},
+            {"message": "secret exception text"},
+        ]
+        for diagnostics in cases:
+            with self.subTest(diagnostics=diagnostics), self.assertRaises(ValueError):
+                malformed = json.loads(json.dumps(event))
+                malformed["error"].update(diagnostics)
+                list(iter_event_markers([EVENT_MARKER + json.dumps(malformed)], "request-7", "gen-1"))
 
     def test_legacy_result_helpers_remain_available_until_dispatch_migrates(self):
         inbound = InboundEnvelope(connector="telegram", actor_id="user-1", message_id="message-9", text="hello")

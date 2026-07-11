@@ -7,7 +7,7 @@ from tomo_core.models import InboundEnvelope
 from tomo_core.onboarding_store import InterruptedGeneration, TelegramGenerationInput, TelegramGenerationWork
 from tomo_core.sandbox_dispatch import SandboxDispatch, SandboxDispatchError
 from tomo_core.sandbox_registry import SandboxRegistry
-from tomo_core.sandbox_protocol import EVENT_MARKER, RESULT_MARKER, SandboxErrorEvent, encode_error, encode_event, encode_result
+from tomo_core.sandbox_protocol import EVENT_MARKER, RESULT_MARKER, SandboxErrorEvent, SandboxTracebackFrame, encode_error, encode_event, encode_result
 from tomo_core.conversation.models import ConversationCompleted, ConversationMove, ConversationResult, MoveConfidence, MovePlan, UtteranceReady
 from tomo_core.models import OutboundBubble
 from tomo_core.onboarding_store import TelegramInstallation
@@ -222,6 +222,38 @@ class SandboxDispatchTests(unittest.TestCase):
         self.auth.access_token.assert_has_calls([unittest.mock.call(force_refresh=False), unittest.mock.call(force_refresh=True)])
         self.assertEqual(self.daytona.start_session_command.call_count, 2)
         self.assertEqual(self.daytona.delete_session.call_count, 2)
+
+    def test_iter_telegram_events_logs_only_safe_error_diagnostics(self):
+        work = self._work()
+        self.daytona.start_session_command.return_value = SessionCommandHandle("telegram-burst-one-r1", "cmd-1")
+        self.daytona.iter_session_logs.return_value = iter(
+            [
+                EVENT_MARKER
+                + encode_event(
+                    "telegram-generation-burst-one-r1",
+                    "burst:one/r1",
+                    0,
+                    SandboxErrorEvent(
+                        0,
+                        "runtime_failed",
+                        "RuntimeError",
+                        (SandboxTracebackFrame("runtime.py", "handle_turn", 42),),
+                    ),
+                )
+                + "\n"
+            ]
+        )
+
+        with self.assertLogs("tomo_core.sandbox_dispatch", level="WARNING") as logs:
+            with self.assertRaises(SandboxDispatchError) as raised:
+                list(self.dispatch.iter_telegram_events(self.installation, work))
+
+        self.assertEqual(raised.exception.code, "runtime_failed")
+        self.assertIn("RuntimeError", logs.output[0])
+        self.assertIn("runtime.py", logs.output[0])
+        self.assertNotIn("burst:one/r1", logs.output[0])
+        self.assertNotIn("tomo-a", logs.output[0])
+        self.assertNotIn("hello", logs.output[0])
 
     def test_burst_from_work_excludes_destination_chat_ids_from_sandbox_metadata(self):
         burst = __import__("tomo_core.sandbox_dispatch", fromlist=["burst_from_work"]).burst_from_work(self.installation, self._work())

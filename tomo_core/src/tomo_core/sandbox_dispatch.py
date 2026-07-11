@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import json
+import logging
 import re
 from collections import defaultdict
 from threading import Lock
@@ -18,6 +19,7 @@ from .sandbox_protocol import SandboxErrorEvent, SandboxEvent, SandboxProtocolEr
 
 _COMMAND = "/opt/tomo/.venv/bin/tomo-core sandbox-inbound"
 _EXEC_TIMEOUT_SECONDS = 120
+_logger = logging.getLogger(__name__)
 
 
 class RailwayAuthBroker(Protocol):
@@ -118,6 +120,12 @@ class SandboxDispatch:
                     expected_generation_id=work.generation_id,
                 ):
                     if isinstance(event, SandboxErrorEvent):
+                        _logger.warning(
+                            "sandbox runtime failure code=%s exception_class=%s traceback=%s",
+                            event.code,
+                            event.exception_class,
+                            [(frame.basename, frame.function, frame.line) for frame in event.traceback],
+                        )
                         if event.code == "auth_expired" and yielded == 0 and attempt == 0:
                             force_refresh = True
                             break
