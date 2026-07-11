@@ -19,6 +19,7 @@ RESULT_MARKER = "TOMO_SANDBOX_RESULT="
 MAX_BUBBLES = 4
 MAX_BUBBLE_CHARS = 4096
 _REQUEST_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+_PTY_PREFIX_RE = re.compile(r"(?:[\x00-\x08\x0b-\x1a\x1c-\x1f\x7f]+|\x1b\[[0-?]*[ -/]*[@-~]|\x1b[ -/]*[@-~])*\Z")
 
 
 @dataclass(frozen=True)
@@ -141,9 +142,10 @@ def iter_event_markers(
 
     def process_line(line: str) -> SandboxEvent | None:
         nonlocal expected_sequence, terminal
-        if not line.startswith(EVENT_MARKER):
+        marker_position = line.find(EVENT_MARKER)
+        if marker_position < 0 or not _PTY_PREFIX_RE.fullmatch(line[:marker_position]):
             return None
-        payload = line[len(EVENT_MARKER) :]
+        payload = line[marker_position + len(EVENT_MARKER) :]
         message = _decode_event(payload, expected_request_id, expected_generation_id)
         sequence = message["sequence"]
         canonical = _encode(message)

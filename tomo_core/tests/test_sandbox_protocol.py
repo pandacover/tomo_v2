@@ -52,6 +52,26 @@ class SandboxProtocolTests(unittest.TestCase):
         self.assertIsInstance(events[1], SandboxCompletedEvent)
         self.assertEqual(events[1].result["logical_text"], "hello back.")
 
+    def test_v2_event_stream_accepts_ansi_pty_prefix_but_ignores_echoed_marker_text(self):
+        utterance = encode_event("request-7", "gen-1", 0, UtteranceReady(0, ConversationMove.ANSWER, "hello back."))
+        plan = MovePlan(ConversationMove.ANSWER, (), "answer", MoveConfidence.HIGH, (ConversationMove.ANSWER,))
+        completed = encode_event("request-7", "gen-1", 1, ConversationCompleted(ConversationResult(plan, ("hello back.",))))
+
+        events = list(
+            iter_event_markers(
+                [
+                    "echo " + EVENT_MARKER + utterance + "\n",
+                    "\x1b[?2004h" + EVENT_MARKER + utterance + "\n",
+                    EVENT_MARKER + completed + "\n",
+                ],
+                "request-7",
+                "gen-1",
+            )
+        )
+
+        self.assertEqual(events[0], SandboxUtteranceEvent(0, ConversationMove.ANSWER, "hello back."))
+        self.assertIsInstance(events[1], SandboxCompletedEvent)
+
     def test_v2_event_stream_rejects_protocol_violations(self):
         first = encode_event("request-7", "gen-1", 0, UtteranceReady(0, ConversationMove.ANSWER, "ok."))
         conflicting = json.loads(first)
