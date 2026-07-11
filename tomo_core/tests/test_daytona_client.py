@@ -102,10 +102,11 @@ class DaytonaClientTests(unittest.TestCase):
         self.sandbox.process.create_pty_session.assert_called_once_with(
             "telegram-gen-1",
             envs={"TOKEN": "safe"},
-            pty_size=PtySize(rows=50, cols=4096),
+            pty_size=PtySize(rows=50, cols=999),
         )
         pty_size = self.sandbox.process.create_pty_session.call_args.kwargs["pty_size"]
-        self.assertGreaterEqual(pty_size.cols, 1024)
+        self.assertGreaterEqual(pty_size.cols, 256)
+        self.assertLess(pty_size.cols, 1000)
         self.assertEqual(pty.sent, ["/opt/tomo/.venv/bin/tomo-core sandbox-inbound\nexit\n"])
         self.assertEqual(chunks, ["first", "second"])
         self.assertEqual(exit_code, 0)

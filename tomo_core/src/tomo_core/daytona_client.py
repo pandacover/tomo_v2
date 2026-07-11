@@ -12,8 +12,9 @@ from daytona import CreateSandboxFromSnapshotParams, Daytona, PtySize, VolumeMou
 
 # Progressive sandbox turns emit long single-line protocol markers. Daytona's
 # default PTY is ~80 columns and soft-wraps those lines, which corrupts the
-# event stream into invalid_result failures on the host parser.
-_PTY_SIZE = PtySize(rows=50, cols=4096)
+# event stream into invalid_result failures on the host parser. Daytona also
+# rejects cols >= 1000, so use the widest legal size.
+_PTY_SIZE = PtySize(rows=50, cols=999)
 
 
 class DaytonaClientError(RuntimeError):
