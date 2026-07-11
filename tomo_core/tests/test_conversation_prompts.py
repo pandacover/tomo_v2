@@ -54,6 +54,18 @@ class ConversationPromptTests(unittest.TestCase):
         self.assertEqual(messages[-2]["role"], "assistant")
         self.assertEqual(len(messages[-2]["content"]), 8000)
 
+    def test_single_text_only_burst_is_sent_as_plain_user_content(self):
+        burst = InputBurst(
+            burst_id="burst-plain-text",
+            generation_id="generation-plain-text",
+            revision=1,
+            messages=(InboundMessage(1, 10, InboundEnvelope("telegram", "user-1", "m1", "yo")),),
+        )
+
+        messages = build_move_selection_messages(self.soul, self.history, burst)
+
+        self.assertEqual(messages[-1], {"role": "user", "content": "yo"})
+
     def test_structured_burst_prompt_preserves_message_boundaries_and_visible_partials(self):
         burst = InputBurst(
             burst_id="burst-1",

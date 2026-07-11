@@ -1,4 +1,3 @@
-import json
 import unittest
 
 from tomo_core.conversation import ConversationCompleted, ConversationEngine, ConversationMove, ConversationRequest, ConversationStarted, UtteranceReady
@@ -97,19 +96,7 @@ class ConversationEngineTests(unittest.TestCase):
         ])
         current_user = {
             "role": "user",
-            "content": json.dumps(
-                {
-                    "incoming_messages": [{
-                        "label": "msg_1",
-                        "update_id": 0,
-                        "message_id": "m1",
-                        "sent_at": "2026-01-01T00:00:00+00:00",
-                        "content": "current u1",
-                        "attachments": [],
-                    }],
-                },
-                separators=(",", ":"),
-            ),
+            "content": "current u1",
         }
         request = ConversationRequest.from_history(
             envelope=InboundEnvelope("telegram", "actor", "m1", "current u1", "2026-01-01T00:00:00+00:00"),

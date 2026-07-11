@@ -101,6 +101,8 @@ def _user_payload(inbound: InboundEnvelope | InputBurst) -> str:
                 separators=(",", ":"),
             )
         return inbound.text
+    if len(inbound.messages) == 1 and not inbound.messages[0].envelope.attachments:
+        return inbound.messages[0].envelope.text
     return json.dumps(
         {
             "incoming_messages": [
