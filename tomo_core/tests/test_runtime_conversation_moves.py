@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from tomo_core import InboundEnvelope, InboundMessage, InputBurst, PersonalAgentRuntime, RuntimeConfig
+from tomo_core.models import MessageAttachment
 from tomo_core.conversation import ConversationMove
 from tomo_core.grok_auth import GrokAuthStore
 from tomo_core.providers import GrokAuthProvider
@@ -99,6 +100,42 @@ class RuntimeConversationMoveTests(unittest.TestCase):
             self.assertEqual(list(iterator), [])
             session = JsonSessionStore(tmp).load("telegram:actor:user-1")
             self.assertEqual([message.role for message in session.messages], ["user"])
+
+    def test_handle_telegram_burst_iter_stops_before_next_provider_call_when_inactive_after_selection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            soul_path = Path(tmp) / "SOUL.md"
+            soul_path.write_text("SOUL SENTINEL", encoding="utf-8")
+            provider = ScriptedProvider([
+                '{"primary_move":"answer","supporting_moves":[],"move_sequence":["answer"],"response_goal":"answer","confidence":"high"}',
+                '{"utterance":"should not run."}',
+            ])
+            runtime = PersonalAgentRuntime(provider, TelegramDeliverySink(FakeTelegramClient()), RuntimeConfig(data_dir=tmp, soul_path=str(soul_path)))
+            burst = InputBurst("burst-1", "gen-1", 1, (InboundMessage(1, 41, InboundEnvelope("telegram", "user-1", "msg-1", "go")),))
+            calls = {"count": 0}
+
+            def is_active():
+                calls["count"] += 1
+                return calls["count"] < 4
+
+            self.assertEqual(list(runtime.handle_telegram_burst_iter(burst, is_active=is_active)), [])
+            self.assertEqual(len(provider.calls), 1)
+
+    def test_inbound_attachment_metadata_is_persisted_for_photo_only_messages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            soul_path = Path(tmp) / "SOUL.md"
+            soul_path.write_text("SOUL SENTINEL", encoding="utf-8")
+            provider = ScriptedProvider([
+                '{"primary_move":"answer","supporting_moves":[],"move_sequence":["answer"],"response_goal":"answer","confidence":"high"}',
+                '{"utterance":"i can work from the image context."}',
+            ])
+            runtime = PersonalAgentRuntime(provider, TelegramDeliverySink(FakeTelegramClient()), RuntimeConfig(data_dir=tmp, soul_path=str(soul_path)))
+            burst = InputBurst("burst-photo", "gen-photo", 1, (InboundMessage(1, 41, InboundEnvelope("telegram", "user-1", "msg-1", "", attachments=(MessageAttachment("image", file_id="photo-id", mime_type="image/jpeg", metadata={"width": 100}),))),))
+
+            list(runtime.handle_telegram_burst_iter(burst))
+
+            session = JsonSessionStore(tmp).load("telegram:actor:user-1")
+            self.assertEqual(session.messages[0].metadata["attachments"][0]["file_id"], "photo-id")
+            self.assertEqual(session.messages[0].metadata["attachments"][0]["metadata"], {"width": 100})
 
     def test_visible_partial_is_prompt_context_without_accepting_full_provisional_completion(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -77,6 +77,25 @@ Delivery is duplicate-averse rather than exactly-once. Before each bubble, Railw
 
 Retryable control-update failures back off at 1, 2, 4, 8, and 16 seconds; after the fifth attempt, the update is marked complete to avoid blocking later control updates in that chat.
 
+### Generation state diagram
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending: private message durably enqueued
+    pending --> processing: debounce window closes and worker claims burst
+    processing --> active: generation row/session claimed
+    active --> completed: completed event validates and finalization wins fence
+    active --> failed: router-owned retryable failure transition
+    failed --> pending: bounded backoff retry creates replacement generation
+    failed --> completed: max attempts exhausted
+    active --> superseded: newer message revises the burst
+    superseded --> pending: replacement generation sees visible sent/unknown text
+    active --> unknown: delivery acknowledgement race after Telegram send
+    unknown --> pending: replacement generation includes visible text context
+```
+
+Only `TelegramUpdateRouter.process_next` moves a claimed generation from `active` to failed/retry on retryable errors. Gateway and dispatch code raise typed safe failures and leave the bounded failure/backoff transition to the router, so missing or rebound installations cannot make a claimed generation look successfully processed.
+
 The same Railway volume also holds installations, the sandbox registry, and the broker's refreshed auth. Each `tomo_id` maps deterministically to one Daytona sandbox name and one volume name. Reconciliation creates a missing volume, resumes a stopped sandbox, replaces invalid or snapshot-mismatched sandboxes, smoke-tests new/resumed sandboxes, and keeps the volume when replacing a sandbox. Sandboxes have Daytona auto-stop disabled.
 
 ## Logs and safe recovery
@@ -91,6 +110,24 @@ For a non-Railway background listener, `telegram-shared start --background` writ
 | SuperGrok refresh failure | On a trusted machine run the export command above after `grok login`, replace `TOMO_SUPERGROK_OAUTH_JSON_B64`, and redeploy. This safely resets Railway's cached broker payload on next use. |
 | Snapshot mismatch | Build a new immutable snapshot, update `TOMO_DAYTONA_SNAPSHOT`, and redeploy. Next reconciliation replaces the sandbox while retaining its volume. |
 | Listener stopped or stale local PID | Redeploy Railway. For a local background listener only: `uv run tomo-core telegram-shared restart --data-dir <data-dir>`. This stops a live PID or removes a stale PID before starting one listener. |
+
+## Snapshot rollout verification
+
+Before changing `TOMO_DAYTONA_SNAPSHOT`:
+
+1. Build the new immutable snapshot from `tomo_core/` and confirm `scripts/create_daytona_snapshot.py` reports the snapshot as `active`.
+2. Run the affected local tests with `PYTHONDONTWRITEBYTECODE=1` and the same `UV_PROJECT_ENVIRONMENT` used by the hosted implementation venv.
+3. Confirm the current Railway service variables include the expected `TOMO_HOSTED_RUNTIME=daytona`, writable `TOMO_CORE_DATA_DIR`, bot token, Daytona API key, snapshot name, sandbox data dir, and SuperGrok bootstrap payload. Check names only; do not copy secret values into logs.
+4. Confirm no Daytona SDK API migration is being attempted unless the installed SDK evidence requires it.
+
+After Railway redeploys with the new snapshot:
+
+1. Check `/v1/health` and Railway logs for `starting control api and shared telegram listener.` and `shared telegram gateway polling started.`
+2. Send a private Telegram message from a bound chat and verify the update is acknowledged only after the durable inbox accepts it.
+3. Confirm reconciliation replaces any sandbox whose recorded or reported snapshot differs, while retaining the user's volume.
+4. Verify a normal text burst produces ordered v2 sandbox events, delivery reservations, Telegram sends to the trusted installation chat only, and a completed generation row.
+5. Verify a superseding message marks the older generation stale and that no further local provider calls or sandbox delivery occurs after the SQLite active-generation fence fails.
+6. Verify sandbox inbound JSON does not contain Telegram bot credentials, refresh tokens, `chat_id`, or `delivery_chat_id`; Railway remains the only Telegram sender.
 
 ## Security boundary
 

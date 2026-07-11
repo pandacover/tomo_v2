@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import os
 import tempfile
 from dataclasses import dataclass
@@ -141,7 +142,7 @@ def _parse_non_negative_float(value: str, name: str) -> float:
         parsed = float(value)
     except (TypeError, ValueError):
         raise ValueError(f"invalid {name}") from None
-    if parsed < 0:
+    if not math.isfinite(parsed) or parsed < 0:
         raise ValueError(f"invalid {name}")
     return parsed
 

@@ -46,7 +46,7 @@ class FakeRuntimeDispatch:
         self.calls.append(("dispatch", installation, update_id, envelope))
         return [OutboundBubble("reply")]
 
-    def iter_telegram_events(self, installation, work):
+    def iter_telegram_events(self, installation, work, is_active=None):
         self.calls.append(("iter", installation, work))
         yield SandboxUtteranceEvent(0, "acknowledge", "first.")
         yield SandboxUtteranceEvent(1, "answer", "second.")
@@ -166,6 +166,39 @@ class SharedGatewayTests(unittest.TestCase):
             self.assertEqual([message["text"] for message in client.sent_messages], ["tomo had trouble replying. try again in a moment."])
             self.assertEqual([message["reply_to_message_id"] for message in client.sent_messages], ["2"])
 
+    def test_generation_work_retryable_error_leaves_failure_transition_to_router(self):
+        with self._store() as store:
+            installation = self._installation(store, chat_id="123", actor_id="999")
+            work = self._generation_work(store, installation.tomo_id)
+            dispatch = FakeRuntimeDispatch()
+            dispatch.iter_telegram_events = Mock(side_effect=SandboxDispatchError("sandbox_exec_failed"))
+            gateway = SharedTelegramGateway(client=FakeTelegramClient(), store=store, dispatch=dispatch, pace_seconds=0)
+
+            with self.assertRaises(RetryableTelegramUpdateError):
+                gateway.process_update(work)
+
+            self.assertTrue(store.is_generation_active(work.generation_id, work.revision))
+
+    def test_missing_or_rebound_installation_raises_safe_retryable_generation_failure(self):
+        with self._store() as store:
+            installation = self._installation(store, chat_id="123", actor_id="999")
+            missing = self._generation_work(store, installation.tomo_id)
+            rebound = type(missing)(missing.generation_id, missing.burst_id, missing.chat_id, "other-tomo", missing.revision, missing.session_id, missing.inputs, missing.visible_assistant_utterances, missing.accepted_generation_ids)
+            gateway = SharedTelegramGateway(client=FakeTelegramClient(), store=store, dispatch=FakeRuntimeDispatch(), pace_seconds=0)
+
+            with self.assertRaises(RetryableTelegramUpdateError) as raised:
+                gateway.process_update(rebound)
+            self.assertEqual(raised.exception.error_code, "installation_rebound")
+            db = store._connect()
+            try:
+                db.execute("delete from telegram_installations where chat_id = ?", ("123",))
+                db.commit()
+            finally:
+                db.close()
+            with self.assertRaises(RetryableTelegramUpdateError) as raised:
+                gateway.process_update(missing)
+            self.assertEqual(raised.exception.error_code, "installation_missing")
+
     def test_generation_work_streams_each_utterance_through_delivery_fence(self):
         with self._store() as store:
             installation = self._installation(store, chat_id="123", actor_id="999")
@@ -190,7 +223,7 @@ class SharedGatewayTests(unittest.TestCase):
             client = FakeTelegramClient()
 
             class InspectingDispatch(FakeRuntimeDispatch):
-                def iter_telegram_events(self, installation, work):
+                def iter_telegram_events(self, installation, work, is_active=None):
                     yield SandboxUtteranceEvent(0, "acknowledge", "first.")
                     self.calls.append(("after-first", len(client.sent_messages)))
                     yield SandboxUtteranceEvent(1, "answer", "second.")
@@ -257,6 +290,19 @@ class SharedGatewayTests(unittest.TestCase):
             replacement = store.claim_next_work(now=time.time() + 1)
             self.assertIsNotNone(replacement)
             self.assertEqual(replacement.visible_assistant_utterances, ("first.",))
+
+    def test_in_process_dispatch_passes_active_predicate_to_runtime(self):
+        with self._store() as store:
+            installation = self._installation(store, chat_id="123", actor_id="999")
+            work = self._generation_work(store, installation.tomo_id)
+            runtime = Mock()
+            runtime.handle_telegram_burst_iter.return_value = iter(())
+            instances = Mock()
+            instances.get.return_value = runtime
+
+            list(InProcessTelegramRuntimeDispatch(instances).iter_telegram_events(installation, work, is_active=lambda: False))
+
+            self.assertIs(runtime.handle_telegram_burst_iter.call_args.kwargs["is_active"](), False)
 
     @staticmethod
     @contextmanager

@@ -114,6 +114,27 @@ class SandboxProtocolTests(unittest.TestCase):
             with self.subTest(chunks=chunks), self.assertRaises(ValueError):
                 list(iter_event_markers(chunks, "request-7", "gen-1", contract))
 
+    def test_completed_event_validates_exact_plan_and_logical_text(self):
+        valid = json.loads(encode_event("request-7", "gen-1", 0, ConversationCompleted(ConversationResult(MovePlan(ConversationMove.ANSWER, (), "answer", MoveConfidence.HIGH, (ConversationMove.ANSWER,)), ("one.",)))))
+        cases = []
+        logical = json.loads(json.dumps(valid))
+        logical["result"]["logical_text"] = "one. "
+        cases.append(logical)
+        duplicate_support = json.loads(json.dumps(valid))
+        duplicate_support["result"]["plan"]["supporting_moves"] = ["answer"]
+        cases.append(duplicate_support)
+        missing_primary = json.loads(json.dumps(valid))
+        missing_primary["result"]["plan"]["primary_move"] = "explore"
+        cases.append(missing_primary)
+        too_many_supporting = json.loads(json.dumps(valid))
+        too_many_supporting["result"]["plan"]["supporting_moves"] = ["explore", "clarify", "repair"]
+        too_many_supporting["result"]["plan"]["move_sequence"] = ["answer", "explore", "clarify", "repair"]
+        cases.append(too_many_supporting)
+
+        for message in cases:
+            with self.subTest(message=message), self.assertRaises(ValueError):
+                list(iter_event_markers([EVENT_MARKER + json.dumps(message, separators=(",", ":"))], "request-7", "gen-1"))
+
     def test_v2_event_stream_requires_a_terminal_event(self):
         utterance = encode_event(
             "request-7",

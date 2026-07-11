@@ -7,7 +7,7 @@ import json
 import re
 from collections import defaultdict
 from threading import Lock
-from typing import Iterator, Protocol
+from typing import Callable, Iterator, Protocol
 
 from .daytona_client import DaytonaClient, DaytonaClientError, SessionCommandHandle
 from .daytona_supervisor import DaytonaSupervisor
@@ -82,7 +82,7 @@ class SandboxDispatch:
             return bubbles
 
     def iter_telegram_events(
-        self, installation: TelegramInstallation, work: TelegramGenerationWork
+        self, installation: TelegramInstallation, work: TelegramGenerationWork, is_active: Callable[[], bool] | None = None
     ) -> Iterator[SandboxEvent]:
         record = self.supervisor.reconcile(installation.tomo_id)
         if not record.sandbox_id:
@@ -267,8 +267,6 @@ def _message_from_input(installation: TelegramInstallation, item: TelegramGenera
         attachments=attachments,
         native_metadata={
             "update_id": item.update_id,
-            "chat_id": str(chat.get("id") or installation.chat_id),
-            "delivery_chat_id": installation.chat_id,
             "from_id": str(sender.get("id") or installation.actor_id),
             "tomo_id": installation.tomo_id,
         },

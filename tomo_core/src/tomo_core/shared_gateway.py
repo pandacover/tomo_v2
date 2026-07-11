@@ -25,7 +25,7 @@ class TelegramRuntimeDispatch(Protocol):
     ) -> list[OutboundBubble]:
         ...
 
-    def iter_telegram_events(self, installation: TelegramInstallation, work: TelegramGenerationWork):
+    def iter_telegram_events(self, installation: TelegramInstallation, work: TelegramGenerationWork, is_active: Callable[[], bool] | None = None):
         ...
 
 
@@ -51,10 +51,10 @@ class InProcessTelegramRuntimeDispatch:
             runtime.telegram.client = original_client
         return collector.bubbles
 
-    def iter_telegram_events(self, installation: TelegramInstallation, work: TelegramGenerationWork):
+    def iter_telegram_events(self, installation: TelegramInstallation, work: TelegramGenerationWork, is_active: Callable[[], bool] | None = None):
         runtime = self.instances.get(installation.tomo_id)
         burst = burst_from_work(installation, work)
-        for sequence, event in enumerate(runtime.handle_telegram_burst_iter(burst)):
+        for sequence, event in enumerate(runtime.handle_telegram_burst_iter(burst, is_active=is_active)):
             if isinstance(event, RuntimeUtteranceReady):
                 yield SandboxUtteranceEvent(sequence, event.event.move, event.bubble.text)
             elif isinstance(event, RuntimeCompleted):
@@ -154,13 +154,14 @@ class SharedTelegramGateway:
     def _process_generation_work(self, work: TelegramGenerationWork) -> bool:
         installation = self.store.installation_for_chat(work.chat_id)
         if installation is None:
-            return False
+            raise RetryableTelegramUpdateError("installation_missing")
         if installation.tomo_id != work.tomo_id:
-            return False
+            raise RetryableTelegramUpdateError("installation_rebound")
         self.client.send_typing(installation.chat_id)
         last_send_at: float | None = None
         try:
-            for event in self.dispatch.iter_telegram_events(installation, work):
+            is_active = lambda: self.store.is_generation_active(work.generation_id, work.revision)
+            for event in self.dispatch.iter_telegram_events(installation, work, is_active=is_active):
                 if isinstance(event, SandboxUtteranceEvent):
                     if last_send_at is not None and self.pace_seconds > 0:
                         elapsed = time.monotonic() - last_send_at
@@ -196,10 +197,8 @@ class SharedTelegramGateway:
                     self.store.complete_generation(work.generation_id, work.revision)
                     return True
                 elif isinstance(event, SandboxErrorEvent):
-                    self.store.fail_generation(work.generation_id, event.code)
                     raise RetryableTelegramUpdateError(event.code)
         except (TelegramRuntimeDispatchError, SandboxSupervisorError) as error:
-            self.store.fail_generation(work.generation_id, error.code)
             raise RetryableTelegramUpdateError(error.code) from error
         return True
 

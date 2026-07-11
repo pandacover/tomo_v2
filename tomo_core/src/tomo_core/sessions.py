@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from .models import InboundMessage, utc_now_iso
+from .models import InboundMessage, MessageAttachment, utc_now_iso
 
 Role = Literal["user", "assistant"]
 
@@ -53,6 +53,7 @@ class ConversationSession:
                     "update_id": message.update_id,
                     "ordinal": message.ordinal,
                     "burst_id": burst_id,
+                    "attachments": [_attachment_metadata(attachment) for attachment in envelope.attachments],
                 },
             )
         )
@@ -83,6 +84,11 @@ class ConversationSession:
                 continue
             visible.append(message)
         return [{"role": message.role, "content": message.content} for message in visible[-limit:]]
+
+
+def _attachment_metadata(attachment: MessageAttachment) -> dict:
+    payload = asdict(attachment)
+    return {key: value for key, value in payload.items() if value is not None}
 
 
 class JsonSessionStore:

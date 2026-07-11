@@ -79,7 +79,7 @@ class PersonalAgentRuntime:
             soul=load_soul(Path(self.config.soul_path)),
             history=tuple(session.model_history_for_burst(burst.burst_id)),
         )
-        conversation_events = self.conversation.respond_iter(request)
+        conversation_events = self.conversation.respond_iter(request, is_active=is_active)
         delivered: list[OutboundBubble] = []
         while True:
             if not is_active():

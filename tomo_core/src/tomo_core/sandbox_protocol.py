@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Iterable, Iterator, TypeAlias
 
 from .conversation import ConversationCompleted, ConversationMove, UtteranceReady
+from .conversation.models import ConversationResult, MoveConfidence, MovePlan
 from .conversation.parsing import ConversationOutputError, parse_utterances
 from .models import InboundEnvelope, InboundMessage, InputBurst, MessageAttachment, OutboundBubble, ResponseContract
 
@@ -388,6 +389,30 @@ def _completed_result_parts(result: dict[str, Any], contract: ResponseContract) 
         raise ValueError("completed plan contains an invalid move") from error
     if len(moves) != len(cleaned):
         raise ValueError("completed plan move_sequence must match utterance count")
+    primary = plan.get("primary_move")
+    supporting = plan.get("supporting_moves")
+    response_goal = plan.get("response_goal")
+    confidence = plan.get("confidence")
+    logical_text = result.get("logical_text")
+    if not isinstance(supporting, list):
+        raise ValueError("completed plan requires supporting_moves")
+    try:
+        move_plan = MovePlan(
+            ConversationMove(primary),
+            tuple(ConversationMove(move) for move in supporting),
+            response_goal,
+            MoveConfidence(confidence),
+            moves,
+        )
+        conversation_result = ConversationResult(move_plan, cleaned)
+    except (TypeError, ValueError) as error:
+        raise ValueError("completed plan is inconsistent") from error
+    if primary not in raw_sequence:
+        raise ValueError("completed plan primary must be in move_sequence")
+    if set(supporting) - set(raw_sequence) or len(supporting) != len(set(supporting)):
+        raise ValueError("completed plan supporting_moves must be unique members of move_sequence")
+    if logical_text != conversation_result.logical_text:
+        raise ValueError("completed logical_text must match utterances exactly")
     return cleaned, moves
 
 

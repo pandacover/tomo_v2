@@ -223,6 +223,15 @@ class SandboxDispatchTests(unittest.TestCase):
         self.assertEqual(self.daytona.start_session_command.call_count, 2)
         self.assertEqual(self.daytona.delete_session.call_count, 2)
 
+    def test_burst_from_work_excludes_destination_chat_ids_from_sandbox_metadata(self):
+        burst = __import__("tomo_core.sandbox_dispatch", fromlist=["burst_from_work"]).burst_from_work(self.installation, self._work())
+
+        metadata = burst.messages[0].envelope.native_metadata
+        self.assertNotIn("chat_id", metadata)
+        self.assertNotIn("delivery_chat_id", metadata)
+        self.assertEqual(metadata["from_id"], "111")
+        self.assertEqual(metadata["update_id"], 42)
+
     def test_deliver_rejects_a_result_with_the_wrong_request_id(self):
         result = encode_result("other", [OutboundBubble("hello")])
         self.daytona.exec.return_value = ExecResult(0, f"{RESULT_MARKER}{result}\n")

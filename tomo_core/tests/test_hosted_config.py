@@ -160,6 +160,18 @@ class HostedRuntimeConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "TOMO_TELEGRAM_DELIVERY_PACE_SECONDS"):
                 HostedRuntimeConfig.from_env({**base, "TOMO_TELEGRAM_DELIVERY_PACE_SECONDS": "-1"})
 
+    def test_nan_and_inf_telegram_debounce_and_pace_are_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = {
+                "TOMO_HOSTED_RUNTIME": "local",
+                "TOMO_TELEGRAM_GLOBAL_BOT_TOKEN": "bot-token",
+                "TOMO_CORE_DATA_DIR": tmp,
+            }
+            for name in ("TOMO_TELEGRAM_INPUT_DEBOUNCE_SECONDS", "TOMO_TELEGRAM_DELIVERY_PACE_SECONDS"):
+                for value in ("nan", "inf", "-inf"):
+                    with self.subTest(name=name, value=value), self.assertRaisesRegex(ValueError, name):
+                        HostedRuntimeConfig.from_env({**base, name: value})
+
     def test_unwritable_data_path_is_rejected_without_echoing_path(self):
         with tempfile.TemporaryDirectory() as tmp:
             data_file = Path(tmp) / "not-a-directory"

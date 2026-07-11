@@ -3,7 +3,7 @@ import unittest
 
 from tomo_core.conversation.models import ConversationMove, MoveConfidence, MovePlan
 from tomo_core.conversation.prompts import build_move_selection_messages, build_realization_messages, build_repair_messages
-from tomo_core.models import InboundEnvelope, InboundMessage, InputBurst, ResponseContract
+from tomo_core.models import InboundEnvelope, InboundMessage, InputBurst, MessageAttachment, ResponseContract
 
 
 class ConversationPromptTests(unittest.TestCase):
@@ -75,6 +75,35 @@ class ConversationPromptTests(unittest.TestCase):
         self.assertEqual(payload["incoming_messages"][1]["message_id"], "m2")
         self.assertEqual(messages[-2], {"role": "assistant", "content": "already visible."})
         self.assertNotIn("already visible", messages[0]["content"])
+
+    def test_structured_attachment_context_omits_delivery_identifiers(self):
+        burst = InputBurst(
+            burst_id="burst-photo",
+            generation_id="generation-photo",
+            revision=1,
+            messages=(
+                InboundMessage(
+                    1,
+                    10,
+                    InboundEnvelope(
+                        "telegram",
+                        "user-1",
+                        "m1",
+                        "",
+                        attachments=(MessageAttachment("image", file_id="telegram-file", mime_type="image/jpeg", metadata={"width": 640, "height": 480, "file_unique_id": "unique"}),),
+                        native_metadata={"delivery_chat_id": "secret-chat"},
+                    ),
+                ),
+            ),
+        )
+
+        messages = build_move_selection_messages(self.soul, self.history, burst)
+        payload = json.loads(messages[-1]["content"])
+
+        self.assertEqual(payload["incoming_messages"][0]["content"], "")
+        self.assertEqual(payload["incoming_messages"][0]["attachments"], [{"kind": "image", "mime_type": "image/jpeg", "metadata": {"width": 640, "height": 480}}])
+        self.assertNotIn("telegram-file", messages[-1]["content"])
+        self.assertNotIn("secret-chat", messages[-1]["content"])
 
 
 if __name__ == "__main__":

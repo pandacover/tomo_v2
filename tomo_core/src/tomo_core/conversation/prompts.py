@@ -90,6 +90,16 @@ def _visible_context(inbound: InboundEnvelope | InputBurst) -> list[dict[str, st
 
 def _user_payload(inbound: InboundEnvelope | InputBurst) -> str:
     if isinstance(inbound, InboundEnvelope):
+        if inbound.attachments:
+            return json.dumps(
+                {
+                    "message_id": inbound.message_id,
+                    "content": inbound.text,
+                    "attachments": [_prompt_attachment(attachment) for attachment in inbound.attachments],
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
         return inbound.text
     return json.dumps(
         {
@@ -100,6 +110,7 @@ def _user_payload(inbound: InboundEnvelope | InputBurst) -> str:
                     "message_id": message.envelope.message_id,
                     "sent_at": message.envelope.timestamp,
                     "content": message.envelope.text,
+                    "attachments": [_prompt_attachment(attachment) for attachment in message.envelope.attachments],
                 }
                 for message in inbound.messages
             ]
@@ -107,6 +118,20 @@ def _user_payload(inbound: InboundEnvelope | InputBurst) -> str:
         ensure_ascii=False,
         separators=(",", ":"),
     )
+
+
+def _prompt_attachment(attachment) -> dict:
+    payload = {"kind": attachment.kind}
+    if attachment.mime_type:
+        payload["mime_type"] = attachment.mime_type
+    metadata = {
+        key: value
+        for key, value in attachment.metadata.items()
+        if key in {"width", "height", "file_size"} and isinstance(value, (int, float, str))
+    }
+    if metadata:
+        payload["metadata"] = metadata
+    return payload
 
 
 def build_repair_messages(original_messages: list[dict[str, str]], invalid_output: str, safe_code: str) -> list[dict[str, str]]:
