@@ -79,7 +79,7 @@ def build_step_realization_messages(
         f"selected procedure:\n{render_move_procedures((move,))}"
     )
     assistant_context = [{"role": "assistant", "content": text} for text in emitted]
-    return [{"role": "system", "content": system}, *request.history, *_visible_context(request.burst), *assistant_context, {"role": "user", "content": _user_payload(request.burst)}]
+    return [{"role": "system", "content": system}, *request.history, *_visible_context(request.burst), {"role": "user", "content": _user_payload(request.burst)}, *assistant_context]
 
 
 def _visible_context(inbound: InboundEnvelope | InputBurst) -> list[dict[str, str]]:

@@ -1,3 +1,4 @@
+import json
 import unittest
 
 from tomo_core.conversation import ConversationCompleted, ConversationEngine, ConversationMove, ConversationRequest, ConversationStarted, UtteranceReady
@@ -86,6 +87,54 @@ class ConversationEngineTests(unittest.TestCase):
         self.assertEqual(second, UtteranceReady(1, ConversationMove.ANSWER, "the answer."))
         self.assertIn("got you.", "\n".join(message["content"] for message in provider.calls[2][0]))
         self.assertIsInstance(next(iterator), ConversationCompleted)
+
+    def test_respond_iter_sequences_current_user_before_same_turn_utterances(self):
+        provider = ScriptedProvider([
+            '{"primary_move":"answer","supporting_moves":["acknowledge","explore"],"move_sequence":["acknowledge","explore","answer"],"response_goal":"answer","confidence":"high"}',
+            '{"utterance":"t1"}',
+            '{"utterance":"t2"}',
+            '{"utterance":"t3"}',
+        ])
+        current_user = {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "incoming_messages": [{
+                        "label": "msg_1",
+                        "update_id": 0,
+                        "message_id": "m1",
+                        "sent_at": "2026-01-01T00:00:00+00:00",
+                        "content": "current u1",
+                        "attachments": [],
+                    }],
+                },
+                separators=(",", ":"),
+            ),
+        }
+        request = ConversationRequest.from_history(
+            envelope=InboundEnvelope("telegram", "actor", "m1", "current u1", "2026-01-01T00:00:00+00:00"),
+            soul="SOUL SENTINEL",
+            history=[],
+        )
+
+        list(ConversationEngine(provider).respond_iter(request))
+
+        self.assertEqual(provider.calls[1][0][-1:], [current_user])
+        self.assertEqual(
+            provider.calls[2][0][-2:],
+            [
+                current_user,
+                {"role": "assistant", "content": "t1"},
+            ],
+        )
+        self.assertEqual(
+            provider.calls[3][0][-3:],
+            [
+                current_user,
+                {"role": "assistant", "content": "t1"},
+                {"role": "assistant", "content": "t2"},
+            ],
+        )
 
 
 if __name__ == "__main__":
