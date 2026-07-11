@@ -7,7 +7,13 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from daytona import CreateSandboxFromSnapshotParams, Daytona, VolumeMount
+from daytona import CreateSandboxFromSnapshotParams, Daytona, PtySize, VolumeMount
+
+
+# Progressive sandbox turns emit long single-line protocol markers. Daytona's
+# default PTY is ~80 columns and soft-wraps those lines, which corrupts the
+# event stream into invalid_result failures on the host parser.
+_PTY_SIZE = PtySize(rows=50, cols=4096)
 
 
 class DaytonaClientError(RuntimeError):
@@ -101,7 +107,7 @@ class DaytonaClient:
 
         def start() -> Any:
             process = self._sandbox(handle).process
-            pty = process.create_pty_session(session_id, envs=env or {})
+            pty = process.create_pty_session(session_id, envs=env or {}, pty_size=_PTY_SIZE)
             try:
                 self._wait_for_pty_connection(pty, timeout)
                 pty.send_input(f"{command}\nexit\n")
