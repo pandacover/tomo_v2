@@ -4,61 +4,189 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import asdict
-from typing import Any
+from dataclasses import asdict, dataclass
+from typing import Any, Iterable, Iterator, TypeAlias
 
-from .models import InboundEnvelope, MessageAttachment, OutboundBubble
+from .conversation import ConversationCompleted, ConversationMove, UtteranceReady
+from .conversation.parsing import ConversationOutputError, parse_utterances
+from .models import InboundEnvelope, InboundMessage, InputBurst, MessageAttachment, OutboundBubble, ResponseContract
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
+LEGACY_PROTOCOL_VERSION = 1
+EVENT_MARKER = "TOMO_SANDBOX_EVENT="
 RESULT_MARKER = "TOMO_SANDBOX_RESULT="
 MAX_BUBBLES = 4
 MAX_BUBBLE_CHARS = 4096
 _REQUEST_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 
 
-def encode_inbound(request_id: str, inbound: InboundEnvelope) -> str:
-    """Serialize a v1 inbound request for the sandbox."""
+@dataclass(frozen=True)
+class SandboxUtteranceEvent:
+    sequence: int
+    move: ConversationMove
+    text: str
+
+
+@dataclass(frozen=True)
+class SandboxCompletedEvent:
+    sequence: int
+    result: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class SandboxErrorEvent:
+    sequence: int
+    code: str
+
+
+SandboxEvent: TypeAlias = SandboxUtteranceEvent | SandboxCompletedEvent | SandboxErrorEvent
+
+
+def encode_inbound(request_id: str, burst: InputBurst | InboundEnvelope) -> str:
+    """Serialize a v2 inbound request for the sandbox."""
     _validate_request_id(request_id)
+    if isinstance(burst, InboundEnvelope):
+        burst = InputBurst(
+            burst_id=f"legacy-{burst.message_id}",
+            generation_id=f"legacy-{burst.message_id}",
+            revision=1,
+            messages=(InboundMessage(1, int(burst.native_metadata.get("update_id", 0)), burst),),
+        )
+    if not isinstance(burst, InputBurst):
+        raise TypeError("burst must be an InputBurst")
     return _encode(
         {
             "version": PROTOCOL_VERSION,
             "type": "inbound",
             "request_id": request_id,
-            "inbound": asdict(inbound),
+            "burst": _burst_to_dict(burst),
         }
     )
 
 
-def decode_inbound(payload: str) -> tuple[str, InboundEnvelope]:
-    """Parse and validate a v1 inbound request from the host."""
+def decode_inbound(payload: str) -> tuple[str, InputBurst]:
+    """Parse and validate a v2 inbound request from the host."""
     message = _decode(payload, "inbound")
-    inbound = message.get("inbound")
-    if not isinstance(inbound, dict):
-        raise ValueError("inbound must be an object")
+    raw_burst = message.get("burst")
+    if not isinstance(raw_burst, dict):
+        raise ValueError("inbound burst must be an object")
+    return message["request_id"], _burst_from_dict(raw_burst)
 
-    attachments = inbound.get("attachments", [])
-    if not isinstance(attachments, list) or not all(isinstance(item, dict) for item in attachments):
-        raise ValueError("inbound attachments must be an array of objects")
-    try:
-        envelope = InboundEnvelope(
-            connector=_required_string(inbound, "connector"),
-            actor_id=_required_string(inbound, "actor_id"),
-            message_id=_required_string(inbound, "message_id"),
-            text=_required_string(inbound, "text"),
-            timestamp=_required_string(inbound, "timestamp"),
-            attachments=tuple(MessageAttachment(**attachment) for attachment in attachments),
-            location=inbound.get("location"),
-            native_metadata=inbound.get("native_metadata", {}),
+
+def encode_event(request_id: str, generation_id: str, sequence: int, event: object) -> str:
+    _validate_request_id(request_id)
+    _validate_generation_id(generation_id)
+    if not isinstance(sequence, int) or sequence < 0:
+        raise ValueError("event sequence must be non-negative")
+    payload: dict[str, Any] = {
+        "version": PROTOCOL_VERSION,
+        "request_id": request_id,
+        "generation_id": generation_id,
+        "sequence": sequence,
+    }
+    conversation_event = getattr(event, "event", event)
+    if isinstance(conversation_event, UtteranceReady):
+        bubble = getattr(event, "bubble", None)
+        text = getattr(bubble, "text", conversation_event.text)
+        payload.update(
+            {
+                "type": "utterance",
+                "move": conversation_event.move.value,
+                "text": text,
+            }
         )
-    except (TypeError, ValueError) as error:
-        raise ValueError("invalid inbound envelope") from error
-    if envelope.connector != "telegram":
-        raise ValueError("unsupported connector")
-    if not isinstance(envelope.native_metadata, dict):
-        raise ValueError("inbound native_metadata must be an object")
-    if envelope.location is not None and not isinstance(envelope.location, dict):
-        raise ValueError("inbound location must be an object")
-    return message["request_id"], envelope
+    elif isinstance(conversation_event, ConversationCompleted):
+        result = conversation_event.result
+        payload.update(
+            {
+                "type": "completed",
+                "result": {
+                    "logical_text": result.logical_text,
+                    "utterances": list(result.utterances),
+                    "plan": {
+                        "primary_move": result.plan.primary.value,
+                        "supporting_moves": [move.value for move in result.plan.supporting],
+                        "move_sequence": [move.value for move in result.plan.sequence],
+                        "response_goal": result.plan.response_goal,
+                        "confidence": result.plan.confidence.value,
+                    },
+                },
+            }
+        )
+    elif isinstance(event, SandboxErrorEvent):
+        if not event.code.strip():
+            raise ValueError("error code must be non-empty")
+        payload.update({"type": "error", "error": {"code": event.code}})
+    else:
+        raise TypeError("unsupported sandbox event")
+    return _encode(payload)
+
+
+def iter_event_markers(
+    chunks: Iterable[str],
+    expected_request_id: str,
+    expected_generation_id: str,
+    contract: ResponseContract | None = None,
+) -> Iterator[SandboxEvent]:
+    _validate_request_id(expected_request_id)
+    _validate_generation_id(expected_generation_id)
+    contract = contract or ResponseContract()
+    buffer = ""
+    expected_sequence = 0
+    seen: dict[int, str] = {}
+    emitted_utterances: list[str] = []
+    emitted_moves: list[ConversationMove] = []
+    terminal = False
+
+    def process_line(line: str) -> SandboxEvent | None:
+        nonlocal expected_sequence, terminal
+        if not line.startswith(EVENT_MARKER):
+            return None
+        payload = line[len(EVENT_MARKER) :]
+        message = _decode_event(payload, expected_request_id, expected_generation_id)
+        sequence = message["sequence"]
+        canonical = _encode(message)
+        previous = seen.get(sequence)
+        if previous is not None:
+            if previous != canonical:
+                raise ValueError("conflicting duplicate sandbox event")
+            return None
+        if terminal:
+            raise ValueError("sandbox event after terminal")
+        if sequence != expected_sequence:
+            raise ValueError("sandbox event sequence gap")
+        seen[sequence] = canonical
+        expected_sequence += 1
+        event = _event_from_message(message, contract)
+        if isinstance(event, SandboxUtteranceEvent):
+            if len(emitted_utterances) >= contract.max_utterances:
+                raise ValueError("sandbox event stream exceeds utterance contract")
+            emitted_utterances.append(event.text)
+            emitted_moves.append(event.move)
+        if isinstance(event, SandboxCompletedEvent):
+            completed_utterances, completed_moves = _completed_result_parts(event.result, contract)
+            if tuple(emitted_utterances) != completed_utterances:
+                raise ValueError("completed utterances do not match streamed utterances")
+            if tuple(emitted_moves) != completed_moves:
+                raise ValueError("completed moves do not match streamed moves")
+            terminal = True
+        elif isinstance(event, SandboxErrorEvent):
+            terminal = True
+        return event
+
+    for chunk in chunks:
+        buffer += chunk
+        while "\n" in buffer:
+            line, buffer = buffer.split("\n", 1)
+            event = process_line(line.rstrip("\r"))
+            if event is not None:
+                yield event
+    if buffer:
+        event = process_line(buffer.rstrip("\r"))
+        if event is not None:
+            yield event
+    if not terminal:
+        raise ValueError("sandbox event stream missing terminal event")
 
 
 class SandboxProtocolError(ValueError):
@@ -70,12 +198,12 @@ class SandboxProtocolError(ValueError):
 
 
 def encode_result(request_id: str, bubbles: list[OutboundBubble]) -> str:
-    """Serialize a successful v1 sandbox result."""
+    """Serialize a successful legacy v1 sandbox result."""
     _validate_request_id(request_id)
     _validate_bubbles(bubbles)
     return _encode(
         {
-            "version": PROTOCOL_VERSION,
+            "version": LEGACY_PROTOCOL_VERSION,
             "request_id": request_id,
             "ok": True,
             "bubbles": [asdict(bubble) for bubble in bubbles],
@@ -84,13 +212,13 @@ def encode_result(request_id: str, bubbles: list[OutboundBubble]) -> str:
 
 
 def encode_error(request_id: str, code: str) -> str:
-    """Serialize a typed v1 sandbox failure without exception details."""
+    """Serialize a typed legacy v1 sandbox failure without exception details."""
     _validate_request_id(request_id)
     if not isinstance(code, str) or not code:
         raise ValueError("error code must be a non-empty string")
     return _encode(
         {
-            "version": PROTOCOL_VERSION,
+            "version": LEGACY_PROTOCOL_VERSION,
             "request_id": request_id,
             "ok": False,
             "error": {"code": code},
@@ -99,7 +227,7 @@ def encode_error(request_id: str, code: str) -> str:
 
 
 def parse_result_marker(output: str, expected_request_id: str) -> list[OutboundBubble]:
-    """Extract the sole marked result from sandbox stdout and validate its request ID."""
+    """Extract the sole legacy marked result from sandbox stdout and validate its request ID."""
     _validate_request_id(expected_request_id)
     marked_results = [line[len(RESULT_MARKER) :] for line in output.splitlines() if line.startswith(RESULT_MARKER)]
     if len(marked_results) != 1:
@@ -130,7 +258,71 @@ def parse_result_marker(output: str, expected_request_id: str) -> list[OutboundB
     return bubbles
 
 
-def _decode_result(payload: str) -> dict[str, Any]:
+def _burst_to_dict(burst: InputBurst) -> dict[str, Any]:
+    return {
+        "burst_id": burst.burst_id,
+        "generation_id": burst.generation_id,
+        "revision": burst.revision,
+        "visible_assistant_utterances": list(burst.visible_assistant_utterances),
+        "accepted_generation_ids": list(burst.accepted_generation_ids),
+        "messages": [
+            {"ordinal": message.ordinal, "update_id": message.update_id, "envelope": asdict(message.envelope)}
+            for message in burst.messages
+        ],
+    }
+
+
+def _burst_from_dict(raw: dict[str, Any]) -> InputBurst:
+    messages = raw.get("messages")
+    if not isinstance(messages, list):
+        raise ValueError("inbound burst messages must be an array")
+    try:
+        return InputBurst(
+            burst_id=_required_string(raw, "burst_id"),
+            generation_id=_required_string(raw, "generation_id"),
+            revision=raw["revision"],
+            visible_assistant_utterances=tuple(raw.get("visible_assistant_utterances", ())),
+            accepted_generation_ids=tuple(raw.get("accepted_generation_ids", ())),
+            messages=tuple(
+                InboundMessage(
+                    ordinal=message["ordinal"],
+                    update_id=message["update_id"],
+                    envelope=_envelope_from_dict(message.get("envelope")),
+                )
+                for message in messages
+                if isinstance(message, dict)
+            ),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("invalid inbound burst") from error
+
+
+def _envelope_from_dict(inbound: object) -> InboundEnvelope:
+    if not isinstance(inbound, dict):
+        raise ValueError("inbound envelope must be an object")
+    attachments = inbound.get("attachments", [])
+    if not isinstance(attachments, list) or not all(isinstance(item, dict) for item in attachments):
+        raise ValueError("inbound attachments must be an array of objects")
+    envelope = InboundEnvelope(
+        connector=_required_string(inbound, "connector"),
+        actor_id=_required_string(inbound, "actor_id"),
+        message_id=_required_string(inbound, "message_id"),
+        text=_required_string(inbound, "text"),
+        timestamp=_required_string(inbound, "timestamp"),
+        attachments=tuple(MessageAttachment(**attachment) for attachment in attachments),
+        location=inbound.get("location"),
+        native_metadata=inbound.get("native_metadata", {}),
+    )
+    if envelope.connector != "telegram":
+        raise ValueError("unsupported connector")
+    if not isinstance(envelope.native_metadata, dict):
+        raise ValueError("inbound native_metadata must be an object")
+    if envelope.location is not None and not isinstance(envelope.location, dict):
+        raise ValueError("inbound location must be an object")
+    return envelope
+
+
+def _decode_event(payload: str, expected_request_id: str, expected_generation_id: str) -> dict[str, Any]:
     try:
         message = json.loads(payload)
     except (TypeError, json.JSONDecodeError) as error:
@@ -138,6 +330,75 @@ def _decode_result(payload: str) -> dict[str, Any]:
     if not isinstance(message, dict):
         raise ValueError("protocol payload must be an object")
     if message.get("version") != PROTOCOL_VERSION:
+        raise ValueError("unsupported protocol version")
+    if message.get("request_id") != expected_request_id:
+        raise ValueError("event request_id does not match inbound request")
+    if message.get("generation_id") != expected_generation_id:
+        raise ValueError("event generation_id does not match inbound request")
+    sequence = message.get("sequence")
+    if not isinstance(sequence, int) or sequence < 0:
+        raise ValueError("event sequence must be non-negative")
+    event_type = message.get("type")
+    if event_type not in {"utterance", "completed", "error"}:
+        raise ValueError("unsupported sandbox event type")
+    return message
+
+
+def _event_from_message(message: dict[str, Any], contract: ResponseContract) -> SandboxEvent:
+    sequence = message["sequence"]
+    event_type = message["type"]
+    if event_type == "utterance":
+        text = message.get("text")
+        if not isinstance(text, str) or not text.strip() or len(text) > MAX_BUBBLE_CHARS:
+            raise ValueError("utterance text must contain 1 to 4096 characters")
+        try:
+            utterance = parse_utterances(json.dumps({"utterances": [text]}), contract)[0]
+        except ConversationOutputError as error:
+            raise ValueError(f"utterance violates response contract: {error.code}") from error
+        return SandboxUtteranceEvent(sequence=sequence, move=ConversationMove(message.get("move")), text=utterance)
+    if event_type == "completed":
+        result = message.get("result")
+        if not isinstance(result, dict) or not isinstance(result.get("logical_text"), str) or not result["logical_text"].strip():
+            raise ValueError("completed event requires a result")
+        _completed_result_parts(result, contract)
+        return SandboxCompletedEvent(sequence=sequence, result=result)
+    error = message.get("error")
+    if not isinstance(error, dict) or not isinstance(error.get("code"), str) or not error["code"].strip():
+        raise ValueError("error event requires a code")
+    return SandboxErrorEvent(sequence=sequence, code=error["code"])
+
+
+def _completed_result_parts(result: dict[str, Any], contract: ResponseContract) -> tuple[tuple[str, ...], tuple[ConversationMove, ...]]:
+    utterances = result.get("utterances")
+    if not isinstance(utterances, list):
+        raise ValueError("completed result utterances must be an array")
+    try:
+        cleaned = parse_utterances(json.dumps({"utterances": utterances}), contract)
+    except ConversationOutputError as error:
+        raise ValueError(f"completed result violates response contract: {error.code}") from error
+    plan = result.get("plan")
+    if not isinstance(plan, dict):
+        raise ValueError("completed result requires a plan")
+    raw_sequence = plan.get("move_sequence")
+    if not isinstance(raw_sequence, list):
+        raise ValueError("completed plan requires a move_sequence")
+    try:
+        moves = tuple(ConversationMove(move) for move in raw_sequence)
+    except ValueError as error:
+        raise ValueError("completed plan contains an invalid move") from error
+    if len(moves) != len(cleaned):
+        raise ValueError("completed plan move_sequence must match utterance count")
+    return cleaned, moves
+
+
+def _decode_result(payload: str) -> dict[str, Any]:
+    try:
+        message = json.loads(payload)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise ValueError("protocol payload must be JSON") from error
+    if not isinstance(message, dict):
+        raise ValueError("protocol payload must be an object")
+    if message.get("version") != LEGACY_PROTOCOL_VERSION:
         raise ValueError("unsupported protocol version")
     _validate_request_id(message.get("request_id"))
     if not isinstance(message.get("ok"), bool):
@@ -167,6 +428,11 @@ def _encode(message: dict[str, Any]) -> str:
 def _validate_request_id(request_id: object) -> None:
     if not isinstance(request_id, str) or not _REQUEST_ID_RE.fullmatch(request_id):
         raise ValueError("request_id must be 1-128 URL-safe characters")
+
+
+def _validate_generation_id(generation_id: object) -> None:
+    if not isinstance(generation_id, str) or not generation_id.strip():
+        raise ValueError("generation_id must be non-empty")
 
 
 def _required_string(message: dict[str, Any], name: str) -> str:

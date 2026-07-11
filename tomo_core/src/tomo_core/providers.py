@@ -160,10 +160,13 @@ class StaticProvider:
                 {
                     "primary_move": "answer",
                     "supporting_moves": [],
+                    "move_sequence": ["answer"],
                     "response_goal": "return the configured static smoke response",
                     "confidence": "high",
                 }
             )
+        if '"utterance"' in system_text:
+            return json.dumps({"utterance": self.response})
         if '"utterances"' in system_text:
             return json.dumps({"utterances": [self.response]})
         return self.response

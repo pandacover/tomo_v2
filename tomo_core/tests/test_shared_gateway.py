@@ -1,4 +1,5 @@
 import tempfile
+import time
 import unittest
 from contextlib import contextmanager
 from unittest.mock import Mock
@@ -9,6 +10,7 @@ from tomo_core.onboarding_store import TelegramOnboardingStore
 from tomo_core.providers import StaticProvider
 from tomo_core.shared_gateway import InProcessTelegramRuntimeDispatch, SharedTelegramGateway
 from tomo_core.sandbox_dispatch import SandboxDispatchError
+from tomo_core.sandbox_protocol import SandboxCompletedEvent, SandboxUtteranceEvent
 from tomo_core.telegram import FakeTelegramClient
 from tomo_core.telegram_router import RetryableTelegramUpdateError
 
@@ -43,6 +45,12 @@ class FakeRuntimeDispatch:
     def deliver_telegram(self, installation, update_id, envelope):
         self.calls.append(("dispatch", installation, update_id, envelope))
         return [OutboundBubble("reply")]
+
+    def iter_telegram_events(self, installation, work):
+        self.calls.append(("iter", installation, work))
+        yield SandboxUtteranceEvent(0, "acknowledge", "first.")
+        yield SandboxUtteranceEvent(1, "answer", "second.")
+        yield SandboxCompletedEvent(2, {"logical_text": "first. second."})
 
 
 class SharedGatewayTests(unittest.TestCase):
@@ -113,6 +121,22 @@ class SharedGatewayTests(unittest.TestCase):
             session = instances.get(installation.tomo_id).sessions.load("telegram:actor:999")
             self.assertEqual(session.model_history()[-2]["content"], "hi")
 
+    def test_in_process_dispatch_supports_generation_work(self):
+        with self._store() as store:
+            installation = self._installation(store, chat_id="123", actor_id="999")
+            work = self._generation_work(store, installation.tomo_id)
+            client = FakeTelegramClient()
+            instances = RuntimeInstanceRegistry(store.data_dir, lambda _: StaticProvider("hello"), client)
+            gateway = SharedTelegramGateway(
+                client=client,
+                store=store,
+                dispatch=InProcessTelegramRuntimeDispatch(instances=instances),
+                pace_seconds=0,
+            )
+
+            self.assertTrue(gateway.process_update(work))
+            self.assertEqual(client.sent_messages[-1]["text"], "hello")
+
     def test_gateway_sends_bubbles_only_to_installation_chat_and_replies_to_the_trigger_first(self):
         with self._store() as store:
             installation = self._installation(store, chat_id="123", actor_id="999")
@@ -142,6 +166,98 @@ class SharedGatewayTests(unittest.TestCase):
             self.assertEqual([message["text"] for message in client.sent_messages], ["tomo had trouble replying. try again in a moment."])
             self.assertEqual([message["reply_to_message_id"] for message in client.sent_messages], ["2"])
 
+    def test_generation_work_streams_each_utterance_through_delivery_fence(self):
+        with self._store() as store:
+            installation = self._installation(store, chat_id="123", actor_id="999")
+            work = self._generation_work(store, installation.tomo_id)
+            client = FakeTelegramClient()
+            dispatch = FakeRuntimeDispatch()
+            gateway = SharedTelegramGateway(client=client, store=store, dispatch=dispatch, pace_seconds=0)
+
+            self.assertTrue(gateway.process_update(work))
+
+            self.assertEqual([call[0] for call in dispatch.calls], ["iter"])
+            self.assertEqual([message["actor_id"] for message in client.sent_messages], ["123", "123"])
+            self.assertEqual([message["text"] for message in client.sent_messages], ["first.", "second."])
+            self.assertEqual([message["reply_to_message_id"] for message in client.sent_messages], ["2", None])
+            self.assertFalse(store.is_generation_active(work.generation_id, work.revision))
+            self.assertFalse(store.reserve_delivery(work.generation_id, work.revision, 2, "answer", "late.", None))
+
+    def test_generation_work_sends_event_zero_before_event_one_is_generated(self):
+        with self._store() as store:
+            installation = self._installation(store, chat_id="123", actor_id="999")
+            work = self._generation_work(store, installation.tomo_id)
+            client = FakeTelegramClient()
+
+            class InspectingDispatch(FakeRuntimeDispatch):
+                def iter_telegram_events(self, installation, work):
+                    yield SandboxUtteranceEvent(0, "acknowledge", "first.")
+                    self.calls.append(("after-first", len(client.sent_messages)))
+                    yield SandboxUtteranceEvent(1, "answer", "second.")
+                    yield SandboxCompletedEvent(2, {"logical_text": "first. second."})
+
+            dispatch = InspectingDispatch()
+            gateway = SharedTelegramGateway(client=client, store=store, dispatch=dispatch, pace_seconds=0)
+
+            gateway.process_update(work)
+
+            self.assertEqual(dispatch.calls, [("after-first", 1)])
+
+    def test_generation_work_suppresses_stale_generation_before_send(self):
+        with self._store() as store:
+            installation = self._installation(store, chat_id="123", actor_id="999")
+            work = self._generation_work(store, installation.tomo_id)
+            store.fail_generation(work.generation_id, "superseded")
+            client = FakeTelegramClient()
+            gateway = SharedTelegramGateway(client=client, store=store, dispatch=FakeRuntimeDispatch(), pace_seconds=0)
+
+            self.assertTrue(gateway.process_update(work))
+
+            self.assertEqual(client.sent_messages, [])
+
+    def test_generation_work_marks_reservation_suppressed_if_revision_turns_stale_after_reserve(self):
+        with self._store() as store:
+            installation = self._installation(store, chat_id="123", actor_id="999")
+            work = self._generation_work(store, installation.tomo_id)
+            original_reserve = store.reserve_delivery
+
+            def reserve_then_supersede(*args, **kwargs):
+                reserved = original_reserve(*args, **kwargs)
+                store.fail_generation(work.generation_id, "superseded")
+                return reserved
+
+            store.reserve_delivery = reserve_then_supersede
+            client = FakeTelegramClient()
+            gateway = SharedTelegramGateway(client=client, store=store, dispatch=FakeRuntimeDispatch(), pace_seconds=0)
+
+            self.assertTrue(gateway.process_update(work))
+            self.assertEqual(client.sent_messages, [])
+            self.assertEqual(store.delivery_status(work.generation_id, 0), "suppressed")
+            replacement = store.claim_next_work(now=time.time() + 1)
+            self.assertEqual(replacement.visible_assistant_utterances, ())
+
+    def test_generation_work_does_not_complete_superseded_generation_after_send_race(self):
+        with self._store() as store:
+            installation = self._installation(store, chat_id="123", actor_id="999")
+            work = self._generation_work(store, installation.tomo_id)
+            original_mark_sent = store.mark_delivery_sent
+
+            def mark_sent_after_supersede(*args, **kwargs):
+                store.fail_generation(work.generation_id, "superseded")
+                return original_mark_sent(*args, **kwargs)
+
+            store.mark_delivery_sent = mark_sent_after_supersede
+            client = FakeTelegramClient()
+            gateway = SharedTelegramGateway(client=client, store=store, dispatch=FakeRuntimeDispatch(), pace_seconds=0)
+
+            self.assertTrue(gateway.process_update(work))
+
+            self.assertEqual([message["text"] for message in client.sent_messages], ["first."])
+            self.assertFalse(store.complete_generation(work.generation_id, work.revision))
+            replacement = store.claim_next_work(now=time.time() + 1)
+            self.assertIsNotNone(replacement)
+            self.assertEqual(replacement.visible_assistant_utterances, ("first.",))
+
     @staticmethod
     @contextmanager
     def _store():
@@ -152,3 +268,29 @@ class SharedGatewayTests(unittest.TestCase):
     def _installation(store, chat_id, actor_id):
         link = store.create_install_link("user-1", "tmnvm_bot")
         return store.consume_start_token(link.token, chat_id=chat_id, actor_id=actor_id)
+
+    @staticmethod
+    def _generation_work(store, tomo_id):
+        store.enqueue_update(
+            1,
+            "123",
+            '{"update_id":1,"message":{"message_id":1,"date":1,"from":{"id":999},"chat":{"id":123,"type":"private"},"text":"first"}}',
+            now=1.0,
+            update_kind="message",
+            message_id="1",
+            telegram_sent_at=1.0,
+            tomo_id=tomo_id,
+        )
+        store.enqueue_update(
+            2,
+            "123",
+            '{"update_id":2,"message":{"message_id":2,"date":2,"from":{"id":999},"chat":{"id":123,"type":"private"},"text":"second"}}',
+            now=1.1,
+            update_kind="message",
+            message_id="2",
+            telegram_sent_at=2.0,
+            tomo_id=tomo_id,
+        )
+        work = store.claim_next_work(now=2.0)
+        assert work is not None
+        return work

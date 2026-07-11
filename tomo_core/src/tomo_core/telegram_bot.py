@@ -10,6 +10,7 @@ from .grok_auth import GrokAuthStore
 from .models import InboundEnvelope
 from .oauth import OAuthError, OAuthManager
 from .runtime import PersonalAgentRuntime
+from .telegram import TelegramSendReceipt
 
 
 class TelegramBotApiError(RuntimeError):
@@ -53,13 +54,16 @@ class TelegramBotApiClient:
         text: str,
         reply_to_message_id: str | None = None,
         reply_markup: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> TelegramSendReceipt:
         payload: dict[str, Any] = {"chat_id": actor_id, "text": text}
         if reply_to_message_id:
             payload["reply_parameters"] = {"message_id": int(reply_to_message_id)}
         if reply_markup:
             payload["reply_markup"] = reply_markup
-        self.request("sendMessage", payload)
+        data = self.request("sendMessage", payload)
+        result = data.get("result") if isinstance(data, dict) else None
+        message_id = result.get("message_id") if isinstance(result, dict) else None
+        return TelegramSendReceipt(str(message_id))
 
     def answer_callback_query(self, callback_query_id: str, text: str | None = None) -> None:
         payload: dict[str, Any] = {"callback_query_id": callback_query_id}

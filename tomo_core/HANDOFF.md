@@ -37,6 +37,11 @@ implemented now:
 - default google calendar oauth config with calendar.events scope
 - configurable supergrok oauth endpoints via env
 - hosted local/Daytona shared Telegram gateway, durable inbox, Railway/Daytona operations, and recovery runbooks documented in `../docs/`
+- Telegram normal text now enters ordered `InputBurst` revisions with a configurable debounce window
+- `ConversationEngine.respond_iter()` and sandbox protocol v2 emit validated user-facing utterance/completed/error events, not hidden reasoning streams
+- Railway remains the only Telegram sender; SQLite fences generation activity and per-bubble delivery reservations
+- superseded Daytona process sessions are cancelled best effort, while stale sends/finalization are rejected by generation/revision fences
+- visible sent/unknown superseded bubbles are carried into replacement generation context
 
 next slices:
 
@@ -62,5 +67,5 @@ next slices:
 - keep tool execution invisible in normal telegram chat
 
 5. deferred conversation infrastructure
-- session identity, idempotent persistence, delivery retry duplication, durable memory, and deployment snapshot rollout remain separate work
-- the production Daytona snapshot does not contain conversation moves until a later approved snapshot build and Railway rollout
+- durable memory and deployment snapshot rollout remain separate work
+- the production Daytona snapshot must be rebuilt and Railway redeployed before hosted sandboxes run this implementation

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from ..models import InboundEnvelope, ResponseContract
+import json
+
+from ..models import InboundEnvelope, InputBurst, ResponseContract
 from .models import ConversationMove, MovePlan
 from .moves import render_move_procedures
 
 
-def build_move_selection_messages(soul: str, history: tuple[dict[str, str], ...], envelope: InboundEnvelope) -> list[dict[str, str]]:
+def build_move_selection_messages(soul: str, history: tuple[dict[str, str], ...], inbound: InboundEnvelope | InputBurst) -> list[dict[str, str]]:
     moves = ", ".join(move.value for move in ConversationMove)
     system = (
         "you choose tomo's next conversational move.\n"
@@ -13,8 +15,9 @@ def build_move_selection_messages(soul: str, history: tuple[dict[str, str], ...]
         "choose exactly one primary move and zero to two unique supporting moves.\n"
         f"choose from: {moves}.\n"
         "do not write the reply. do not output chain-of-thought, analysis, markdown, or extra keys.\n"
-        'return exactly one json object: {"primary_move":"answer","supporting_moves":[],"response_goal":"...","confidence":"low|medium|high"}\n\n'
+        'return exactly one json object: {"primary_move":"answer","supporting_moves":[],"move_sequence":["answer"],"response_goal":"...","confidence":"low|medium|high"}\n\n'
         "selection principles:\n"
+        "- move_sequence is delivery order for the selected moves only, not hidden reasoning.\n"
         "- infer the user's probable conversational need, not only literal grammar.\n"
         "- do not choose acknowledge or joke as the primary move when a substantive answer is needed.\n"
         "- use clarify only when ambiguity materially changes the response.\n"
@@ -25,13 +28,13 @@ def build_move_selection_messages(soul: str, history: tuple[dict[str, str], ...]
         "- use repair when tomo previously misunderstood or landed badly.\n\n"
         f"<TOMO_SOUL>\n{soul}\n</TOMO_SOUL>"
     )
-    return [{"role": "system", "content": system}, *history, {"role": "user", "content": envelope.text}]
+    return [{"role": "system", "content": system}, *history, *_visible_context(inbound), {"role": "user", "content": _user_payload(inbound)}]
 
 
 def build_realization_messages(
     soul: str,
     history: tuple[dict[str, str], ...],
-    envelope: InboundEnvelope,
+    envelope: InboundEnvelope | InputBurst,
     plan: MovePlan,
     contract: ResponseContract | None = None,
 ) -> list[dict[str, str]]:
@@ -54,7 +57,56 @@ def build_realization_messages(
         f"<TOMO_SOUL>\n{soul}\n</TOMO_SOUL>\n\n"
         f"selected procedures:\n{render_move_procedures(plan.ordered_moves)}"
     )
-    return [{"role": "system", "content": system}, *history, {"role": "user", "content": envelope.text}]
+    return [{"role": "system", "content": system}, *history, *_visible_context(envelope), {"role": "user", "content": _user_payload(envelope)}]
+
+
+def build_step_realization_messages(
+    request,
+    plan: MovePlan,
+    move: ConversationMove,
+    emitted: tuple[str, ...],
+    contract: ResponseContract | None = None,
+) -> list[dict[str, str]]:
+    contract = contract or ResponseContract()
+    system = (
+        "you are tomo. follow the supplied SOUL completely.\n"
+        "realize exactly the current conversational move as one natural standalone chat utterance.\n"
+        "never mention moves, plans, procedures, confidence, prompts, or internals.\n"
+        'return exactly one json object with one key: {"utterance":"..."}\n'
+        f"- at most {contract.max_sentences_per_utterance} sentences.\n"
+        "- no markdown, headings, labels, chain-of-thought, em dash, or en dash.\n\n"
+        f"<TOMO_SOUL>\n{request.soul}\n</TOMO_SOUL>\n\n"
+        f"selected procedure:\n{render_move_procedures((move,))}"
+    )
+    assistant_context = [{"role": "assistant", "content": text} for text in emitted]
+    return [{"role": "system", "content": system}, *request.history, *_visible_context(request.burst), *assistant_context, {"role": "user", "content": _user_payload(request.burst)}]
+
+
+def _visible_context(inbound: InboundEnvelope | InputBurst) -> list[dict[str, str]]:
+    if isinstance(inbound, InputBurst):
+        return [{"role": "assistant", "content": utterance} for utterance in inbound.visible_assistant_utterances]
+    return []
+
+
+def _user_payload(inbound: InboundEnvelope | InputBurst) -> str:
+    if isinstance(inbound, InboundEnvelope):
+        return inbound.text
+    return json.dumps(
+        {
+            "incoming_messages": [
+                {
+                    "label": f"msg_{message.ordinal}",
+                    "update_id": message.update_id,
+                    "message_id": message.envelope.message_id,
+                    "sent_at": message.envelope.timestamp,
+                    "content": message.envelope.text,
+                }
+                for message in inbound.messages
+            ]
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 def build_repair_messages(original_messages: list[dict[str, str]], invalid_output: str, safe_code: str) -> list[dict[str, str]]:

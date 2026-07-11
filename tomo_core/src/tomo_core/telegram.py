@@ -6,11 +6,16 @@ from typing import Protocol
 from .models import OutboundBubble
 
 
+@dataclass(frozen=True)
+class TelegramSendReceipt:
+    message_id: str
+
+
 class TelegramClient(Protocol):
     def send_typing(self, actor_id: str) -> None:
         ...
 
-    def send_message(self, actor_id: str, text: str, reply_to_message_id: str | None = None) -> None:
+    def send_message(self, actor_id: str, text: str, reply_to_message_id: str | None = None) -> TelegramSendReceipt:
         ...
 
 
@@ -38,7 +43,8 @@ class FakeTelegramClient:
     def send_typing(self, actor_id: str) -> None:
         self.typing_actor_ids.append(actor_id)
 
-    def send_message(self, actor_id: str, text: str, reply_to_message_id: str | None = None) -> None:
+    def send_message(self, actor_id: str, text: str, reply_to_message_id: str | None = None) -> TelegramSendReceipt:
         self.sent_messages.append(
             {"actor_id": actor_id, "text": text, "reply_to_message_id": reply_to_message_id}
         )
+        return TelegramSendReceipt(str(len(self.sent_messages)))

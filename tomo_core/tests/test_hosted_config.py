@@ -20,6 +20,8 @@ class HostedRuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config.runtime, "local")
         self.assertEqual(config.worker_count, 4)
         self.assertEqual(config.poll_timeout, 30)
+        self.assertEqual(config.telegram_input_debounce_seconds, 0.7)
+        self.assertEqual(config.telegram_delivery_pace_seconds, 1.5)
         self.assertEqual(config.xai_model, "grok-4.5")
         self.assertEqual(config.xai_reasoning_effort, "high")
 
@@ -68,6 +70,8 @@ class HostedRuntimeConfigTests(unittest.TestCase):
                     "TOMO_DAYTONA_SANDBOX_DATA_DIR": "/var/lib/tomo",
                     "TOMO_SUPERGROK_OAUTH_JSON_B64": base64.b64encode(b"{}").decode("ascii"),
                     "TOMO_TELEGRAM_POLL_TIMEOUT": "45",
+                    "TOMO_TELEGRAM_INPUT_DEBOUNCE_SECONDS": "0.25",
+                    "TOMO_TELEGRAM_DELIVERY_PACE_SECONDS": "0",
                     "TOMO_ROUTER_WORKERS": "8",
                 }
             )
@@ -76,6 +80,8 @@ class HostedRuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config.daytona_snapshot, "tomo-snapshot")
         self.assertEqual(config.daytona_sandbox_data_dir, "/var/lib/tomo")
         self.assertEqual(config.poll_timeout, 45)
+        self.assertEqual(config.telegram_input_debounce_seconds, 0.25)
+        self.assertEqual(config.telegram_delivery_pace_seconds, 0.0)
         self.assertEqual(config.worker_count, 8)
         self.assertEqual(config.xai_model, "grok-4.5")
         self.assertEqual(config.xai_reasoning_effort, "high")
@@ -141,6 +147,18 @@ class HostedRuntimeConfigTests(unittest.TestCase):
             base["TOMO_SUPERGROK_OAUTH_JSON_B64"] = "not-base64"
             with self.assertRaisesRegex(ValueError, "TOMO_SUPERGROK_OAUTH_JSON_B64"):
                 HostedRuntimeConfig.from_env(base)
+
+    def test_negative_telegram_debounce_and_pace_are_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = {
+                "TOMO_HOSTED_RUNTIME": "local",
+                "TOMO_TELEGRAM_GLOBAL_BOT_TOKEN": "bot-token",
+                "TOMO_CORE_DATA_DIR": tmp,
+            }
+            with self.assertRaisesRegex(ValueError, "TOMO_TELEGRAM_INPUT_DEBOUNCE_SECONDS"):
+                HostedRuntimeConfig.from_env({**base, "TOMO_TELEGRAM_INPUT_DEBOUNCE_SECONDS": "-0.1"})
+            with self.assertRaisesRegex(ValueError, "TOMO_TELEGRAM_DELIVERY_PACE_SECONDS"):
+                HostedRuntimeConfig.from_env({**base, "TOMO_TELEGRAM_DELIVERY_PACE_SECONDS": "-1"})
 
     def test_unwritable_data_path_is_rejected_without_echoing_path(self):
         with tempfile.TemporaryDirectory() as tmp:

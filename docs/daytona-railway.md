@@ -18,6 +18,8 @@ Set these variables on the core service. Values marked required are required for
 | `TOMO_CONTROL_HOST` | no | Defaults to `0.0.0.0` in the Railway wrapper. |
 | `TOMO_CONTROL_PORT` | no | Defaults to Railway `$PORT`, or `8787` if `PORT` is absent. |
 | `TOMO_TELEGRAM_POLL_TIMEOUT` | no | Long-poll seconds, default `30`; valid range is `1..60`. |
+| `TOMO_TELEGRAM_INPUT_DEBOUNCE_SECONDS` | no | Resettable quiet window for coalescing normal Telegram text into one input burst, default `0.7`; must be non-negative. |
+| `TOMO_TELEGRAM_DELIVERY_PACE_SECONDS` | no | Minimum pause between progressive Telegram bubbles, default `1.5`; must be non-negative. |
 | `TOMO_ROUTER_WORKERS` | no | Durable inbox worker count, default `4`; valid range is `1..32`. |
 | `TOMO_XAI_MODEL` | no | Model used for hosted Daytona sandbox turns and local model providers, default `grok-4.5`. Changes are included in the sandbox environment on the next turn. |
 | `TOMO_XAI_REASONING_EFFORT` | no | Reasoning effort passed to SuperGrok/xAI chat completions in hosted Daytona sandboxes, default `high`. Changes are included in the sandbox environment on the next turn. |
@@ -67,7 +69,13 @@ Update `TOMO_DAYTONA_SNAPSHOT` and redeploy immediately after replacement. Do no
 
 The listener long-polls only private Telegram updates. It inserts each update into `/data/onboarding.sqlite` before advancing its Telegram offset. `update_id` is unique, workers preserve order per chat, and an interrupted `processing` row returns to `pending` at listener startup.
 
-This is at-least-once delivery, not exactly-once. A process can die after a sandbox turn or Telegram send but before the inbox row is marked complete, so a user may receive a duplicate response after recovery. Retryable failures back off at 1, 2, 4, 8, and 16 seconds; after the fifth attempt, the update is marked complete to avoid blocking later messages in that chat.
+Normal text messages for one chat are coalesced into an ordered burst after the resettable debounce window. A later normal message during generation increments the burst revision, marks the older generation `superseded`, and schedules best-effort Daytona process-session deletion. Railway still fences every send and finalization in SQLite, so hard cancellation is an optimization, not the correctness boundary.
+
+Sandbox output uses protocol v2 event lines: `TOMO_SANDBOX_EVENT=...` with ordered `utterance`, `completed`, or typed `error` events. Railway validates request ID, generation ID, sequence continuity, and event shape before delivery. The sandbox receives no Telegram token or destination chat ID; Railway is the only Telegram sender.
+
+Delivery is duplicate-averse rather than exactly-once. Before each bubble, Railway reserves `(generation_id, revision, sequence)` in SQLite, checks that the generation remains active, sends to the trusted installation chat, and records Telegram's returned message ID. If Telegram may have accepted a send but local acknowledgement fails, the event becomes `unknown` and is not blindly resent; replacement generations include sent or unknown visible text as context.
+
+Retryable control-update failures back off at 1, 2, 4, 8, and 16 seconds; after the fifth attempt, the update is marked complete to avoid blocking later control updates in that chat.
 
 The same Railway volume also holds installations, the sandbox registry, and the broker's refreshed auth. Each `tomo_id` maps deterministically to one Daytona sandbox name and one volume name. Reconciliation creates a missing volume, resumes a stopped sandbox, replaces invalid or snapshot-mismatched sandboxes, smoke-tests new/resumed sandboxes, and keeps the volume when replacing a sandbox. Sandboxes have Daytona auto-stop disabled.
 

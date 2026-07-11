@@ -34,6 +34,8 @@ class HostedRuntimeConfig:
     oauth_json_b64: str | None
     poll_timeout: int
     worker_count: int
+    telegram_input_debounce_seconds: float
+    telegram_delivery_pace_seconds: float
     xai_model: str
     xai_reasoning_effort: str
 
@@ -93,6 +95,12 @@ class HostedRuntimeConfig:
         if not 1 <= resolved_poll_timeout <= _MAX_POLL_TIMEOUT:
             raise ValueError("invalid TOMO_TELEGRAM_POLL_TIMEOUT")
         worker_count = _parse_positive(values.get("TOMO_ROUTER_WORKERS", "4"), "TOMO_ROUTER_WORKERS", _MAX_ROUTER_WORKERS)
+        input_debounce_seconds = _parse_non_negative_float(
+            values.get("TOMO_TELEGRAM_INPUT_DEBOUNCE_SECONDS", "0.7"), "TOMO_TELEGRAM_INPUT_DEBOUNCE_SECONDS"
+        )
+        delivery_pace_seconds = _parse_non_negative_float(
+            values.get("TOMO_TELEGRAM_DELIVERY_PACE_SECONDS", "1.5"), "TOMO_TELEGRAM_DELIVERY_PACE_SECONDS"
+        )
         root = Path(resolved_data_dir)
         try:
             root.mkdir(parents=True, exist_ok=True)
@@ -111,6 +119,8 @@ class HostedRuntimeConfig:
             oauth_json_b64=values.get("TOMO_SUPERGROK_OAUTH_JSON_B64") if runtime == "daytona" else None,
             poll_timeout=resolved_poll_timeout,
             worker_count=worker_count,
+            telegram_input_debounce_seconds=input_debounce_seconds,
+            telegram_delivery_pace_seconds=delivery_pace_seconds,
             xai_model=values.get("TOMO_XAI_MODEL", _DEFAULT_XAI_MODEL),
             xai_reasoning_effort=values.get("TOMO_XAI_REASONING_EFFORT", _DEFAULT_XAI_REASONING_EFFORT),
         )
@@ -122,6 +132,16 @@ def _parse_positive(value: str, name: str, maximum: int) -> int:
     except (TypeError, ValueError):
         raise ValueError(f"invalid {name}") from None
     if not 1 <= parsed <= maximum:
+        raise ValueError(f"invalid {name}")
+    return parsed
+
+
+def _parse_non_negative_float(value: str, name: str) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"invalid {name}") from None
+    if parsed < 0:
         raise ValueError(f"invalid {name}")
     return parsed
 

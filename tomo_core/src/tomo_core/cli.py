@@ -172,11 +172,16 @@ def run_shared_gateway_foreground(args: argparse.Namespace, config: HostedRuntim
     pid_path.write_text(str(os.getpid()), encoding="utf-8")
     try:
         client = TelegramBotApiClient(token=config.bot_token)
-        store = TelegramOnboardingStore(config.data_dir)
+        store = TelegramOnboardingStore(config.data_dir, input_debounce_seconds=config.telegram_input_debounce_seconds)
         if config.runtime == "local":
             provider_factory = lambda _: StaticProvider(args.static_response) if args.static_response else build_provider(args, build_oauth_manager(args))
             instances = RuntimeInstanceRegistry(config.data_dir, provider_factory, client, soul_path=args.soul)
-            gateway = SharedTelegramGateway(client=client, store=store, dispatch=InProcessTelegramRuntimeDispatch(instances))
+            gateway = SharedTelegramGateway(
+                client=client,
+                store=store,
+                dispatch=InProcessTelegramRuntimeDispatch(instances),
+                pace_seconds=config.telegram_delivery_pace_seconds,
+            )
         else:
             auth = HostedSuperGrokTokenBroker(config.data_dir, os.getenv("TOMO_SUPERGROK_OAUTH_JSON_B64"))
             auth.access_token()
@@ -199,12 +204,18 @@ def run_shared_gateway_foreground(args: argparse.Namespace, config: HostedRuntim
                 xai_model=config.xai_model,
                 xai_reasoning_effort=config.xai_reasoning_effort,
             )
-            gateway = SharedTelegramGateway(client=client, store=store, dispatch=dispatch)
+            gateway = SharedTelegramGateway(
+                client=client,
+                store=store,
+                dispatch=dispatch,
+                pace_seconds=config.telegram_delivery_pace_seconds,
+            )
         print("shared telegram gateway polling started. press ctrl+c to stop.")
         TelegramUpdateRouter(
             client=client,
             store=store,
             process_update=gateway.process_update,
+            cancel_generation=getattr(gateway.dispatch, "cancel_generation", None),
             poll_timeout=config.poll_timeout,
             worker_count=config.worker_count,
         ).run_forever()

@@ -7,9 +7,10 @@ from tomo_core.models import ResponseContract
 
 class ConversationParsingTests(unittest.TestCase):
     def test_parse_move_plan_accepts_only_compact_decision_fields(self):
-        plan = parse_move_plan('{"primary_move":"challenge","supporting_moves":["acknowledge","explore"],"response_goal":"challenge the assumption","confidence":"high"}')
+        plan = parse_move_plan('{"primary_move":"challenge","supporting_moves":["acknowledge","explore"],"move_sequence":["acknowledge","challenge","explore"],"response_goal":"challenge the assumption","confidence":"high"}')
         self.assertEqual(plan.primary, ConversationMove.CHALLENGE)
         self.assertEqual(plan.supporting, (ConversationMove.ACKNOWLEDGE, ConversationMove.EXPLORE))
+        self.assertEqual(plan.sequence, (ConversationMove.ACKNOWLEDGE, ConversationMove.CHALLENGE, ConversationMove.EXPLORE))
         self.assertEqual(plan.confidence, MoveConfidence.HIGH)
 
     def test_parse_move_plan_rejects_unknown_fields_and_falls_back(self):

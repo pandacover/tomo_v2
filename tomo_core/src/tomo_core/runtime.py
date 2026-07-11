@@ -1,15 +1,31 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, Iterator, TypeAlias
 
-from .conversation import ConversationEngine, ConversationRequest
-from .delivery import DeliveryPlanner
+from .conversation import ConversationCompleted, ConversationEngine, ConversationRequest, ConversationStarted, UtteranceReady
+from .delivery import DeliveryPlanner, sanitize_style, strip_markdown
 from .graph import build_langgraph_or_linear
-from .models import InboundEnvelope, RuntimeConfig
+from .models import InboundEnvelope, InputBurst, OutboundBubble, RuntimeConfig
 from .providers import ProviderAdapter
 from .sessions import JsonSessionStore, StoredMessage
 from .soul import load_soul
 from .telegram import TelegramDeliverySink
+
+
+@dataclass(frozen=True)
+class RuntimeUtteranceReady:
+    event: UtteranceReady
+    bubble: OutboundBubble
+
+
+@dataclass(frozen=True)
+class RuntimeCompleted:
+    event: ConversationCompleted
+
+
+RuntimeEvent: TypeAlias = RuntimeUtteranceReady | RuntimeCompleted
 
 
 class PersonalAgentRuntime:
@@ -39,6 +55,52 @@ class PersonalAgentRuntime:
             {"text": bubble.text, "reply_to_message_id": bubble.reply_to_message_id}
             for bubble in bubbles
         ]
+
+    def handle_telegram_burst_iter(
+        self,
+        burst: InputBurst,
+        *,
+        is_active: Callable[[], bool] | None = None,
+    ) -> Iterator[RuntimeEvent]:
+        if burst.latest.connector != "telegram":
+            raise ValueError("runtime only supports telegram bursts")
+        is_active = is_active or (lambda: True)
+        self.telegram.start_typing(burst.latest.actor_id)
+        session = self.sessions.load(burst.latest.session_key)
+        session.accept_generations(burst.accepted_generation_ids)
+        for message in burst.messages:
+            session.append_inbound_once(message, burst.burst_id)
+        self.sessions.save_atomic(session)
+        if not is_active():
+            return
+
+        request = ConversationRequest(
+            burst=burst,
+            soul=load_soul(Path(self.config.soul_path)),
+            history=tuple(session.model_history_for_burst(burst.burst_id)),
+        )
+        conversation_events = self.conversation.respond_iter(request)
+        delivered: list[OutboundBubble] = []
+        while True:
+            if not is_active():
+                return
+            try:
+                event = next(conversation_events)
+            except StopIteration:
+                return
+            if not is_active():
+                return
+            if isinstance(event, ConversationStarted):
+                continue
+            if isinstance(event, UtteranceReady):
+                bubble = self._compose_progressive_bubble(event, burst.latest.message_id, bool(delivered))
+                delivered.append(bubble)
+                yield RuntimeUtteranceReady(event=event, bubble=bubble)
+                continue
+            if isinstance(event, ConversationCompleted):
+                self._persist_completed_burst(session, burst, event, delivered)
+                yield RuntimeCompleted(event=event)
+                return
 
     def _build_graph(self):
         return build_langgraph_or_linear(
@@ -100,3 +162,41 @@ class PersonalAgentRuntime:
         )
         self.sessions.save(session)
         return {"session": session}
+
+    def _compose_progressive_bubble(self, event: UtteranceReady, reply_to_message_id: str, has_prior_delivery: bool) -> OutboundBubble:
+        text = sanitize_style(strip_markdown(event.text))
+        if not text:
+            raise ValueError("utterance cannot be empty after delivery cleanup")
+        return OutboundBubble(text=text, reply_to_message_id=None if has_prior_delivery else reply_to_message_id)
+
+    def _persist_completed_burst(
+        self,
+        session,
+        burst: InputBurst,
+        event: ConversationCompleted,
+        delivered: list[OutboundBubble],
+    ) -> None:
+        result = event.result
+        logical_parts = (*burst.visible_assistant_utterances, *result.utterances)
+        session.append(
+            StoredMessage(
+                role="assistant",
+                content=" ".join(part.strip() for part in logical_parts if part.strip()),
+                metadata={
+                    "provider": self.provider.name,
+                    "generation_id": burst.generation_id,
+                    "generation_status": "provisional",
+                    "burst_id": burst.burst_id,
+                    "revision": burst.revision,
+                    "conversation": {
+                        "primary_move": result.plan.primary.value,
+                        "supporting_moves": [move.value for move in result.plan.supporting],
+                        "move_sequence": [move.value for move in result.plan.sequence],
+                        "response_goal": result.plan.response_goal,
+                        "confidence": result.plan.confidence.value,
+                    },
+                    "delivery_bubbles": [bubble.text for bubble in delivered],
+                },
+            )
+        )
+        self.sessions.save_atomic(session)

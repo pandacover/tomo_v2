@@ -1,6 +1,6 @@
 import unittest
 
-from tomo_core.conversation import ConversationEngine, ConversationMove, ConversationRequest
+from tomo_core.conversation import ConversationCompleted, ConversationEngine, ConversationMove, ConversationRequest, ConversationStarted, UtteranceReady
 from tomo_core.models import InboundEnvelope
 from tomo_core.providers import ProviderSetupRequired
 
@@ -69,6 +69,23 @@ class ConversationEngineTests(unittest.TestCase):
         self.assertEqual(result.plan.primary, ConversationMove.ANSWER)
         self.assertEqual(result.utterances, ("use /connect to connect supergrok oauth first.",))
         self.assertEqual(len(provider.calls), 1)
+
+    def test_respond_iter_yields_each_move_before_realizing_the_next(self):
+        provider = ScriptedProvider([
+            '{"primary_move":"answer","supporting_moves":["acknowledge"],"move_sequence":["acknowledge","answer"],"response_goal":"answer","confidence":"high"}',
+            '{"utterance":"got you."}',
+            '{"utterance":"the answer."}',
+        ])
+        iterator = ConversationEngine(provider).respond_iter(self.request())
+
+        self.assertIsInstance(next(iterator), ConversationStarted)
+        first = next(iterator)
+        self.assertEqual(first, UtteranceReady(0, ConversationMove.ACKNOWLEDGE, "got you."))
+        self.assertEqual(len(provider.calls), 2)
+        second = next(iterator)
+        self.assertEqual(second, UtteranceReady(1, ConversationMove.ANSWER, "the answer."))
+        self.assertIn("got you.", "\n".join(message["content"] for message in provider.calls[2][0]))
+        self.assertIsInstance(next(iterator), ConversationCompleted)
 
 
 if __name__ == "__main__":

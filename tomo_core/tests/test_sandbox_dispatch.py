@@ -2,13 +2,21 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from tomo_core.daytona_client import ExecResult, SandboxHandle
+from tomo_core.daytona_client import ExecResult, SandboxHandle, SessionCommandHandle
 from tomo_core.models import InboundEnvelope
+from tomo_core.onboarding_store import InterruptedGeneration, TelegramGenerationInput, TelegramGenerationWork
 from tomo_core.sandbox_dispatch import SandboxDispatch, SandboxDispatchError
 from tomo_core.sandbox_registry import SandboxRegistry
-from tomo_core.sandbox_protocol import RESULT_MARKER, encode_error, encode_result
+from tomo_core.sandbox_protocol import EVENT_MARKER, RESULT_MARKER, SandboxErrorEvent, encode_error, encode_event, encode_result
+from tomo_core.conversation.models import ConversationCompleted, ConversationMove, ConversationResult, MoveConfidence, MovePlan, UtteranceReady
 from tomo_core.models import OutboundBubble
 from tomo_core.onboarding_store import TelegramInstallation
+
+
+def completed_marker(request_id, generation_id, sequence, text, move=ConversationMove.ANSWER):
+    plan = MovePlan(move, (), move.value, MoveConfidence.HIGH, (move,))
+    completed = ConversationCompleted(ConversationResult(plan, (text,)))
+    return EVENT_MARKER + encode_event(request_id, generation_id, sequence, completed) + "\n"
 
 
 class SandboxDispatchTests(unittest.TestCase):
@@ -32,6 +40,25 @@ class SandboxDispatchTests(unittest.TestCase):
         )
         self.installation = TelegramInstallation("user", "tomo-a", "chat", "user", 0)
         self.inbound = InboundEnvelope(connector="telegram", actor_id="user", message_id="message", text="hello")
+
+    def _work(self):
+        return TelegramGenerationWork(
+            generation_id="burst:one/r1",
+            burst_id="burst:one",
+            chat_id="chat",
+            tomo_id="tomo-a",
+            revision=1,
+            session_id="persisted-session",
+            inputs=(
+                TelegramGenerationInput(
+                    update_id=42,
+                    ordinal=1,
+                    payload='{"update_id":42,"message":{"message_id":7,"date":10,"from":{"id":111},"chat":{"id":222,"type":"private"},"text":"hello"}}',
+                    message_id="7",
+                    telegram_sent_at=10.0,
+                ),
+            ),
+        )
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -70,6 +97,131 @@ class SandboxDispatchTests(unittest.TestCase):
         self.assertIn('"text":"hello"', env["TOMO_INBOUND_JSON"])
         self.assertNotIn("hello", command)
         self.assertEqual(self.daytona.exec.call_args.kwargs["timeout"], 120)
+
+    def test_iter_telegram_events_streams_v2_events_from_named_session(self):
+        work = self._work()
+        self.daytona.start_session_command.return_value = SessionCommandHandle("telegram-burst-one-r1", "cmd-1")
+        self.daytona.iter_session_logs.return_value = iter(
+            [
+                "log line\n",
+                EVENT_MARKER
+                + encode_event(
+                    "telegram-generation-burst-one-r1",
+                    "burst:one/r1",
+                    0,
+                    UtteranceReady(0, ConversationMove.ACKNOWLEDGE, "hello."),
+                )
+                + "\n",
+                completed_marker("telegram-generation-burst-one-r1", "burst:one/r1", 1, "hello.", ConversationMove.ACKNOWLEDGE),
+            ]
+        )
+        self.daytona.session_command_exit_code.return_value = 0
+
+        events = list(self.dispatch.iter_telegram_events(self.installation, work))
+
+        self.assertEqual(events[0].text, "hello.")
+        self.daytona.start_session_command.assert_called_once()
+        sandbox, session_id, command = self.daytona.start_session_command.call_args.args
+        self.assertEqual(sandbox.id, "sbx-1")
+        self.assertEqual(session_id, "persisted-session")
+        self.assertEqual(command, "/opt/tomo/.venv/bin/tomo-core sandbox-inbound")
+        env = self.daytona.start_session_command.call_args.kwargs["env"]
+        self.assertIn('"generation_id":"burst:one/r1"', env["TOMO_INBOUND_JSON"])
+        self.assertIn('"text":"hello"', env["TOMO_INBOUND_JSON"])
+        self.assertNotIn("hello", command)
+        self.daytona.iter_session_logs.assert_called_once_with(sandbox, SessionCommandHandle("telegram-burst-one-r1", "cmd-1"))
+        self.daytona.delete_session.assert_called_once_with(sandbox, "persisted-session")
+
+    def test_iter_telegram_events_preserves_photo_attachment_boundary(self):
+        work = TelegramGenerationWork(
+            generation_id="gen-photo",
+            burst_id="burst-photo",
+            chat_id="chat",
+            tomo_id="tomo-a",
+            revision=1,
+            session_id="photo-session",
+            inputs=(
+                TelegramGenerationInput(
+                    update_id=43,
+                    ordinal=1,
+                    payload='{"update_id":43,"message":{"message_id":8,"date":11,"from":{"id":111},"chat":{"id":222,"type":"private"},"caption":"look","photo":[{"file_id":"small","width":90,"height":90},{"file_id":"large","width":900,"height":900}]}}',
+                    message_id="8",
+                    telegram_sent_at=11.0,
+                ),
+            ),
+        )
+        self.daytona.start_session_command.return_value = SessionCommandHandle("photo-session", "photo-session")
+        self.daytona.iter_session_logs.return_value = iter(
+            [
+                EVENT_MARKER
+                + encode_event(
+                    "telegram-generation-gen-photo",
+                    "gen-photo",
+                    0,
+                    UtteranceReady(0, ConversationMove.ANSWER, "done."),
+                )
+                + "\n",
+                completed_marker("telegram-generation-gen-photo", "gen-photo", 1, "done."),
+            ]
+        )
+        self.daytona.session_command_exit_code.return_value = 0
+
+        list(self.dispatch.iter_telegram_events(self.installation, work))
+
+        env = self.daytona.start_session_command.call_args.kwargs["env"]
+        self.assertIn('"attachments":[{"kind":"image","file_id":"large"', env["TOMO_INBOUND_JSON"])
+        self.assertIn('"text":"look"', env["TOMO_INBOUND_JSON"])
+
+    def test_iter_telegram_events_rejects_wrong_generation_without_delivery(self):
+        work = self._work()
+        self.daytona.start_session_command.return_value = SessionCommandHandle("telegram-burst-one-r1", "cmd-1")
+        self.daytona.iter_session_logs.return_value = iter(
+            [
+                EVENT_MARKER
+                + encode_event(
+                    "telegram-generation-burst-one-r1",
+                    "other-generation",
+                    0,
+                    UtteranceReady(0, ConversationMove.ANSWER, "wrong."),
+                )
+                + "\n"
+            ]
+        )
+
+        with self.assertRaises(SandboxDispatchError) as raised:
+            list(self.dispatch.iter_telegram_events(self.installation, work))
+
+        self.assertEqual(raised.exception.code, "invalid_result")
+
+    def test_cancel_generation_deletes_only_the_process_session(self):
+        self.dispatch.cancel_generation(InterruptedGeneration("gen:1", "chat", "tomo-a", 1, "session-from-store"))
+
+        sandbox = self.daytona.get.return_value
+        self.supervisor.reconcile.assert_called_once_with("tomo-a")
+        self.daytona.get.assert_called_once_with("sbx-1")
+        self.daytona.delete_session.assert_called_once_with(sandbox, "session-from-store")
+        self.daytona.delete.assert_not_called()
+
+    def test_iter_telegram_events_refreshes_auth_once_before_visible_output_only(self):
+        work = self._work()
+        self.daytona.start_session_command.return_value = SessionCommandHandle("telegram-burst-one-r1", "cmd-1")
+        self.daytona.iter_session_logs.side_effect = [
+            iter([EVENT_MARKER + encode_event("telegram-generation-burst-one-r1", "burst:one/r1", 0, SandboxErrorEvent(0, "auth_expired")) + "\n"]),
+            iter(
+                [
+                    EVENT_MARKER + encode_event("telegram-generation-burst-one-r1", "burst:one/r1", 0, UtteranceReady(0, ConversationMove.ANSWER, "ok.")) + "\n",
+                    completed_marker("telegram-generation-burst-one-r1", "burst:one/r1", 1, "ok."),
+                ]
+            ),
+        ]
+        self.daytona.session_command_exit_code.return_value = 0
+
+        events = list(self.dispatch.iter_telegram_events(self.installation, work))
+
+        self.assertEqual(events[0].text, "ok.")
+        self.auth.access_token.assert_has_calls([unittest.mock.call(force_refresh=False), unittest.mock.call(force_refresh=True)])
+        self.assertEqual(self.daytona.start_session_command.call_count, 2)
+        self.assertEqual(self.daytona.delete_session.call_count, 2)
 
     def test_deliver_rejects_a_result_with_the_wrong_request_id(self):
         result = encode_result("other", [OutboundBubble("hello")])

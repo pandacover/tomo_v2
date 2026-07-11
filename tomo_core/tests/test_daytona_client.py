@@ -1,7 +1,10 @@
 import unittest
+import threading
 from unittest.mock import Mock
 
-from tomo_core.daytona_client import DaytonaClient, DaytonaClientError, SandboxHandle, VolumeHandle
+from daytona import SessionExecuteRequest
+
+from tomo_core.daytona_client import DaytonaClient, DaytonaClientError, SandboxHandle, SessionCommandHandle, VolumeHandle
 
 
 class DaytonaClientTests(unittest.TestCase):
@@ -78,9 +81,96 @@ class DaytonaClientTests(unittest.TestCase):
         self.assertEqual(raised.exception.operation, "exec")
         self.assertNotIn("sensitive-value", str(raised.exception))
 
+    def test_async_session_command_streams_logs_and_deletes_session_idempotently(self):
+        handle = self.client.get("agent")
+        pty = _FakePty([b"first", b"second"], exit_code=0)
+        self.sandbox.process.create_pty_session.return_value = pty
+
+        command = self.client.start_session_command(
+            handle,
+            "telegram-gen-1",
+            "/opt/tomo/.venv/bin/tomo-core sandbox-inbound",
+            env={"TOKEN": "safe"},
+            timeout=120,
+        )
+        chunks = list(self.client.iter_session_logs(handle, command))
+        exit_code = self.client.session_command_exit_code(handle, command)
+        self.client.delete_session(handle, "telegram-gen-1")
+        self.client.delete_session(handle, "telegram-gen-1")
+
+        self.assertEqual(command, SessionCommandHandle("telegram-gen-1", "telegram-gen-1"))
+        self.sandbox.process.create_pty_session.assert_called_once_with("telegram-gen-1", envs={"TOKEN": "safe"})
+        self.assertEqual(pty.sent, ["/opt/tomo/.venv/bin/tomo-core sandbox-inbound\nexit\n"])
+        self.assertEqual(chunks, ["first", "second"])
+        self.assertEqual(exit_code, 0)
+        self.sandbox.process.kill_pty_session.assert_called_once_with("telegram-gen-1")
+
+    def test_installed_sdk_session_request_silently_discards_environment(self):
+        request = SessionExecuteRequest(command="true", run_async=True, env={"TOKEN": "secret"})
+
+        self.assertFalse(hasattr(request, "env"))
+        self.assertNotIn("env", request.model_dump())
+
+    def test_session_adapter_errors_are_safe(self):
+        self.sandbox.process.create_pty_session.side_effect = RuntimeError("secret-token")
+
+        with self.assertRaises(DaytonaClientError) as raised:
+            self.client.start_session_command(
+                SandboxHandle(id="sandbox-123", name="agent"),
+                "telegram-gen-1",
+                "echo secret-token",
+                env={"TOKEN": "secret-token"},
+                timeout=120,
+            )
+
+        self.assertEqual(raised.exception.operation, "session_command")
+        self.assertNotIn("secret-token", str(raised.exception))
+
+    def test_session_connection_wait_is_bounded_and_cleans_up_session(self):
+        handle = self.client.get("agent")
+        pty = _HangingPty()
+        self.sandbox.process.create_pty_session.return_value = pty
+
+        with self.assertRaises(DaytonaClientError) as raised:
+            self.client.start_session_command(handle, "telegram-gen-1", "true", timeout=0.01)
+
+        self.assertEqual(raised.exception.operation, "session_command")
+        self.assertEqual(pty.sent, [])
+        self.assertTrue(pty.disconnected)
+        self.sandbox.process.kill_pty_session.assert_called_once_with("telegram-gen-1")
+
     def test_get_returns_safe_state_and_snapshot_without_exposing_the_sdk_sandbox(self):
         handle = self.client.get("agent")
 
         self.assertEqual(handle.state, "started")
         self.assertEqual(handle.snapshot, "python-base")
         self.assertNotIn("_sandbox", repr(handle))
+
+
+class _FakePty:
+    def __init__(self, chunks, *, exit_code):
+        self._chunks = chunks
+        self.exit_code = exit_code
+        self.sent = []
+        self.disconnected = False
+
+    def wait_for_connection(self):
+        return None
+
+    def send_input(self, data):
+        self.sent.append(data)
+
+    def __iter__(self):
+        return iter(self._chunks)
+
+    def disconnect(self):
+        self.disconnected = True
+
+
+class _HangingPty(_FakePty):
+    def __init__(self):
+        super().__init__([], exit_code=None)
+        self._release = threading.Event()
+
+    def wait_for_connection(self):
+        self._release.wait(timeout=5)

@@ -1,6 +1,6 @@
 import unittest
 
-from tomo_core.conversation import ConversationMove, ConversationRequest, ConversationResult, MoveConfidence, MovePlan
+from tomo_core.conversation import ConversationCompleted, ConversationMove, ConversationRequest, ConversationResult, ConversationStarted, MoveConfidence, MovePlan, UtteranceReady
 from tomo_core.models import InboundEnvelope, ResponseContract
 
 
@@ -26,16 +26,32 @@ class ConversationModelTests(unittest.TestCase):
             )
 
     def test_move_plan_requires_one_primary_and_at_most_two_unique_supporting_moves(self):
-        plan = MovePlan(ConversationMove.ANSWER, (ConversationMove.ACKNOWLEDGE, ConversationMove.EXPLORE), "give a verdict", MoveConfidence.HIGH)
-        self.assertEqual(plan.ordered_moves, (ConversationMove.ANSWER, ConversationMove.ACKNOWLEDGE, ConversationMove.EXPLORE))
+        plan = MovePlan(ConversationMove.ANSWER, (ConversationMove.ACKNOWLEDGE, ConversationMove.EXPLORE), "give a verdict", MoveConfidence.HIGH, (ConversationMove.ACKNOWLEDGE, ConversationMove.ANSWER, ConversationMove.EXPLORE))
+        self.assertEqual(plan.ordered_moves, (ConversationMove.ACKNOWLEDGE, ConversationMove.ANSWER, ConversationMove.EXPLORE))
         with self.assertRaises(ValueError):
             MovePlan(ConversationMove.ANSWER, (ConversationMove.ANSWER,), "duplicate", MoveConfidence.LOW)
         with self.assertRaises(ValueError):
             MovePlan(ConversationMove.ANSWER, (ConversationMove.ACKNOWLEDGE, ConversationMove.EXPLORE, ConversationMove.JOKE), "too many", MoveConfidence.LOW)
+        with self.assertRaises(ValueError):
+            MovePlan(ConversationMove.ANSWER, (ConversationMove.ACKNOWLEDGE,), "missing primary", MoveConfidence.LOW, (ConversationMove.ACKNOWLEDGE,))
         for invalid_goal in ("first line\nsecond line", "x" * 241, 42):
             with self.subTest(invalid_goal=invalid_goal):
                 with self.assertRaises(ValueError):
                     MovePlan(ConversationMove.ANSWER, (), invalid_goal, MoveConfidence.LOW)
+
+    def test_progressive_events_validate_user_visible_steps(self):
+        plan = MovePlan(ConversationMove.ANSWER, (ConversationMove.ACKNOWLEDGE,), "answer", MoveConfidence.HIGH, (ConversationMove.ACKNOWLEDGE, ConversationMove.ANSWER))
+        result = ConversationResult(plan, ("got you.", "the answer."))
+
+        self.assertEqual(ConversationStarted(plan).plan, plan)
+        self.assertEqual(UtteranceReady(0, ConversationMove.ACKNOWLEDGE, "got you.").text, "got you.")
+        self.assertEqual(ConversationCompleted(result).result, result)
+        with self.assertRaises(ValueError):
+            UtteranceReady(-1, ConversationMove.ANSWER, "bad")
+        with self.assertRaises(ValueError):
+            UtteranceReady(0, ConversationMove.ANSWER, " ")
+        with self.assertRaises(ValueError):
+            ConversationCompleted(None)
 
     def test_result_requires_one_to_four_non_empty_utterances(self):
         plan = MovePlan.direct_answer()

@@ -69,6 +69,14 @@ InboundEnvelope
   -> persist one logical turn + compact move metadata
 ```
 
+## progressive Telegram turns
+
+Telegram normal text uses an `InputBurst` rather than a flattened message. A burst contains ordered `msg_n` items with update IDs, Telegram message IDs, timestamps, and exact user text. The prompt renderer serializes those items as a deterministic user-role JSON payload, so text that looks like labels or JSON remains untrusted user content. Host-confirmed visible assistant partials are appended as assistant-role context, never interpolated into system text.
+
+`ConversationEngine.respond_iter()` emits typed user-facing events: `ConversationStarted`, one `UtteranceReady` per selected move in `move_sequence`, then `ConversationCompleted`. These are not token streams and do not expose hidden reasoning. The legacy `respond()` API remains a compatibility wrapper for callers that still expect one completed logical result.
+
+Railway keeps one logical assistant turn even when it sends multiple Telegram bubbles. SQLite tracks burst revisions, active generations, and delivery reservations. A newer normal message supersedes the active generation immediately; already visible bubbles remain in Telegram and become visible context for the replacement generation. Stale completions and stale sends are fenced by generation ID and revision.
+
 ## invariants
 
 1. every normal reply has exactly one primary conversational move.
@@ -81,3 +89,5 @@ InboundEnvelope
 8. malformed planning output falls back safely; malformed realization gets one repair attempt.
 9. no action is claimed without an observed result.
 10. conversation architecture does not own sessions, memory, transport, or tools.
+11. progressive events contain only validated outward utterances, never chain-of-thought or token deltas.
+12. `ResponseContract` remains the hard source of truth for the maximum of four utterances.

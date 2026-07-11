@@ -7,7 +7,8 @@ from ..delivery import split_sentences
 from ..models import ResponseContract
 from .models import ConversationMove, MoveConfidence, MovePlan
 
-_ALLOWED_MOVE_PLAN_KEYS = {"primary_move", "supporting_moves", "response_goal", "confidence"}
+_REQUIRED_MOVE_PLAN_KEYS = {"primary_move", "supporting_moves", "response_goal", "confidence"}
+_ALLOWED_MOVE_PLAN_KEYS = {*_REQUIRED_MOVE_PLAN_KEYS, "move_sequence"}
 _MARKDOWN_RE = re.compile(
     r"(?:^|\n)\s*(?:#{1,6}\s|>|[-*+]\s)|`|\[[^\]]+\]\([^)]+\)|\*\*[^*]+\*\*|(?<!\*)\*[^*\n]+\*(?!\*)"
 )
@@ -26,7 +27,7 @@ class ConversationOutputError(ValueError):
 def parse_move_plan(raw: str) -> MovePlan:
     try:
         payload = json.loads(raw)
-        if not isinstance(payload, dict) or set(payload) != _ALLOWED_MOVE_PLAN_KEYS:
+        if not isinstance(payload, dict) or set(payload) - _ALLOWED_MOVE_PLAN_KEYS or not _REQUIRED_MOVE_PLAN_KEYS <= set(payload):
             raise ValueError("invalid move plan keys")
         supporting = payload["supporting_moves"]
         if not isinstance(supporting, list):
@@ -39,6 +40,7 @@ def parse_move_plan(raw: str) -> MovePlan:
             supporting=tuple(ConversationMove(item) for item in supporting),
             response_goal=response_goal,
             confidence=MoveConfidence(payload["confidence"]),
+            sequence=tuple(ConversationMove(item) for item in payload.get("move_sequence", (payload["primary_move"], *supporting))),
         )
     except (TypeError, ValueError, KeyError, json.JSONDecodeError):
         return MovePlan.direct_answer()
@@ -67,3 +69,17 @@ def parse_utterances(raw: str, contract: ResponseContract | None = None) -> tupl
     if any(len(split_sentences(item)) > contract.max_sentences_per_utterance for item in cleaned):
         raise ConversationOutputError("sentence_limit")
     return cleaned
+
+
+def parse_utterance(raw: str, contract: ResponseContract | None = None) -> str:
+    contract = contract or ResponseContract()
+    try:
+        payload = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        raise ConversationOutputError("invalid_json") from None
+    if not isinstance(payload, dict) or set(payload) != {"utterance"}:
+        raise ConversationOutputError("invalid_shape")
+    utterance = payload["utterance"]
+    if not isinstance(utterance, str) or not utterance.strip():
+        raise ConversationOutputError("invalid_utterance")
+    return parse_utterances(json.dumps({"utterances": [utterance]}), contract)[0]

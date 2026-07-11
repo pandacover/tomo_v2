@@ -90,3 +90,137 @@ class TelegramOnboardingStoreTests(unittest.TestCase):
                 store.retry_update(update.update_id, "temporary_failure", now=now)
                 update = store.claim_next_update(now=now + 300)
                 self.assertIsNotNone(update)
+
+    def test_normal_messages_debounce_into_one_generation_and_delivery_is_fenced(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TelegramOnboardingStore(tmp)
+
+            first = store.enqueue_update(101, "chat-a", '{"text":"first"}', now=10.0, update_kind="message", message_id="m1", telegram_sent_at=9.0, tomo_id="tomo-1")
+            second = store.enqueue_update(102, "chat-a", '{"text":"second"}', now=10.4, update_kind="message", message_id="m2", telegram_sent_at=9.0, tomo_id="tomo-1")
+
+            self.assertTrue(first)
+            self.assertEqual(first.revision, 1)
+            self.assertEqual(second.revision, 2)
+            self.assertIsNone(store.claim_next_work(now=11.0))
+            work = store.claim_next_work(now=11.2)
+            self.assertEqual(work.chat_id, "chat-a")
+            self.assertEqual(work.revision, 2)
+            self.assertEqual([item.update_id for item in work.inputs], [101, 102])
+            self.assertEqual([item.ordinal for item in work.inputs], [1, 2])
+            self.assertTrue(store.reserve_delivery(work.generation_id, work.revision, 0, "answer", "hi", "m2", now=11.3))
+            self.assertTrue(store.mark_delivery_sent(work.generation_id, 0, "tg-1", now=11.4))
+            self.assertTrue(store.complete_generation(work.generation_id, work.revision, now=11.5))
+            self.assertFalse(store.reserve_delivery(work.generation_id, work.revision, 1, "answer", "late", None, now=11.6))
+
+    def test_later_message_supersedes_active_generation_and_recovery_reports_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TelegramOnboardingStore(tmp)
+            store.enqueue_update(101, "chat-a", "first", now=1.0, update_kind="message", message_id="m1", tomo_id="tomo-1")
+            work = store.claim_next_work(now=2.0)
+
+            result = store.enqueue_update(102, "chat-a", "second", now=2.1, update_kind="message", message_id="m2", tomo_id="tomo-1")
+
+            self.assertEqual(result.superseded_generation_id, work.generation_id)
+            self.assertEqual(result.superseded_session_id, work.session_id)
+            self.assertFalse(store.is_generation_active(work.generation_id, work.revision))
+            self.assertFalse(store.reserve_delivery(work.generation_id, work.revision, 0, "answer", "stale", "m1", now=2.2))
+            replacement = store.claim_next_work(now=3.0)
+            self.assertEqual(replacement.revision, 2)
+            self.assertEqual([item.update_id for item in replacement.inputs], [101, 102])
+            self.assertEqual([item.session_id for item in store.recover_interrupted_generations()], [replacement.session_id])
+
+    def test_normal_message_cannot_escape_debounce_through_legacy_queue(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TelegramOnboardingStore(tmp)
+            store.enqueue_update(
+                1,
+                "chat-a",
+                '{"update_id":1}',
+                now=10.0,
+                update_kind="message",
+                message_id="m1",
+                tomo_id="tomo-1",
+            )
+
+            self.assertIsNone(store.claim_next_work(now=10.1))
+            self.assertIsNone(store.claim_next_update(now=10.1))
+
+    def test_failed_generation_requeues_burst_with_a_new_attempt_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TelegramOnboardingStore(tmp)
+            store.enqueue_update(1, "chat-a", "first", now=0, update_kind="message", message_id="m1", tomo_id="tomo-1")
+            first = store.claim_next_work(now=1)
+
+            self.assertTrue(store.fail_generation(first.generation_id, "provider_failed", now=2))
+            replacement = store.claim_next_work(now=3)
+
+            self.assertIsNotNone(replacement)
+            self.assertEqual(replacement.revision, first.revision)
+            self.assertNotEqual(replacement.generation_id, first.generation_id)
+            self.assertEqual([item.update_id for item in replacement.inputs], [1])
+
+    def test_completed_generation_is_accepted_by_the_next_burst(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TelegramOnboardingStore(tmp)
+            store.enqueue_update(1, "chat-a", "first", now=0, update_kind="message", message_id="m1", tomo_id="tomo-1")
+            first = store.claim_next_work(now=1)
+            self.assertTrue(store.complete_generation(first.generation_id, first.revision, now=1.1))
+            store.enqueue_update(2, "chat-a", "second", now=2, update_kind="message", message_id="m2", tomo_id="tomo-1")
+
+            second = store.claim_next_work(now=3)
+
+            self.assertIn(first.generation_id, second.accepted_generation_ids)
+
+    def test_recovery_atomically_requeues_active_generation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TelegramOnboardingStore(tmp)
+            store.enqueue_update(1, "chat-a", "first", now=0, update_kind="message", message_id="m1", tomo_id="tomo-1")
+            first = store.claim_next_work(now=1)
+
+            interrupted = store.recover_interrupted_generations(now=2)
+            replacement = store.claim_next_work(now=2)
+
+            self.assertEqual(interrupted[0].generation_id, first.generation_id)
+            self.assertEqual(interrupted[0].tomo_id, "tomo-1")
+            self.assertIsNotNone(replacement)
+            self.assertNotEqual(replacement.generation_id, first.generation_id)
+
+    def test_recovery_converts_abandoned_reservation_to_unknown_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TelegramOnboardingStore(tmp)
+            store.enqueue_update(1, "chat-a", "first", now=0, update_kind="message", message_id="m1", tomo_id="tomo-1")
+            first = store.claim_next_work(now=1)
+            self.assertTrue(store.reserve_delivery(first.generation_id, first.revision, 0, "answer", "possibly visible", "m1", now=1.1))
+
+            store.recover_interrupted_generations(now=2)
+            replacement = store.claim_next_work(now=2)
+
+            self.assertEqual(replacement.visible_assistant_utterances, ("possibly visible",))
+            self.assertEqual(replacement.accepted_generation_ids, ())
+
+    def test_superseded_visible_partial_is_context_not_accepted_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TelegramOnboardingStore(tmp)
+            store.enqueue_update(1, "chat-a", "first", now=0, update_kind="message", message_id="m1", tomo_id="tomo-1")
+            first = store.claim_next_work(now=1)
+            self.assertTrue(store.reserve_delivery(first.generation_id, first.revision, 0, "answer", "visible only", "m1", now=1.1))
+            self.assertTrue(store.mark_delivery_sent(first.generation_id, 0, "tm1", now=1.2))
+            store.enqueue_update(2, "chat-a", "second", now=1.3, update_kind="message", message_id="m2", tomo_id="tomo-1")
+
+            replacement = store.claim_next_work(now=3)
+
+            self.assertEqual(replacement.visible_assistant_utterances, ("visible only",))
+            self.assertNotIn(first.generation_id, replacement.accepted_generation_ids)
+
+    def test_reserved_stale_delivery_can_be_marked_suppressed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TelegramOnboardingStore(tmp)
+            store.enqueue_update(1, "chat-a", "first", now=0, update_kind="message", message_id="m1", tomo_id="tomo-1")
+            first = store.claim_next_work(now=1)
+            self.assertTrue(store.reserve_delivery(first.generation_id, first.revision, 0, "answer", "stale", "m1", now=1.1))
+
+            self.assertTrue(store.fail_generation(first.generation_id, "superseded", now=1.2))
+            self.assertTrue(store.mark_delivery_suppressed(first.generation_id, 0, now=1.3))
+            replacement = store.claim_next_work(now=2)
+
+            self.assertEqual(replacement.visible_assistant_utterances, ())

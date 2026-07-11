@@ -20,6 +20,10 @@ what is included:
 - 1-4 intentional telegram utterances, each capped at three sentences
 - compact move metadata stored with one logical assistant turn
 - malformed realization receives one bounded repair attempt
+- ordered Telegram input bursts with a resettable debounce window
+- progressive user-facing utterance events from the sandbox, validated before send
+- SQLite generation and delivery fencing for interruptible Telegram turns
+- already-visible superseded bubbles become context for replacement generations
 - delivery planner that emits 1 to 4 plain-text bubbles
 - first bubble replies to the triggering telegram message
 - no tool execution message bubbles

@@ -10,7 +10,8 @@ import httpx
 from .models import OutboundBubble, RuntimeConfig
 from .providers import ProviderAdapter
 from .runtime import PersonalAgentRuntime
-from .sandbox_protocol import RESULT_MARKER, decode_inbound, encode_error, encode_result
+from .runtime import RuntimeCompleted, RuntimeUtteranceReady
+from .sandbox_protocol import EVENT_MARKER, SandboxErrorEvent, decode_inbound, encode_event
 
 
 class SandboxInboundError(RuntimeError):
@@ -46,34 +47,49 @@ def run_once(
     provider: ProviderAdapter,
     secret_values: tuple[str, ...] = (),
 ) -> int:
-    """Read one protocol envelope, run it locally, and emit exactly one result."""
+    """Read one protocol envelope, run it locally, and emit incremental v2 events."""
+    request_id = "unknown"
+    generation_id = "unknown"
+    sequence = 0
     try:
-        request_id, envelope = decode_inbound(stdin.read())
+        request_id, burst = decode_inbound(stdin.read())
+        generation_id = burst.generation_id
     except Exception as error:
-        _raise_failure(stdout, "invalid_request", error, secret_values, "unknown")
+        _raise_failure(stdout, "invalid_request", error, secret_values, request_id, generation_id)
 
     try:
         runtime = build_runtime(provider, config)
-        runtime.handle_telegram_text(envelope)
-        _write_payload(stdout, encode_result(request_id, runtime.telegram.bubbles))
+        for event in runtime.handle_telegram_burst_iter(burst):
+            _write_payload(stdout, encode_event(request_id, generation_id, sequence, event))
+            sequence += 1
+            if isinstance(event, RuntimeCompleted):
+                return 0
         return 0
     except httpx.HTTPStatusError as error:
         code = "auth_expired" if error.response.status_code == 401 else "provider_failed"
-        _raise_failure(stdout, code, error, secret_values, request_id)
+        _raise_failure(stdout, code, error, secret_values, request_id, generation_id, sequence)
     except Exception as error:
-        _raise_failure(stdout, "runtime_failed", error, secret_values, request_id)
+        _raise_failure(stdout, "runtime_failed", error, secret_values, request_id, generation_id, sequence)
 
 
 def emit_failure(stdout: TextIO, code: str, request_id: str = "unknown") -> None:
-    _write_payload(stdout, encode_error(request_id, code))
+    _write_payload(stdout, encode_event(request_id, "unknown", 0, SandboxErrorEvent(0, code)))
 
 
-def _raise_failure(stdout: TextIO, code: str, error: Exception, secret_values: tuple[str, ...], request_id: str) -> None:
+def _raise_failure(
+    stdout: TextIO,
+    code: str,
+    error: Exception,
+    secret_values: tuple[str, ...],
+    request_id: str,
+    generation_id: str,
+    sequence: int = 0,
+) -> None:
     # Never serialize or surface exception text: providers and HTTP libraries can include credentials.
-    emit_failure(stdout, code, request_id)
+    _write_payload(stdout, encode_event(request_id, generation_id, sequence, SandboxErrorEvent(sequence, code)))
     raise SandboxInboundError(code) from None
 
 
 def _write_payload(stdout: TextIO, payload: str) -> None:
-    stdout.write(f"{RESULT_MARKER}{payload}\n")
+    stdout.write(f"{EVENT_MARKER}{payload}\n")
     stdout.flush()

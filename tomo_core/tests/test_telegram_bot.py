@@ -1,12 +1,13 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from tomo_core import RuntimeConfig
 from tomo_core.providers import StaticProvider
 from tomo_core.runtime import PersonalAgentRuntime
-from tomo_core.telegram import TelegramDeliverySink
-from tomo_core.telegram_bot import TelegramPollingBot, envelope_from_update
+from tomo_core.telegram import TelegramDeliverySink, TelegramSendReceipt
+from tomo_core.telegram_bot import TelegramBotApiClient, TelegramPollingBot, envelope_from_update
 
 
 class FakeBotApiClient:
@@ -105,6 +106,21 @@ class TelegramBotTests(unittest.TestCase):
                 }
             )
         self.assertEqual(len(reported), 1)
+
+    def test_bot_api_send_message_returns_message_receipt(self):
+        class Response:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"ok": True, "result": {"message_id": 123}}
+
+        with patch("httpx.post", return_value=Response()) as post:
+            receipt = TelegramBotApiClient("token").send_message("chat", "hello", reply_to_message_id="7")
+
+        self.assertEqual(receipt, TelegramSendReceipt("123"))
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["reply_parameters"], {"message_id": 7})
 
 
 if __name__ == "__main__":
