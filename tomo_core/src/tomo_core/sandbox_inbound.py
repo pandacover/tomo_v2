@@ -11,8 +11,7 @@ import httpx
 
 from .models import OutboundBubble, RuntimeConfig
 from .providers import ProviderAdapter
-from .runtime import PersonalAgentRuntime
-from .runtime import RuntimeCompleted, RuntimeUtteranceReady
+from .runtime import PersonalAgentRuntime, RuntimeCompleted, RuntimeFrameReady
 from .sandbox_protocol import EVENT_MARKER, SandboxErrorEvent, SandboxTracebackFrame, decode_inbound, encode_event
 
 
@@ -55,7 +54,7 @@ def run_once(
     provider: ProviderAdapter,
     secret_values: tuple[str, ...] = (),
 ) -> int:
-    """Read one protocol envelope, run it locally, and emit incremental v2 events."""
+    """Read one protocol envelope, run it locally, and emit incremental v3 frames."""
     request_id = "unknown"
     generation_id = "unknown"
     sequence = 0
@@ -68,6 +67,8 @@ def run_once(
     try:
         runtime = build_runtime(provider, config)
         for event in runtime.handle_telegram_burst_iter(burst):
+            if not isinstance(event, (RuntimeFrameReady, RuntimeCompleted)):
+                raise TypeError("runtime emitted an unsupported sandbox event")
             _write_payload(stdout, encode_event(request_id, generation_id, sequence, event))
             sequence += 1
             if isinstance(event, RuntimeCompleted):

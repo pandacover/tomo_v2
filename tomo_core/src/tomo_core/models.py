@@ -130,11 +130,17 @@ class RuntimeConfig:
     max_bubbles: int = 4
     min_bubbles: int = 1
     max_sentences_per_bubble: int = 3
+    max_frames_per_segment: int = 3
+    max_chars_per_frame: int = 800
     data_dir: str = ".tomo_core"
     soul_path: str = "SOUL.md"
 
     def __post_init__(self) -> None:
         self.response_contract
+        if not isinstance(self.max_frames_per_segment, int) or isinstance(self.max_frames_per_segment, bool) or self.max_frames_per_segment < 1:
+            raise ValueError("max_frames_per_segment must be at least 1")
+        if not isinstance(self.max_chars_per_frame, int) or isinstance(self.max_chars_per_frame, bool) or not 1 <= self.max_chars_per_frame <= 4096:
+            raise ValueError("max_chars_per_frame must be between 1 and 4096")
 
     @property
     def response_contract(self) -> ResponseContract:
@@ -143,3 +149,15 @@ class RuntimeConfig:
             max_utterances=self.max_bubbles,
             max_sentences_per_utterance=self.max_sentences_per_bubble,
         )
+
+    @property
+    def ordinary_turn_budget(self):
+        from .conversation.models import TurnBudget
+
+        return TurnBudget(1, 0, 0, 1, self.max_frames_per_segment, self.max_sentences_per_bubble, self.max_chars_per_frame)
+
+    @property
+    def tool_turn_budget(self):
+        from .conversation.models import TurnBudget
+
+        return TurnBudget(6, 5, 5, 3, self.max_frames_per_segment, self.max_sentences_per_bubble, self.max_chars_per_frame)

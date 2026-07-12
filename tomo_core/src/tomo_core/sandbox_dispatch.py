@@ -12,7 +12,8 @@ from typing import Callable, Iterator, Protocol
 
 from .daytona_client import DaytonaClient, DaytonaClientError, SessionCommandHandle
 from .daytona_supervisor import DaytonaSupervisor
-from .models import InboundEnvelope, InboundMessage, InputBurst, MessageAttachment, OutboundBubble
+from .conversation import TurnBudget
+from .models import InboundEnvelope, InboundMessage, InputBurst, MessageAttachment, OutboundBubble, RuntimeConfig
 from .onboarding_store import InterruptedGeneration, TelegramGenerationInput, TelegramGenerationWork, TelegramInstallation
 from .sandbox_protocol import SandboxErrorEvent, SandboxEvent, SandboxProtocolError, encode_inbound, iter_event_markers, parse_result_marker
 
@@ -53,6 +54,7 @@ class SandboxDispatch:
         data_dir: str,
         xai_model: str,
         xai_reasoning_effort: str,
+        budget: TurnBudget | None = None,
     ) -> None:
         self.supervisor = supervisor
         self.client = client
@@ -60,6 +62,7 @@ class SandboxDispatch:
         self.data_dir = data_dir
         self.xai_model = xai_model
         self.xai_reasoning_effort = xai_reasoning_effort
+        self.budget = budget or RuntimeConfig().tool_turn_budget
 
     def ensure_worker(self, installation: TelegramInstallation) -> None:
         self.supervisor.reconcile(installation.tomo_id)
@@ -86,6 +89,9 @@ class SandboxDispatch:
     def iter_telegram_events(
         self, installation: TelegramInstallation, work: TelegramGenerationWork, is_active: Callable[[], bool] | None = None
     ) -> Iterator[SandboxEvent]:
+        is_active = is_active or (lambda: True)
+        if not is_active():
+            return
         record = self.supervisor.reconcile(installation.tomo_id)
         if not record.sandbox_id:
             raise SandboxDispatchError("sandbox_not_ready")
@@ -98,6 +104,8 @@ class SandboxDispatch:
         for attempt in range(2):
             command: SessionCommandHandle | None = None
             try:
+                if not is_active():
+                    return
                 token = self.auth_broker.access_token(force_refresh=force_refresh)
                 command = self.client.start_session_command(
                     sandbox,
@@ -118,7 +126,10 @@ class SandboxDispatch:
                     self.client.iter_session_logs(sandbox, command),
                     expected_request_id=request_id,
                     expected_generation_id=work.generation_id,
+                    budget=self.budget,
                 ):
+                    if not is_active():
+                        return
                     if isinstance(event, SandboxErrorEvent):
                         _logger.warning(
                             "sandbox runtime failure code=%s exception_class=%s traceback=%s",
@@ -131,6 +142,8 @@ class SandboxDispatch:
                             break
                         raise SandboxDispatchError(event.code)
                     yielded += 1
+                    if not is_active():
+                        return
                     yield event
                 else:
                     exit_code = self.client.session_command_exit_code(sandbox, command)

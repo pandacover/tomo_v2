@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import codecs
 import json
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Iterator, Protocol, TypeAlias
 
 import httpx
 
@@ -10,11 +11,53 @@ from .grok_auth import GrokAuthStore
 from .oauth import OAuthManager
 
 
+@dataclass(frozen=True)
+class ProviderTextDelta:
+    text: str
+
+
+@dataclass(frozen=True)
+class ProviderToolCallReady:
+    call_id: str
+    name: str
+    arguments_json: str
+
+    def __post_init__(self) -> None:
+        if not self.call_id.strip() or not self.name.strip():
+            raise ValueError("tool call id and name are required")
+
+
+@dataclass(frozen=True)
+class ProviderStreamCompleted:
+    finish_reason: str
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+    def __post_init__(self) -> None:
+        if not self.finish_reason.strip():
+            raise ValueError("finish reason is required")
+        for count in (self.input_tokens, self.output_tokens):
+            if count is not None and (isinstance(count, bool) or not isinstance(count, int) or count < 0):
+                raise ValueError("usage counts must be nonnegative integers")
+
+
+ProviderStreamEvent: TypeAlias = ProviderTextDelta | ProviderToolCallReady | ProviderStreamCompleted
+
+
 class ProviderAdapter(Protocol):
     name: str
     supports_images_in: bool
     supports_images_out: bool
     supports_tool_calls: bool
+
+    def stream(
+        self,
+        messages: list[dict[str, object]],
+        *,
+        tools: tuple[dict[str, object], ...] = (),
+        actor_id: str | None = None,
+    ) -> Iterator[ProviderStreamEvent]:
+        ...
 
     def complete(self, messages: list[dict[str, str]], actor_id: str | None = None) -> str:
         ...
@@ -27,7 +70,211 @@ class ProviderSetupRequired(RuntimeError):
 
 
 @dataclass
-class XaiApiProvider:
+class _ToolCallParts:
+    call_id: str | None = None
+    name: str | None = None
+    arguments: str = ""
+    received_arguments: bool = False
+
+
+def _stream_openai_compatible(
+    *,
+    base_url: str,
+    access_token: str,
+    model: str,
+    messages: list[dict[str, object]],
+    tools: tuple[dict[str, object], ...],
+    reasoning_effort: str | None,
+) -> Iterator[ProviderStreamEvent]:
+    request_body: dict[str, object] = {"model": model, "messages": messages, "stream": True}
+    if tools:
+        request_body["tools"] = list(tools)
+    if reasoning_effort:
+        request_body["reasoning_effort"] = reasoning_effort
+
+    tool_calls: dict[int, _ToolCallParts] = {}
+    tool_call_indices: dict[str, int] = {}
+    finish_reason: str | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    saw_done = False
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    buffer = ""
+
+    def parse_usage(payload: dict[str, object]) -> None:
+        nonlocal input_tokens, output_tokens
+        usage = payload.get("usage")
+        if usage is None:
+            return
+        if not isinstance(usage, dict):
+            raise ValueError("invalid stream usage")
+        prompt = usage.get("prompt_tokens")
+        completion = usage.get("completion_tokens")
+        for value in (prompt, completion):
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+                raise ValueError("invalid stream usage")
+        if prompt is not None:
+            if input_tokens is not None and input_tokens != prompt:
+                raise ValueError("conflicting stream usage")
+            input_tokens = prompt
+        if completion is not None:
+            if output_tokens is not None and output_tokens != completion:
+                raise ValueError("conflicting stream usage")
+            output_tokens = completion
+
+    def consume_data(data: str) -> Iterator[ProviderTextDelta]:
+        nonlocal finish_reason, saw_done
+        if data == "[DONE]":
+            if saw_done:
+                raise ValueError("duplicate stream completion")
+            saw_done = True
+            return
+        if saw_done:
+            raise ValueError("data after stream completion")
+        try:
+            payload = json.loads(data)
+        except json.JSONDecodeError as exc:
+            raise ValueError("malformed stream JSON") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("invalid stream payload")
+        parse_usage(payload)
+        choices = payload.get("choices")
+        if not isinstance(choices, list):
+            raise ValueError("missing stream choices")
+        if not choices:
+            return
+        if len(choices) != 1 or not isinstance(choices[0], dict):
+            raise ValueError("invalid stream choices")
+        choice = choices[0]
+        current_finish = choice.get("finish_reason")
+        if current_finish is not None:
+            if not isinstance(current_finish, str) or not current_finish.strip():
+                raise ValueError("invalid stream finish reason")
+            if finish_reason is not None:
+                raise ValueError("duplicate stream finish reason")
+            finish_reason = current_finish
+        elif finish_reason is not None:
+            raise ValueError("data after stream finish")
+        delta = choice.get("delta", {})
+        if not isinstance(delta, dict):
+            raise ValueError("invalid stream delta")
+        content = delta.get("content")
+        if content is not None:
+            if not isinstance(content, str):
+                raise ValueError("invalid stream content")
+            if content:
+                yield ProviderTextDelta(content)
+        native_calls = delta.get("tool_calls")
+        if native_calls is not None:
+            if not isinstance(native_calls, list):
+                raise ValueError("invalid stream tool calls")
+            for native_call in native_calls:
+                if not isinstance(native_call, dict):
+                    raise ValueError("invalid stream tool call")
+                index = native_call.get("index")
+                if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+                    raise ValueError("invalid stream tool call index")
+                parts = tool_calls.setdefault(index, _ToolCallParts())
+                call_id = native_call.get("id")
+                if call_id is not None:
+                    if not isinstance(call_id, str) or not call_id.strip() or (parts.call_id is not None and parts.call_id != call_id):
+                        raise ValueError("conflicting stream tool call id")
+                    existing_index = tool_call_indices.get(call_id)
+                    if existing_index is not None and existing_index != index:
+                        raise ValueError("conflicting stream tool call id")
+                    tool_call_indices[call_id] = index
+                    parts.call_id = call_id
+                function = native_call.get("function")
+                if function is not None:
+                    if not isinstance(function, dict):
+                        raise ValueError("invalid stream tool function")
+                    name = function.get("name")
+                    if name is not None:
+                        if not isinstance(name, str) or not name.strip() or (parts.name is not None and parts.name != name):
+                            raise ValueError("conflicting stream tool call name")
+                        parts.name = name
+                    if "arguments" in function:
+                        arguments = function["arguments"]
+                        if not isinstance(arguments, str):
+                            raise ValueError("invalid stream tool arguments")
+                        parts.arguments += arguments
+                        parts.received_arguments = True
+
+    def consume_sse_event(raw_event: str) -> Iterator[ProviderTextDelta]:
+        lines = raw_event.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        data_lines = [line[5:].lstrip(" ") for line in lines if line.startswith("data:")]
+        if not data_lines:
+            if any(line and not line.startswith((":", "event:", "id:", "retry:")) for line in lines):
+                raise ValueError("invalid SSE event")
+            return
+        yield from consume_data("\n".join(data_lines))
+
+    with httpx.stream(
+        "POST",
+        f"{base_url}/chat/completions",
+        headers={"Authorization": f"Bearer {access_token}"},
+        json=request_body,
+        timeout=60,
+    ) as response:
+        response.raise_for_status()
+        for chunk in response.iter_raw():
+            if not isinstance(chunk, bytes):
+                raise ValueError("invalid stream chunk")
+            buffer += decoder.decode(chunk)
+            while "\n\n" in buffer or "\r\n\r\n" in buffer:
+                separator = "\r\n\r\n" if "\r\n\r\n" in buffer and (
+                    "\n\n" not in buffer or buffer.index("\r\n\r\n") <= buffer.index("\n\n")) else "\n\n"
+                raw_event, buffer = buffer.split(separator, 1)
+                yield from consume_sse_event(raw_event)
+        buffer += decoder.decode(b"", final=True)
+        if buffer:
+            raise ValueError("incomplete SSE event")
+
+    if not saw_done or finish_reason is None:
+        raise ValueError("stream ended without terminal completion")
+    if tool_calls and finish_reason != "tool_calls":
+        raise ValueError("tool calls without tool finish")
+    if finish_reason == "tool_calls":
+        if not tool_calls:
+            raise ValueError("tool finish without tool calls")
+        for index in sorted(tool_calls):
+            parts = tool_calls[index]
+            if not parts.call_id or not parts.name or not parts.received_arguments:
+                raise ValueError("incomplete stream tool call")
+            yield ProviderToolCallReady(parts.call_id, parts.name, parts.arguments)
+    yield ProviderStreamCompleted(finish_reason, input_tokens, output_tokens)
+
+
+class _OpenAICompatibleProvider:
+    def _stream_with_token(
+        self,
+        access_token: str,
+        messages: list[dict[str, object]],
+        *,
+        tools: tuple[dict[str, object], ...] = (),
+    ) -> Iterator[ProviderStreamEvent]:
+        return _stream_openai_compatible(
+            base_url=self.base_url,
+            access_token=access_token,
+            model=self.model,
+            messages=messages,
+            tools=tools,
+            reasoning_effort=self.reasoning_effort,
+        )
+
+    # Compatibility collector for callers that have not migrated to streaming.
+    def complete(self, messages: list[dict[str, str]], actor_id: str | None = None) -> str:
+        text: list[str] = []
+        for event in self.stream(messages, actor_id=actor_id):
+            if isinstance(event, ProviderTextDelta):
+                text.append(event.text)
+            elif isinstance(event, ProviderToolCallReady):
+                raise ValueError("complete does not support tool calls")
+        return "".join(text)
+
+
+@dataclass
+class XaiApiProvider(_OpenAICompatibleProvider):
     api_key: str
     model: str = "grok-4.5"
     base_url: str = "https://api.x.ai/v1"
@@ -38,19 +285,8 @@ class XaiApiProvider:
     supports_images_out: bool = False
     supports_tool_calls: bool = True
 
-    def complete(self, messages: list[dict[str, str]], actor_id: str | None = None) -> str:
-        request_body = {"model": self.model, "messages": messages}
-        if self.reasoning_effort:
-            request_body["reasoning_effort"] = self.reasoning_effort
-        response = httpx.post(
-            f"{self.base_url}/chat/completions",
-            headers={"Authorization": f"Bearer {self.api_key}"},
-            json=request_body,
-            timeout=60,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        return payload["choices"][0]["message"]["content"]
+    def stream(self, messages: list[dict[str, object]], *, tools: tuple[dict[str, object], ...] = (), actor_id: str | None = None) -> Iterator[ProviderStreamEvent]:
+        return self._stream_with_token(self.api_key, messages, tools=tools)
 
 
 @dataclass
@@ -59,7 +295,7 @@ class SuperGrokTokenStore:
 
 
 @dataclass
-class SuperGrokOAuthProvider:
+class SuperGrokOAuthProvider(_OpenAICompatibleProvider):
     token_store: SuperGrokTokenStore
     model: str = "grok-4.5"
     base_url: str = "https://api.x.ai/v1"
@@ -70,20 +306,11 @@ class SuperGrokOAuthProvider:
     supports_images_out: bool = False
     supports_tool_calls: bool = True
 
-    def complete(self, messages: list[dict[str, str]], actor_id: str | None = None) -> str:
-        response = httpx.post(
-            f"{self.base_url}/chat/completions",
-            headers={"Authorization": f"Bearer {self.token_store.access_token}"},
-            json={"model": self.model, "messages": messages, "reasoning_effort": self.reasoning_effort},
-            timeout=60,
-        )
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"]
+    def stream(self, messages: list[dict[str, object]], *, tools: tuple[dict[str, object], ...] = (), actor_id: str | None = None) -> Iterator[ProviderStreamEvent]:
+        return self._stream_with_token(self.token_store.access_token, messages, tools=tools)
 
 
-def supergrok_oauth_provider_from_access_token(
-    access_token: str, *, model: str = "grok-4.5", reasoning_effort: str = "high"
-) -> SuperGrokOAuthProvider:
+def supergrok_oauth_provider_from_access_token(access_token: str, *, model: str = "grok-4.5", reasoning_effort: str = "high") -> SuperGrokOAuthProvider:
     """Build a fixed-token provider without retaining the token in repr output."""
     if not access_token:
         raise ValueError("SuperGrok access token is required")
@@ -102,7 +329,7 @@ class OAuthBackedSuperGrokProvider:
     supports_images_out: bool = False
     supports_tool_calls: bool = True
 
-    def complete(self, messages: list[dict[str, str]], actor_id: str | None = None) -> str:
+    def stream(self, messages: list[dict[str, object]], *, tools: tuple[dict[str, object], ...] = (), actor_id: str | None = None) -> Iterator[ProviderStreamEvent]:
         if not actor_id:
             raise ProviderSetupRequired("use /connect to connect supergrok oauth first.")
         token_path = self.oauth.token_path("supergrok", actor_id)
@@ -113,11 +340,11 @@ class OAuthBackedSuperGrokProvider:
         if not access_token:
             raise ProviderSetupRequired("use /connect to connect supergrok oauth first.")
         return SuperGrokOAuthProvider(
-            token_store=SuperGrokTokenStore(access_token=access_token),
-            model=self.model,
-            base_url=self.base_url,
-            reasoning_effort=self.reasoning_effort,
-        ).complete(messages, actor_id=actor_id)
+            token_store=SuperGrokTokenStore(access_token=access_token), model=self.model, base_url=self.base_url, reasoning_effort=self.reasoning_effort
+        ).stream(messages, tools=tools, actor_id=actor_id)
+
+    def complete(self, messages: list[dict[str, str]], actor_id: str | None = None) -> str:
+        return _collect_text(self.stream(messages, actor_id=actor_id))
 
 
 @dataclass
@@ -131,11 +358,24 @@ class GrokAuthProvider:
     supports_images_out: bool = False
     supports_tool_calls: bool = True
 
-    def complete(self, messages: list[dict[str, str]], actor_id: str | None = None) -> str:
+    def stream(self, messages: list[dict[str, object]], *, tools: tuple[dict[str, object], ...] = (), actor_id: str | None = None) -> Iterator[ProviderStreamEvent]:
         access_token = self.auth_store.access_token()
         if not access_token:
             raise ProviderSetupRequired("run grok login or grok login --device-auth first, then restart me.")
-        return XaiApiProvider(api_key=access_token, model=self.model, base_url=self.base_url).complete(messages, actor_id=actor_id)
+        return XaiApiProvider(api_key=access_token, model=self.model, base_url=self.base_url).stream(messages, tools=tools, actor_id=actor_id)
+
+    def complete(self, messages: list[dict[str, str]], actor_id: str | None = None) -> str:
+        return _collect_text(self.stream(messages, actor_id=actor_id))
+
+
+def _collect_text(events: Iterator[ProviderStreamEvent]) -> str:
+    text: list[str] = []
+    for event in events:
+        if isinstance(event, ProviderTextDelta):
+            text.append(event.text)
+        elif isinstance(event, ProviderToolCallReady):
+            raise ValueError("complete does not support tool calls")
+    return "".join(text)
 
 
 # Backcompat aliases for older tests/imports. New code should use XaiApiProvider
@@ -153,18 +393,31 @@ class StaticProvider:
     supports_images_out: bool = False
     supports_tool_calls: bool = False
 
+    def stream(self, messages: list[dict[str, object]], *, tools: tuple[dict[str, object], ...] = (), actor_id: str | None = None) -> Iterator[ProviderStreamEvent]:
+        if tools:
+            raise ValueError("static provider does not support tool calls")
+        system_text = "\n".join(message["content"] for message in messages if message.get("role") == "system" and isinstance(message.get("content"), str))
+        if "generate exactly one internal turn_plan JSONL record" in system_text:
+            plan = {
+                "type": "turn_plan",
+                "primary_move": "answer",
+                "supporting_moves": [],
+                "move_sequence": ["answer"],
+                "response_goal": "return the configured static smoke response",
+                "confidence": "high",
+            }
+            frame = {"type": "frame", "text": self.response}
+            yield ProviderTextDelta("\n".join(json.dumps(record, separators=(",", ":")) for record in (plan, frame)))
+        elif "do not emit a turn_plan record; reuse the fixed turn plan" in system_text:
+            yield ProviderTextDelta(json.dumps({"type": "frame", "text": self.response}, separators=(",", ":")))
+        else:
+            yield ProviderTextDelta(self.complete(messages, actor_id=actor_id))
+        yield ProviderStreamCompleted("stop")
+
     def complete(self, messages: list[dict[str, str]], actor_id: str | None = None) -> str:
         system_text = "\n".join(message["content"] for message in messages if message.get("role") == "system")
         if '"primary_move"' in system_text and '"supporting_moves"' in system_text:
-            return json.dumps(
-                {
-                    "primary_move": "answer",
-                    "supporting_moves": [],
-                    "move_sequence": ["answer"],
-                    "response_goal": "return the configured static smoke response",
-                    "confidence": "high",
-                }
-            )
+            return json.dumps({"primary_move": "answer", "supporting_moves": [], "move_sequence": ["answer"], "response_goal": "return the configured static smoke response", "confidence": "high"})
         if '"utterance"' in system_text:
             return json.dumps({"utterance": self.response})
         if '"utterances"' in system_text:

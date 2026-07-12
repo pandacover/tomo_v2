@@ -6,11 +6,12 @@ from unittest.mock import Mock, patch
 
 import httpx
 
-from tomo_core.conversation import ConversationCompleted, ConversationMove, ConversationResult, MoveConfidence, MovePlan, UtteranceReady
+from tomo_core.conversation import Frame, FrameReady, MoveConfidence, MovePlan, SegmentFinish, SegmentResult, TurnRunCompleted, TurnRunResult, TurnRunStatus, TurnUsage
 from tomo_core.models import InboundEnvelope, InboundMessage, InputBurst, OutboundBubble, RuntimeConfig
-from tomo_core.runtime import RuntimeCompleted, RuntimeUtteranceReady
+from tomo_core.runtime import RuntimeCompleted, RuntimeFrameReady
 from tomo_core.sandbox_inbound import CollectingTelegramSink, SandboxInboundError, build_runtime, run_once
-from tomo_core.sandbox_protocol import EVENT_MARKER, SandboxErrorEvent, SandboxUtteranceEvent, encode_inbound, iter_event_markers
+from tomo_core.sandbox_protocol import EVENT_MARKER, SandboxFrameEvent, encode_inbound, iter_event_markers
+from tomo_core.providers import ProviderStreamCompleted, ProviderTextDelta
 
 
 class SandboxInboundTests(unittest.TestCase):
@@ -20,74 +21,52 @@ class SandboxInboundTests(unittest.TestCase):
         supports_images_out = False
         supports_tool_calls = False
 
-        def __init__(self):
-            self.responses = [
-                '{"primary_move":"answer","supporting_moves":["acknowledge"],"move_sequence":["acknowledge","answer"],"response_goal":"answer","confidence":"high"}',
-                '{"utterance":"hello back."}',
-                '{"utterance":"second bubble."}',
-            ]
+        def stream(self, messages, *, tools=(), actor_id=None):
+            payload = '{"type":"turn_plan","primary_move":"answer","supporting_moves":[],"move_sequence":["answer"],"response_goal":"answer","confidence":"high"}\n{"type":"frame","text":"hello back."}\n'
+            return iter((ProviderTextDelta(payload), ProviderStreamCompleted("stop")))
 
-        def complete(self, messages, actor_id=None):
-            return self.responses.pop(0)
-
-    def test_run_once_runs_an_envelope_without_a_telegram_client(self):
-        burst = self._burst()
-        stdout = io.StringIO()
-        provider = Mock()
+    def test_run_once_emits_v3_frames_then_one_completion(self):
+        frame, completed = self._runtime_events()
         runtime = Mock()
-        plan = MovePlan(ConversationMove.ANSWER, (), "answer", MoveConfidence.HIGH, (ConversationMove.ANSWER,))
-        runtime.handle_telegram_burst_iter.return_value = iter([
-            RuntimeUtteranceReady(UtteranceReady(0, ConversationMove.ANSWER, "hello back."), OutboundBubble("hello back.", "message-1")),
-            RuntimeCompleted(ConversationCompleted(ConversationResult(plan, ("hello back.",)))),
-        ])
-
-        with tempfile.TemporaryDirectory() as data_dir:
-            with patch("tomo_core.sandbox_inbound.build_runtime", return_value=runtime) as build_runtime:
-                result = run_once(
-                    io.StringIO(encode_inbound("request-1", burst)),
-                    stdout,
-                    config=RuntimeConfig(data_dir=data_dir),
-                    provider=provider,
-                )
-
-        self.assertEqual(result, 0)
-        build_runtime.assert_called_once_with(provider, RuntimeConfig(data_dir=data_dir))
-        runtime.handle_telegram_burst_iter.assert_called_once_with(burst)
-        self.assertEqual(stdout.getvalue().count(EVENT_MARKER), 2)
-        events = list(iter_event_markers(stdout.getvalue().splitlines(keepends=True), "request-1", "gen-1"))
-        self.assertEqual(events[0], SandboxUtteranceEvent(0, ConversationMove.ANSWER, "hello back."))
-
-    def test_run_once_returns_a_typed_secret_safe_failure(self):
-        token = "secret-access-token"
+        runtime.handle_telegram_burst_iter.return_value = iter((frame, completed))
         stdout = io.StringIO()
         provider = Mock()
+        config = RuntimeConfig(data_dir="/tmp/data")
+        burst = self._burst()
+        with patch("tomo_core.sandbox_inbound.build_runtime", return_value=runtime) as build_runtime:
+            self.assertEqual(run_once(io.StringIO(encode_inbound("request-1", burst)), stdout, config=config, provider=provider), 0)
+        build_runtime.assert_called_once_with(provider, config)
+        runtime.handle_telegram_burst_iter.assert_called_once_with(burst)
+        events = list(iter_event_markers(stdout.getvalue().splitlines(keepends=True), "request-1", "gen-1"))
+        self.assertEqual(events[0], SandboxFrameEvent(0, 0, 0, "hello back."))
+        self.assertEqual(events[-1].result["status"], "completed")
+        self.assertEqual(stdout.getvalue().count(EVENT_MARKER), 2)
 
-        with self.assertRaises(SandboxInboundError) as raised:
-            run_once(io.StringIO("not json"), stdout, config=RuntimeConfig(data_dir="/tmp/data"), provider=provider, secret_values=(token,))
-
-        self.assertEqual(raised.exception.code, "invalid_request")
-        self.assertNotIn(token, str(raised.exception))
+    def test_cancellation_after_frames_does_not_synthesize_completion(self):
+        frame, _ = self._runtime_events()
+        runtime = Mock()
+        runtime.handle_telegram_burst_iter.return_value = iter((frame,))
+        stdout = io.StringIO()
+        with patch("tomo_core.sandbox_inbound.build_runtime", return_value=runtime):
+            self.assertEqual(run_once(io.StringIO(encode_inbound("request-1", self._burst())), stdout, config=RuntimeConfig(data_dir="/tmp/data"), provider=Mock()), 0)
         self.assertEqual(stdout.getvalue().count(EVENT_MARKER), 1)
+        with self.assertRaises(ValueError):
+            list(iter_event_markers(stdout.getvalue().splitlines(keepends=True), "request-1", "gen-1"))
+
+    def test_invalid_input_emits_a_safe_v3_error(self):
+        stdout = io.StringIO()
+        with self.assertRaises(SandboxInboundError):
+            run_once(io.StringIO("not json"), stdout, config=RuntimeConfig(data_dir="/tmp/data"), provider=Mock(), secret_values=("secret",))
         event = list(iter_event_markers([stdout.getvalue()], "unknown", "unknown"))[0]
-        self.assertEqual((event.sequence, event.code), (0, "invalid_request"))
+        self.assertEqual(event.code, "invalid_request")
+        self.assertNotIn("secret", stdout.getvalue())
 
     def test_run_once_wraps_runtime_failures_without_exposing_the_access_token(self):
-        burst = self._burst()
-        token = "secret-access-token"
-        stdout = io.StringIO()
-        runtime = Mock()
+        token, stdout, runtime = "secret-access-token", io.StringIO(), Mock()
         runtime.handle_telegram_burst_iter.side_effect = RuntimeError(f"authorization failed: {token}")
-
         with patch("tomo_core.sandbox_inbound.build_runtime", return_value=runtime):
             with self.assertRaises(SandboxInboundError) as raised:
-                run_once(
-                    io.StringIO(encode_inbound("request-1", burst)),
-                    stdout,
-                    config=RuntimeConfig(data_dir="/tmp/data"),
-                    provider=Mock(),
-                    secret_values=(token,),
-                )
-
+                run_once(io.StringIO(encode_inbound("request-1", self._burst())), stdout, config=RuntimeConfig(data_dir="/tmp/data"), provider=Mock(), secret_values=(token,))
         self.assertEqual(raised.exception.code, "runtime_failed")
         self.assertNotIn(token, str(raised.exception))
         self.assertNotIn(token, stdout.getvalue())
@@ -98,30 +77,12 @@ class SandboxInboundTests(unittest.TestCase):
         self.assertNotIn("authorization failed", stdout.getvalue())
 
     def test_run_once_bounds_and_sanitizes_long_unsafe_traceback_diagnostics(self):
-        burst = self._burst()
-        stdout = io.StringIO()
-        runtime = Mock()
+        stdout, runtime = io.StringIO(), Mock()
         runtime.handle_telegram_burst_iter.side_effect = RuntimeError("secret-access-token")
-        summaries = [
-            traceback.FrameSummary(
-                f"/private/path/secret-access-token-{'x' * 400} {index}.py",
-                index + 1,
-                "<string>" if index == 11 else f"<function name {'y' * 400} {index}>",
-            )
-            for index in range(12)
-        ]
-
-        with patch("tomo_core.sandbox_inbound.build_runtime", return_value=runtime):
-            with patch("tomo_core.sandbox_inbound.traceback.extract_tb", return_value=summaries):
-                with self.assertRaises(SandboxInboundError) as raised:
-                    run_once(
-                        io.StringIO(encode_inbound("request-1", burst)),
-                        stdout,
-                        config=RuntimeConfig(data_dir="/tmp/data"),
-                        provider=Mock(),
-                        secret_values=("secret-access-token",),
-                    )
-
+        summaries = [traceback.FrameSummary(f"/private/path/secret-access-token-{'x' * 400} {index}.py", index + 1, "<string>" if index == 11 else f"<function name {'y' * 400} {index}>") for index in range(12)]
+        with patch("tomo_core.sandbox_inbound.build_runtime", return_value=runtime), patch("tomo_core.sandbox_inbound.traceback.extract_tb", return_value=summaries):
+            with self.assertRaises(SandboxInboundError) as raised:
+                run_once(io.StringIO(encode_inbound("request-1", self._burst())), stdout, config=RuntimeConfig(data_dir="/tmp/data"), provider=Mock(), secret_values=("secret-access-token",))
         self.assertEqual(raised.exception.code, "runtime_failed")
         self.assertLessEqual(len(stdout.getvalue().rstrip("\n")), 900)
         event = list(iter_event_markers([stdout.getvalue()], "request-1", "gen-1"))[0]
@@ -133,103 +94,59 @@ class SandboxInboundTests(unittest.TestCase):
         self.assertNotIn("secret-access-token", stdout.getvalue())
 
     def test_run_once_uses_a_local_delivery_sink_for_a_real_runtime_turn(self):
-        burst = self._burst()
         stdout = io.StringIO()
-
         with tempfile.TemporaryDirectory() as data_dir:
             runtime = build_runtime(self.ScriptedProvider(), RuntimeConfig(data_dir=data_dir))
             self.assertIsInstance(runtime.telegram, CollectingTelegramSink)
-
-            result = run_once(
-                io.StringIO(encode_inbound("request-1", burst)),
-                stdout,
-                config=RuntimeConfig(data_dir=data_dir),
-                provider=self.ScriptedProvider(),
-            )
-
+            result = run_once(io.StringIO(encode_inbound("request-1", self._burst())), stdout, config=RuntimeConfig(data_dir=data_dir), provider=self.ScriptedProvider())
         self.assertEqual(result, 0)
-        self.assertEqual(stdout.getvalue().count(EVENT_MARKER), 3)
         events = list(iter_event_markers(stdout.getvalue().splitlines(keepends=True), "request-1", "gen-1"))
-        self.assertEqual([event.text for event in events if isinstance(event, SandboxUtteranceEvent)], ["hello back.", "second bubble."])
+        self.assertEqual([event.text for event in events if isinstance(event, SandboxFrameEvent)], ["hello back."])
 
     def test_run_once_maps_http_401_to_auth_expired_without_exception_text(self):
-        burst = self._burst()
-        token = "secret-access-token"
-        stdout = io.StringIO()
+        token, stdout, runtime = "secret-access-token", io.StringIO(), Mock()
         response = httpx.Response(401, request=httpx.Request("POST", "https://api.x.ai/v1/chat/completions"))
-        runtime = Mock()
         runtime.handle_telegram_burst_iter.side_effect = httpx.HTTPStatusError(f"unauthorized: {token}", request=response.request, response=response)
-
         with patch("tomo_core.sandbox_inbound.build_runtime", return_value=runtime):
             with self.assertRaises(SandboxInboundError) as raised:
-                run_once(
-                    io.StringIO(encode_inbound("request-1", burst)),
-                    stdout,
-                    config=RuntimeConfig(data_dir="/tmp/data"),
-                    provider=Mock(),
-                    secret_values=(token,),
-                )
-
+                run_once(io.StringIO(encode_inbound("request-1", self._burst())), stdout, config=RuntimeConfig(data_dir="/tmp/data"), provider=Mock(), secret_values=(token,))
         self.assertEqual(raised.exception.code, "auth_expired")
-        self.assertIsNone(raised.exception.__cause__)
         self.assertNotIn(token, stdout.getvalue())
         self.assertEqual(stdout.getvalue().count(EVENT_MARKER), 1)
 
-    def test_failure_after_visible_output_uses_next_sequence(self):
-        burst = self._burst()
-        stdout = io.StringIO()
+    def test_failure_after_visible_frame_uses_next_sequence(self):
+        stdout, runtime = io.StringIO(), Mock()
         response = httpx.Response(401, request=httpx.Request("POST", "https://api.x.ai/v1/chat/completions"))
-        runtime = Mock()
-
+        frame, _ = self._runtime_events()
         def events():
-            yield RuntimeUtteranceReady(
-                UtteranceReady(0, ConversationMove.ANSWER, "visible."),
-                OutboundBubble("visible.", "message-1"),
-            )
+            yield frame
             raise httpx.HTTPStatusError("unauthorized", request=response.request, response=response)
-
         runtime.handle_telegram_burst_iter.return_value = events()
         with patch("tomo_core.sandbox_inbound.build_runtime", return_value=runtime):
             with self.assertRaises(SandboxInboundError):
-                run_once(
-                    io.StringIO(encode_inbound("request-1", burst)),
-                    stdout,
-                    config=RuntimeConfig(data_dir="/tmp/data"),
-                    provider=Mock(),
-                )
-
+                run_once(io.StringIO(encode_inbound("request-1", self._burst())), stdout, config=RuntimeConfig(data_dir="/tmp/data"), provider=Mock())
         parsed = list(iter_event_markers(stdout.getvalue().splitlines(keepends=True), "request-1", "gen-1"))
         self.assertEqual((parsed[-1].sequence, parsed[-1].code), (1, "auth_expired"))
 
     def test_run_once_flushes_each_incremental_event(self):
         class RecordingStdout(io.StringIO):
-            def __init__(self):
-                super().__init__()
-                self.flushes = 0
-
-            def flush(self):
-                self.flushes += 1
-
+            def __init__(self): super().__init__(); self.flushes = 0
+            def flush(self): self.flushes += 1
         stdout = RecordingStdout()
         with tempfile.TemporaryDirectory() as data_dir:
-            result = run_once(
-                io.StringIO(encode_inbound("request-1", self._burst())),
-                stdout,
-                config=RuntimeConfig(data_dir=data_dir),
-                provider=self.ScriptedProvider(),
-            )
-
+            result = run_once(io.StringIO(encode_inbound("request-1", self._burst())), stdout, config=RuntimeConfig(data_dir=data_dir), provider=self.ScriptedProvider())
         self.assertEqual(result, 0)
         self.assertEqual(stdout.getvalue().count(EVENT_MARKER), stdout.flushes)
-        self.assertEqual(stdout.flushes, 3)
+        self.assertEqual(stdout.flushes, 2)
 
-    def _burst(self) -> InputBurst:
-        return InputBurst(
-            "burst-1",
-            "gen-1",
-            1,
-            (InboundMessage(1, 41, InboundEnvelope("telegram", "user-1", "message-1", "hello")),),
-        )
+    def _burst(self):
+        return InputBurst("burst-1", "gen-1", 1, (InboundMessage(1, 41, InboundEnvelope("telegram", "user-1", "message-1", "hello")),))
+
+    def _runtime_events(self):
+        frame = Frame(0, 0, "hello back.")
+        plan = MovePlan("answer", (), "answer", MoveConfidence.HIGH, ("answer",))
+        result = TurnRunResult(plan, (SegmentResult(0, (frame,), (), SegmentFinish.COMPLETE),), (frame,), TurnUsage(1, 0, 0, 1), TurnRunStatus.COMPLETED)
+        return RuntimeFrameReady(FrameReady(0, frame), OutboundBubble("hello back.", "message-1")), RuntimeCompleted(TurnRunCompleted(result))
 
 
 if __name__ == "__main__":

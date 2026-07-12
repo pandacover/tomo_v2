@@ -1,10 +1,187 @@
+import sqlite3
 import tempfile
 import unittest
+from pathlib import Path
 
 from tomo_core.onboarding_store import TelegramOnboardingStore
 
 
 class TelegramOnboardingStoreTests(unittest.TestCase):
+    def test_fresh_delivery_schema_supports_coordinate_rows_without_legacy_move(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TelegramOnboardingStore(tmp)
+            db = sqlite3.connect(Path(tmp) / "onboarding.sqlite")
+            try:
+                columns = {row[1]: row for row in db.execute("pragma table_info(telegram_delivery_events)")}
+                self.assertEqual(
+                    list(columns),
+                    [
+                        "generation_id",
+                        "sequence",
+                        "segment_index",
+                        "frame_index",
+                        "move",
+                        "text",
+                        "reply_to_message_id",
+                        "status",
+                        "telegram_message_id",
+                        "created_at",
+                        "updated_at",
+                    ],
+                )
+                self.assertEqual(columns["segment_index"][4], "0")
+                self.assertEqual(columns["frame_index"][4], "0")
+                self.assertEqual(columns["move"][3], 0)
+                db.execute(
+                    """
+                    insert into telegram_delivery_events(
+                      generation_id, sequence, segment_index, frame_index, move, text,
+                      reply_to_message_id, status, telegram_message_id, created_at, updated_at
+                    ) values ('g1', 0, 2, 3, null, 'frame', null, 'reserved', null, 1, 1)
+                    """
+                )
+                db.commit()
+            finally:
+                db.close()
+
+    def test_delivery_schema_migrates_legacy_rows_without_losing_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "onboarding.sqlite"
+            db = sqlite3.connect(db_path)
+            db.execute(
+                """
+                create table telegram_delivery_events(
+                  generation_id text not null,
+                  sequence integer not null,
+                  move text not null,
+                  text text not null,
+                  reply_to_message_id text,
+                  status text not null check(status in ('reserved','sent','unknown','suppressed')),
+                  telegram_message_id text,
+                  created_at real not null,
+                  updated_at real not null,
+                  primary key(generation_id, sequence)
+                )
+                """
+            )
+            db.execute(
+                """
+                insert into telegram_delivery_events values
+                ('old-generation', 4, 'answer', 'preserved text', 'reply-1', 'sent', 'telegram-1', 1.25, 2.5)
+                """
+            )
+            db.commit()
+            db.close()
+
+            TelegramOnboardingStore(tmp)
+            TelegramOnboardingStore(tmp)
+
+            db = sqlite3.connect(db_path)
+            try:
+                row = db.execute("select * from telegram_delivery_events where generation_id = 'old-generation'").fetchone()
+                self.assertEqual(row, ("old-generation", 4, 0, 4, "answer", "preserved text", "reply-1", "sent", "telegram-1", 1.25, 2.5))
+                db.execute(
+                    """
+                    insert into telegram_delivery_events(
+                      generation_id, sequence, segment_index, frame_index, move, text,
+                      reply_to_message_id, status, telegram_message_id, created_at, updated_at
+                    ) values ('v3-generation', 0, 0, 0, null, 'new frame', null, 'reserved', null, 3, 3)
+                    """
+                )
+                db.commit()
+            finally:
+                db.close()
+
+    def test_delivery_schema_migration_discards_stale_internal_replacement_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "onboarding.sqlite"
+            db = sqlite3.connect(db_path)
+            db.execute(
+                """
+                create table telegram_delivery_events(
+                  generation_id text not null,
+                  sequence integer not null,
+                  move text not null,
+                  text text not null,
+                  reply_to_message_id text,
+                  status text not null check(status in ('reserved','sent','unknown','suppressed')),
+                  telegram_message_id text,
+                  created_at real not null,
+                  updated_at real not null,
+                  primary key(generation_id, sequence)
+                )
+                """
+            )
+            db.execute("create table telegram_delivery_events_v3(stale text)")
+            db.commit()
+            db.close()
+
+            TelegramOnboardingStore(tmp)
+
+            db = sqlite3.connect(db_path)
+            try:
+                self.assertEqual(
+                    db.execute(
+                        "select name from sqlite_master where type = 'table' and name = 'telegram_delivery_events_v3'"
+                    ).fetchone(),
+                    None,
+                )
+            finally:
+                db.close()
+
+    def test_failed_delivery_schema_migration_preserves_legacy_table_and_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "onboarding.sqlite"
+            db = sqlite3.connect(db_path)
+            db.execute(
+                """
+                create table telegram_delivery_events(
+                  generation_id text not null,
+                  sequence integer not null,
+                  move text not null,
+                  text text not null,
+                  reply_to_message_id text,
+                  status text not null check(status in ('reserved','sent','unknown','suppressed')),
+                  telegram_message_id text,
+                  created_at real not null,
+                  updated_at real not null,
+                  primary key(generation_id, sequence)
+                )
+                """
+            )
+            db.execute(
+                """
+                insert into telegram_delivery_events values
+                ('old-generation', -1, 'answer', 'preserved text', 'reply-1', 'sent', 'telegram-1', 1.25, 2.5)
+                """
+            )
+            before_schema = db.execute(
+                "select sql from sqlite_master where type = 'table' and name = 'telegram_delivery_events'"
+            ).fetchone()[0]
+            before_row = db.execute("select * from telegram_delivery_events").fetchone()
+            db.commit()
+            db.close()
+
+            with self.assertRaises(sqlite3.IntegrityError):
+                TelegramOnboardingStore(tmp)
+
+            db = sqlite3.connect(db_path)
+            try:
+                self.assertEqual(
+                    db.execute(
+                        "select sql from sqlite_master where type = 'table' and name = 'telegram_delivery_events'"
+                    ).fetchone()[0],
+                    before_schema,
+                )
+                self.assertEqual(db.execute("select * from telegram_delivery_events").fetchone(), before_row)
+                self.assertIsNone(
+                    db.execute(
+                        "select name from sqlite_master where type = 'table' and name = 'telegram_delivery_events_v3'"
+                    ).fetchone()
+                )
+            finally:
+                db.close()
+
     def test_create_and_consume_single_use_token(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = TelegramOnboardingStore(tmp)
@@ -107,10 +284,31 @@ class TelegramOnboardingStoreTests(unittest.TestCase):
             self.assertEqual(work.revision, 2)
             self.assertEqual([item.update_id for item in work.inputs], [101, 102])
             self.assertEqual([item.ordinal for item in work.inputs], [1, 2])
-            self.assertTrue(store.reserve_delivery(work.generation_id, work.revision, 0, "answer", "hi", "m2", now=11.3))
+            self.assertTrue(store.reserve_delivery(work.generation_id, work.revision, 0, 0, 0, "hi", "m2", legacy_move="answer", now=11.3))
+            db = sqlite3.connect(store.db_path)
+            try:
+                self.assertEqual(
+                    db.execute(
+                        "select segment_index, frame_index, move, text from telegram_delivery_events"
+                    ).fetchone(),
+                    (0, 0, "answer", "hi"),
+                )
+            finally:
+                db.close()
             self.assertTrue(store.mark_delivery_sent(work.generation_id, 0, "tg-1", now=11.4))
             self.assertTrue(store.complete_generation(work.generation_id, work.revision, now=11.5))
-            self.assertFalse(store.reserve_delivery(work.generation_id, work.revision, 1, "answer", "late", None, now=11.6))
+            self.assertFalse(store.reserve_delivery(work.generation_id, work.revision, 1, 0, 1, "late", None, legacy_move="answer", now=11.6))
+
+    def test_reserve_delivery_rejects_blank_legacy_move_but_allows_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TelegramOnboardingStore(tmp)
+            store.enqueue_update(1, "chat-a", "first", now=0, update_kind="message", message_id="m1", tomo_id="tomo-1")
+            work = store.claim_next_work(now=1)
+
+            with self.assertRaises(ValueError):
+                store.reserve_delivery(work.generation_id, work.revision, 0, 0, 0, "frame", "m1", legacy_move="  ", now=1.1)
+
+            self.assertTrue(store.reserve_delivery(work.generation_id, work.revision, 0, 0, 0, "frame", "m1", now=1.1))
 
     def test_later_message_supersedes_active_generation_and_recovery_reports_session(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -123,7 +321,7 @@ class TelegramOnboardingStoreTests(unittest.TestCase):
             self.assertEqual(result.superseded_generation_id, work.generation_id)
             self.assertEqual(result.superseded_session_id, work.session_id)
             self.assertFalse(store.is_generation_active(work.generation_id, work.revision))
-            self.assertFalse(store.reserve_delivery(work.generation_id, work.revision, 0, "answer", "stale", "m1", now=2.2))
+            self.assertFalse(store.reserve_delivery(work.generation_id, work.revision, 0, 0, 0, "stale", "m1", legacy_move="answer", now=2.2))
             replacement = store.claim_next_work(now=3.0)
             self.assertEqual(replacement.revision, 2)
             self.assertEqual([item.update_id for item in replacement.inputs], [101, 102])
@@ -190,7 +388,7 @@ class TelegramOnboardingStoreTests(unittest.TestCase):
             store = TelegramOnboardingStore(tmp)
             store.enqueue_update(1, "chat-a", "first", now=0, update_kind="message", message_id="m1", tomo_id="tomo-1")
             first = store.claim_next_work(now=1)
-            self.assertTrue(store.reserve_delivery(first.generation_id, first.revision, 0, "answer", "possibly visible", "m1", now=1.1))
+            self.assertTrue(store.reserve_delivery(first.generation_id, first.revision, 0, 0, 0, "possibly visible", "m1", legacy_move="answer", now=1.1))
 
             store.recover_interrupted_generations(now=2)
             replacement = store.claim_next_work(now=2)
@@ -203,7 +401,7 @@ class TelegramOnboardingStoreTests(unittest.TestCase):
             store = TelegramOnboardingStore(tmp)
             store.enqueue_update(1, "chat-a", "first", now=0, update_kind="message", message_id="m1", tomo_id="tomo-1")
             first = store.claim_next_work(now=1)
-            self.assertTrue(store.reserve_delivery(first.generation_id, first.revision, 0, "answer", "visible only", "m1", now=1.1))
+            self.assertTrue(store.reserve_delivery(first.generation_id, first.revision, 0, 0, 0, "visible only", "m1", legacy_move="answer", now=1.1))
             self.assertTrue(store.mark_delivery_sent(first.generation_id, 0, "tm1", now=1.2))
             store.enqueue_update(2, "chat-a", "second", now=1.3, update_kind="message", message_id="m2", tomo_id="tomo-1")
 
@@ -217,7 +415,7 @@ class TelegramOnboardingStoreTests(unittest.TestCase):
             store = TelegramOnboardingStore(tmp)
             store.enqueue_update(1, "chat-a", "first", now=0, update_kind="message", message_id="m1", tomo_id="tomo-1")
             first = store.claim_next_work(now=1)
-            self.assertTrue(store.reserve_delivery(first.generation_id, first.revision, 0, "answer", "stale", "m1", now=1.1))
+            self.assertTrue(store.reserve_delivery(first.generation_id, first.revision, 0, 0, 0, "stale", "m1", legacy_move="answer", now=1.1))
 
             self.assertTrue(store.fail_generation(first.generation_id, "superseded", now=1.2))
             self.assertTrue(store.mark_delivery_suppressed(first.generation_id, 0, now=1.3))

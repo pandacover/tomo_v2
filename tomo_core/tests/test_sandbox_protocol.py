@@ -1,21 +1,35 @@
 import json
 import unittest
 
-from tomo_core.models import InboundEnvelope, OutboundBubble, ResponseContract
-from tomo_core.conversation import ConversationCompleted, ConversationMove, ConversationResult, MoveConfidence, MovePlan, UtteranceReady
-from tomo_core.models import InboundMessage, InputBurst
+from tomo_core.conversation import (
+    ConversationMove,
+    Frame,
+    FrameReady,
+    MoveConfidence,
+    MovePlan,
+    SegmentFinish,
+    SegmentResult,
+    ToolCall,
+    TurnBudget,
+    TurnRunCompleted,
+    TurnRunResult,
+    TurnRunStatus,
+    TurnUsage,
+)
+from tomo_core.models import InboundEnvelope, InboundMessage, InputBurst, OutboundBubble, ResponseContract
+from tomo_core.runtime import RuntimeCompleted, RuntimeFrameReady
 from tomo_core.sandbox_protocol import (
     EVENT_MARKER,
+    INBOUND_PROTOCOL_VERSION,
+    LEGACY_EVENT_PROTOCOL_VERSION,
     PROTOCOL_VERSION,
     RESULT_MARKER,
-    SandboxCompletedEvent,
     SandboxErrorEvent,
-    SandboxProtocolError,
+    SandboxFrameEvent,
     SandboxTracebackFrame,
-    SandboxUtteranceEvent,
     decode_inbound,
-    encode_event,
     encode_error,
+    encode_event,
     encode_inbound,
     encode_result,
     iter_event_markers,
@@ -24,234 +38,173 @@ from tomo_core.sandbox_protocol import (
 
 
 class SandboxProtocolTests(unittest.TestCase):
-    def test_v2_inbound_burst_and_events_round_trip(self):
-        burst = InputBurst(
-            burst_id="burst-1",
-            generation_id="gen-1",
-            revision=2,
-            visible_assistant_utterances=("already visible.",),
-            accepted_generation_ids=("gen-0",),
-            messages=(
-                InboundMessage(1, 41, InboundEnvelope("telegram", "user-1", "message-9", "hello")),
-                InboundMessage(2, 42, InboundEnvelope("telegram", "user-1", "message-10", "again")),
-            ),
-        )
+    def test_v2_inbound_and_v3_frame_completion_round_trip(self):
+        burst = self._burst()
+        inbound_payload = encode_inbound("request-7", burst)
+        self.assertEqual(json.loads(inbound_payload)["version"], 2)
+        self.assertEqual(INBOUND_PROTOCOL_VERSION, 2)
+        request_id, decoded = decode_inbound(inbound_payload)
+        self.assertEqual((request_id, decoded), ("request-7", burst))
 
-        request_id, decoded = decode_inbound(encode_inbound("request-7", burst))
+        frame, completed = self._events()
+        frame_payload = encode_event("request-7", "gen-1", 0, frame)
+        completed_payload = encode_event("request-7", "gen-1", 1, completed)
+        self.assertEqual(json.loads(frame_payload)["version"], 3)
+        self.assertEqual(json.loads(frame_payload)["type"], "frame")
+        self.assertEqual(json.loads(completed_payload)["result"]["segments"][0]["tool_call_count"], 1)
+        self.assertNotIn("call_id", completed_payload)
+        self.assertNotIn("arguments", completed_payload)
 
-        self.assertEqual(request_id, "request-7")
-        self.assertEqual(decoded, burst)
-
-        plan = MovePlan(ConversationMove.ANSWER, (), "answer", MoveConfidence.HIGH, (ConversationMove.ANSWER,))
-        chunks = [
-            "log line\n" + EVENT_MARKER + encode_event("request-7", "gen-1", 0, UtteranceReady(0, ConversationMove.ANSWER, "hello back."))[:25],
-            encode_event("request-7", "gen-1", 0, UtteranceReady(0, ConversationMove.ANSWER, "hello back."))[25:] + "\n",
-            EVENT_MARKER + encode_event("request-7", "gen-1", 1, ConversationCompleted(ConversationResult(plan, ("hello back.",)))) + "\n",
-        ]
-        events = list(iter_event_markers(chunks, "request-7", "gen-1"))
-        self.assertEqual(events[0], SandboxUtteranceEvent(0, ConversationMove.ANSWER, "hello back."))
-        self.assertIsInstance(events[1], SandboxCompletedEvent)
+        events = list(iter_event_markers([
+            "log\n" + EVENT_MARKER + frame_payload[:20],
+            frame_payload[20:] + "\n",
+            "\x1b[?2004h" + EVENT_MARKER + completed_payload + "\n",
+        ], "request-7", "gen-1"))
+        self.assertEqual(events[0], SandboxFrameEvent(0, 0, 0, "hello back."))
         self.assertEqual(events[1].result["logical_text"], "hello back.")
 
-    def test_v2_event_stream_accepts_ansi_pty_prefix_but_ignores_echoed_marker_text(self):
-        utterance = encode_event("request-7", "gen-1", 0, UtteranceReady(0, ConversationMove.ANSWER, "hello back."))
-        plan = MovePlan(ConversationMove.ANSWER, (), "answer", MoveConfidence.HIGH, (ConversationMove.ANSWER,))
-        completed = encode_event("request-7", "gen-1", 1, ConversationCompleted(ConversationResult(plan, ("hello back.",))))
-
-        events = list(
-            iter_event_markers(
-                [
-                    "echo " + EVENT_MARKER + utterance + "\n",
-                    "\x1b[?2004h" + EVENT_MARKER + utterance + "\n",
-                    EVENT_MARKER + completed + "\n",
-                ],
-                "request-7",
-                "gen-1",
-            )
-        )
-
-        self.assertEqual(events[0], SandboxUtteranceEvent(0, ConversationMove.ANSWER, "hello back."))
-        self.assertIsInstance(events[1], SandboxCompletedEvent)
-
-    def test_v2_event_stream_rejects_protocol_violations(self):
-        first = encode_event("request-7", "gen-1", 0, UtteranceReady(0, ConversationMove.ANSWER, "ok."))
-        conflicting = json.loads(first)
-        conflicting["text"] = "different."
-
-        cases = [
-            [EVENT_MARKER + encode_event("request-7", "gen-1", 1, UtteranceReady(1, ConversationMove.ANSWER, "gap."))],
-            [EVENT_MARKER + first + "\n" + EVENT_MARKER + json.dumps(conflicting, separators=(",", ":"))],
-            [EVENT_MARKER + first.replace('"request-7"', '"other"')],
-            [EVENT_MARKER + first.replace('"gen-1"', '"gen-2"')],
-            [EVENT_MARKER + first.replace('"answer"', '"fake"')],
-            [EVENT_MARKER + first.replace('"ok."', '"' + ("x" * 4097) + '"')],
+    def test_v2_and_v3_inbound_and_v2_event_fixtures_remain_readable(self):
+        burst = self._burst()
+        inbound = json.loads(encode_inbound("request-7", burst))
+        for version in (LEGACY_EVENT_PROTOCOL_VERSION, PROTOCOL_VERSION):
+            with self.subTest(version=version):
+                inbound["version"] = version
+                self.assertEqual(decode_inbound(json.dumps(inbound)), ("request-7", burst))
+        events = [
+            {"version": 2, "request_id": "request-7", "generation_id": "gen-1", "sequence": 0, "type": "utterance", "move": "answer", "text": "hello back."},
+            {"version": 2, "request_id": "request-7", "generation_id": "gen-1", "sequence": 1, "type": "completed", "result": {"logical_text": "hello back.", "utterances": ["hello back."], "plan": {"primary_move": "answer", "supporting_moves": [], "move_sequence": ["answer"], "response_goal": "answer", "confidence": "high"}}},
         ]
-        for chunks in cases:
-            with self.subTest(chunks=chunks), self.assertRaises(ValueError):
-                list(iter_event_markers(chunks, "request-7", "gen-1"))
+        parsed = list(iter_event_markers([EVENT_MARKER + json.dumps(event) + "\n" for event in events], "request-7", "gen-1"))
+        self.assertEqual(parsed[0], SandboxFrameEvent(0, 0, 0, "hello back.", ConversationMove.ANSWER))
 
-    def test_v2_event_stream_enforces_response_contract_and_completion_reconciliation(self):
-        plan = MovePlan(
-            ConversationMove.ANSWER,
-            (ConversationMove.EXPLORE,),
-            "answer then explore",
-            MoveConfidence.HIGH,
-            (ConversationMove.ANSWER, ConversationMove.EXPLORE),
-        )
+    def test_v3_encoder_rejects_unsupported_objects(self):
+        for event in (object(), {"type": "frame"}):
+            with self.subTest(event=event), self.assertRaises(TypeError):
+                encode_event("request-7", "gen-1", 0, event)
+
+    def test_v2_events_retain_response_contract_validation(self):
         contract = ResponseContract(max_utterances=2, max_sentences_per_utterance=1)
-        valid = [
-            EVENT_MARKER + encode_event("request-7", "gen-1", 0, UtteranceReady(0, ConversationMove.ANSWER, "one.")) + "\n",
-            EVENT_MARKER + encode_event("request-7", "gen-1", 1, UtteranceReady(1, ConversationMove.EXPLORE, "two?")) + "\n",
-            EVENT_MARKER + encode_event("request-7", "gen-1", 2, ConversationCompleted(ConversationResult(plan, ("one.", "two?")))) + "\n",
-        ]
+        plan = {"primary_move": "answer", "supporting_moves": [], "move_sequence": ["answer"], "response_goal": "answer", "confidence": "high"}
+        cases = (
+            [{"version": 2, "request_id": "request-7", "generation_id": "gen-1", "sequence": 0, "type": "utterance", "move": "answer", "text": "One. Two."}],
+            [
+                {"version": 2, "request_id": "request-7", "generation_id": "gen-1", "sequence": 0, "type": "utterance", "move": "answer", "text": "One."},
+                {"version": 2, "request_id": "request-7", "generation_id": "gen-1", "sequence": 1, "type": "completed", "result": {"logical_text": "One. Two. Three.", "utterances": ["One.", "Two.", "Three."], "plan": plan}},
+            ],
+        )
 
-        events = list(iter_event_markers(valid, "request-7", "gen-1", contract))
+        for messages in cases:
+            with self.subTest(messages=messages), self.assertRaises(ValueError):
+                list(iter_event_markers([EVENT_MARKER + json.dumps(message) + "\n" for message in messages], "request-7", "gen-1", contract))
 
-        self.assertEqual([event.sequence for event in events], [0, 1, 2])
-
-        too_many = valid[:2] + [
-            EVENT_MARKER + encode_event("request-7", "gen-1", 2, UtteranceReady(2, ConversationMove.ANSWER, "three.")) + "\n"
-        ]
-        sentence_limit = [
-            EVENT_MARKER + encode_event("request-7", "gen-1", 0, UtteranceReady(0, ConversationMove.ANSWER, "one. two.")) + "\n"
-        ]
-        mismatched_text = valid[:2] + [
-            EVENT_MARKER + encode_event("request-7", "gen-1", 2, ConversationCompleted(ConversationResult(plan, ("one.", "changed.")))) + "\n"
-        ]
-        mismatched_moves = valid[:2] + [
-            EVENT_MARKER
-            + encode_event(
-                "request-7",
-                "gen-1",
-                2,
-                ConversationCompleted(ConversationResult(MovePlan(ConversationMove.EXPLORE, (ConversationMove.ANSWER,), "wrong", MoveConfidence.HIGH, (ConversationMove.EXPLORE, ConversationMove.ANSWER)), ("one.", "two?"))),
-            )
-            + "\n"
-        ]
-        smuggled_without_stream = [
-            EVENT_MARKER + encode_event("request-7", "gen-1", 0, ConversationCompleted(ConversationResult(plan, ("one.",)))) + "\n"
-        ]
-        for chunks in (too_many, sentence_limit, mismatched_text, mismatched_moves, smuggled_without_stream):
-            with self.subTest(chunks=chunks), self.assertRaises(ValueError):
-                list(iter_event_markers(chunks, "request-7", "gen-1", contract))
-
-    def test_completed_event_validates_exact_plan_and_logical_text(self):
-        valid = json.loads(encode_event("request-7", "gen-1", 0, ConversationCompleted(ConversationResult(MovePlan(ConversationMove.ANSWER, (), "answer", MoveConfidence.HIGH, (ConversationMove.ANSWER,)), ("one.",)))))
+    def test_rejects_mixed_versions_coordinates_sizes_and_terminal_violations(self):
+        frame, completed = self._events()
+        valid = json.loads(encode_event("request-7", "gen-1", 0, frame))
+        terminal = encode_event("request-7", "gen-1", 1, completed)
         cases = []
-        logical = json.loads(json.dumps(valid))
-        logical["result"]["logical_text"] = "one. "
-        cases.append(logical)
-        duplicate_support = json.loads(json.dumps(valid))
-        duplicate_support["result"]["plan"]["supporting_moves"] = ["answer"]
-        cases.append(duplicate_support)
-        missing_primary = json.loads(json.dumps(valid))
-        missing_primary["result"]["plan"]["primary_move"] = "explore"
-        cases.append(missing_primary)
-        too_many_supporting = json.loads(json.dumps(valid))
-        too_many_supporting["result"]["plan"]["supporting_moves"] = ["explore", "clarify", "repair"]
-        too_many_supporting["result"]["plan"]["move_sequence"] = ["answer", "explore", "clarify", "repair"]
-        cases.append(too_many_supporting)
+        mixed = [valid, json.loads(terminal)]
+        mixed[1]["version"] = 2
+        cases.append(mixed)
+        for key, value in (("sequence", -1), ("segment_index", -1), ("frame_index", 1), ("text", "x" * 801), ("text", "one. two. three. four.")):
+            malformed = dict(valid)
+            malformed[key] = value
+            cases.append([malformed])
+        gap = dict(valid)
+        gap["sequence"] = 1
+        cases.append([gap])
+        conflict = dict(valid)
+        conflict["text"] = "other."
+        cases.append([valid, conflict])
+        post_terminal = [valid, json.loads(terminal), dict(valid, sequence=2)]
+        cases.append(post_terminal)
+        for messages in cases:
+            with self.subTest(messages=messages), self.assertRaises(ValueError):
+                list(iter_event_markers([EVENT_MARKER + json.dumps(message) + "\n" for message in messages], "request-7", "gen-1"))
 
-        for message in cases:
-            with self.subTest(message=message), self.assertRaises(ValueError):
-                list(iter_event_markers([EVENT_MARKER + json.dumps(message, separators=(",", ":"))], "request-7", "gen-1"))
+    def test_rejects_noncontiguous_frames_and_smuggled_completion_fields(self):
+        frame, completed = self._events()
+        first = json.loads(encode_event("request-7", "gen-1", 0, frame))
+        second = dict(first, sequence=1, frame_index=2)
+        result = json.loads(encode_event("request-7", "gen-1", 1, completed))
+        result["result"]["segments"][0]["tool_calls"] = [{"arguments": {"secret": "no"}}]
+        for messages in ([first, second], [first, result]):
+            with self.subTest(messages=messages), self.assertRaises(ValueError):
+                list(iter_event_markers([EVENT_MARKER + json.dumps(message) + "\n" for message in messages], "request-7", "gen-1"))
 
-    def test_v2_event_stream_requires_a_terminal_event(self):
-        utterance = encode_event(
-            "request-7",
-            "gen-1",
-            0,
-            UtteranceReady(0, ConversationMove.ANSWER, "unfinished."),
-        )
+    def test_requires_exact_completion_reconciliation_and_safe_error_diagnostics(self):
+        frame, completed = self._events()
+        streamed = json.loads(encode_event("request-7", "gen-1", 0, frame))
+        terminal = json.loads(encode_event("request-7", "gen-1", 1, completed))
+        terminal["result"]["frames"][0]["text"] = "changed."
+        terminal["result"]["logical_text"] = "changed."
+        with self.assertRaises(ValueError):
+            list(iter_event_markers([EVENT_MARKER + json.dumps(streamed), EVENT_MARKER + json.dumps(terminal)], "request-7", "gen-1"))
+
+        encoded = encode_event("request-7", "gen-1", 0, SandboxErrorEvent(0, "runtime_failed", "RuntimeError", (SandboxTracebackFrame("run.py", "run", 1),)))
+        self.assertEqual(list(iter_event_markers([EVENT_MARKER + encoded], "request-7", "gen-1"))[0].exception_class, "RuntimeError")
+        unsafe = json.loads(encoded)
+        unsafe["error"]["message"] = "secret exception text"
+        with self.assertRaises(ValueError):
+            list(iter_event_markers([EVENT_MARKER + json.dumps(unsafe)], "request-7", "gen-1"))
+
+    def test_v3_reuses_strict_frame_validation_and_rejects_unsafe_error_codes(self):
+        frame, _ = self._events()
+        payload = json.loads(encode_event("request-7", "gen-1", 0, frame))
+        for text in ("- list item", "Primary move: answer.", "first line\nsecond line", "has an em — dash"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                list(iter_event_markers([EVENT_MARKER + json.dumps(dict(payload, text=text))], "request-7", "gen-1"))
+        for code in ("RuntimeError: secret", "safe-code", "UPPERCASE"):
+            with self.subTest(code=code), self.assertRaises(ValueError):
+                encode_event("request-7", "gen-1", 0, SandboxErrorEvent(0, code))
+
+    def test_v3_rejects_more_than_three_reconciled_frames(self):
+        frame, completed = self._events()
+        stream = [json.loads(encode_event("request-7", "gen-1", index, RuntimeFrameReady(FrameReady(index, Frame(0, index, f"Frame {index}.")), OutboundBubble(f"Frame {index}.")))) for index in range(3)]
+        fourth = dict(stream[-1], sequence=3, frame_index=3, text="Fourth.")
 
         with self.assertRaises(ValueError):
-            list(iter_event_markers([EVENT_MARKER + utterance], "request-7", "gen-1"))
+            list(iter_event_markers([EVENT_MARKER + json.dumps(message) + "\n" for message in [*stream, fourth]], "request-7", "gen-1"))
 
-        first = encode_event("request-7", "gen-1", 0, UtteranceReady(0, ConversationMove.ANSWER, "ok."))
-        error = encode_event("request-7", "gen-1", 0, SandboxErrorEvent(0, "auth_expired"))
-        self.assertEqual(list(iter_event_markers([EVENT_MARKER + error], "request-7", "gen-1")), [SandboxErrorEvent(0, "auth_expired")])
+    def test_v3_validates_segment_and_visible_budgets_before_yielding_frames(self):
+        frame, _ = self._events()
+        payload = json.loads(encode_event("request-7", "gen-1", 0, frame))
+        oversized = dict(payload, segment_index=99)
+        events = iter_event_markers([EVENT_MARKER + json.dumps(oversized) + "\n"], "request-7", "gen-1")
         with self.assertRaises(ValueError):
-            list(iter_event_markers([EVENT_MARKER + error + "\n" + EVENT_MARKER + first], "request-7", "gen-1"))
+            next(events)
 
-    def test_error_event_round_trips_safe_diagnostics_and_accepts_legacy_shape(self):
-        diagnostic = SandboxErrorEvent(
-            0,
-            "runtime_failed",
-            exception_class="RuntimeError",
-            traceback=(SandboxTracebackFrame("runtime.py", "handle_turn", 42),),
-        )
-        encoded = encode_event("request-7", "gen-1", 0, diagnostic)
+        at_segment_two = dict(payload, segment_index=2)
+        terminal = {"version": 3, "request_id": "request-7", "generation_id": "gen-1", "sequence": 1, "type": "error", "error": {"code": "runtime_failed"}}
+        parsed = list(iter_event_markers([EVENT_MARKER + json.dumps(at_segment_two) + "\n", EVENT_MARKER + json.dumps(terminal) + "\n"], "request-7", "gen-1"))
+        self.assertEqual(parsed[0], SandboxFrameEvent(0, 2, 0, "hello back."))
 
-        self.assertEqual(
-            list(iter_event_markers([EVENT_MARKER + encoded], "request-7", "gen-1")),
-            [diagnostic],
-        )
-        legacy = json.loads(encoded)
-        legacy["error"] = {"code": "runtime_failed"}
-        self.assertEqual(
-            list(iter_event_markers([EVENT_MARKER + json.dumps(legacy)], "request-7", "gen-1")),
-            [SandboxErrorEvent(0, "runtime_failed")],
-        )
+    def test_accepts_partial_completion_and_safe_errors(self):
+        frame = Frame(0, 0, "partial.")
+        plan = MovePlan(ConversationMove.ANSWER, (), "answer", MoveConfidence.HIGH, (ConversationMove.ANSWER,))
+        result = TurnRunResult(plan, (SegmentResult(0, (frame,), (), SegmentFinish.PARTIAL),), (frame,), TurnUsage(1, 0, 0, 1), TurnRunStatus.COMPLETED_PARTIAL)
+        events = list(iter_event_markers([
+            EVENT_MARKER + encode_event("request-7", "gen-1", 0, RuntimeFrameReady(FrameReady(0, frame), OutboundBubble("partial."))) + "\n",
+            EVENT_MARKER + encode_event("request-7", "gen-1", 1, RuntimeCompleted(TurnRunCompleted(result))) + "\n",
+        ], "request-7", "gen-1"))
+        self.assertEqual(events[-1].result["status"], "completed_partial")
+        error = encode_event("request-7", "gen-1", 0, SandboxErrorEvent(0, "runtime_failed"))
+        self.assertEqual(list(iter_event_markers([EVENT_MARKER + error], "request-7", "gen-1"))[0].code, "runtime_failed")
 
-    def test_error_event_rejects_malformed_diagnostics(self):
-        event = json.loads(encode_event("request-7", "gen-1", 0, SandboxErrorEvent(0, "runtime_failed")))
-        cases = [
-            {"exception_class": "RuntimeError: secret"},
-            {"traceback": "not-a-list"},
-            {"traceback": [{"basename": "/secret/path.py", "function": "run", "line": 1}]},
-            {"traceback": [{"basename": "run.py", "function": "run", "line": 0}]},
-            {"traceback": [{"basename": "run.py", "function": "run", "line": 1}] * 13},
-            {"message": "secret exception text"},
-        ]
-        for diagnostics in cases:
-            with self.subTest(diagnostics=diagnostics), self.assertRaises(ValueError):
-                malformed = json.loads(json.dumps(event))
-                malformed["error"].update(diagnostics)
-                list(iter_event_markers([EVENT_MARKER + json.dumps(malformed)], "request-7", "gen-1"))
-
-    def test_legacy_result_helpers_remain_available_until_dispatch_migrates(self):
-        inbound = InboundEnvelope(connector="telegram", actor_id="user-1", message_id="message-9", text="hello")
-
-        self.assertEqual(PROTOCOL_VERSION, 2)
-
-        result = encode_result(
-            "request-7",
-            [OutboundBubble("first", reply_to_message_id="message-9"), OutboundBubble("second")],
-        )
-        self.assertEqual(
-            parse_result_marker(f"sandbox log\n{RESULT_MARKER}{result}\n", "request-7"),
-            [OutboundBubble("first", reply_to_message_id="message-9"), OutboundBubble("second")],
-        )
-
-        with self.assertRaises(ValueError):
-            parse_result_marker(f"{RESULT_MARKER}{result}", "other-request")
-
-        invalid_version = json.loads(result)
-        invalid_version["version"] = PROTOCOL_VERSION
-        with self.assertRaises(ValueError):
-            parse_result_marker(f"{RESULT_MARKER}{json.dumps(invalid_version)}", "request-7")
-
-        with self.assertRaises(ValueError):
-            encode_result("request-7", [])
-        with self.assertRaises(ValueError):
-            encode_result("request-7", [OutboundBubble("ok")] * 5)
-        with self.assertRaises(ValueError):
-            encode_result("request-7", [OutboundBubble("x" * 4097)])
-
-    def test_result_marker_requires_exactly_one_versioned_success_or_typed_error(self):
+    def test_v1_result_helpers_remain(self):
+        self.assertEqual(PROTOCOL_VERSION, 3)
         result = encode_result("request-7", [OutboundBubble("ok")])
-        self.assertEqual(RESULT_MARKER, "TOMO_SANDBOX_RESULT=")
-        self.assertIn('"version":1', result)
-        self.assertIn('"ok":true', result)
-        self.assertEqual(parse_result_marker(f"{RESULT_MARKER}{result}\n", "request-7"), [OutboundBubble("ok")])
+        self.assertEqual(parse_result_marker(RESULT_MARKER + result, "request-7"), [OutboundBubble("ok")])
+        with self.assertRaises(Exception):
+            parse_result_marker(RESULT_MARKER + encode_error("request-7", "failed"), "request-7")
 
-        error = encode_error("request-7", "runtime_failed")
-        with self.assertRaises(SandboxProtocolError) as raised:
-            parse_result_marker(f"{RESULT_MARKER}{error}\n", "request-7")
-        self.assertEqual(raised.exception.code, "runtime_failed")
+    def _burst(self):
+        return InputBurst("burst-1", "gen-1", 1, (InboundMessage(1, 41, InboundEnvelope("telegram", "user-1", "message-1", "hello")),))
 
-        with self.assertRaises(ValueError):
-            parse_result_marker(f"{RESULT_MARKER}{result}\n{RESULT_MARKER}{result}\n", "request-7")
+    def _events(self):
+        frame = Frame(0, 0, "hello back.")
+        plan = MovePlan(ConversationMove.ANSWER, (), "answer", MoveConfidence.HIGH, (ConversationMove.ANSWER,))
+        result = TurnRunResult(plan, (SegmentResult(0, (frame,), (ToolCall("call-1", "lookup", {}),), SegmentFinish.TOOL_BATCH), SegmentResult(1, (), (), SegmentFinish.FAILED)), (frame,), TurnUsage(2, 1, 1, 1), TurnRunStatus.COMPLETED_PARTIAL)
+        return RuntimeFrameReady(FrameReady(0, frame), OutboundBubble("hello back.")), RuntimeCompleted(TurnRunCompleted(result))
 
 
 if __name__ == "__main__":

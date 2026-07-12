@@ -1,0 +1,50 @@
+import unittest
+
+from tomo_core.context import ContextFact, ContextHydrator, ContextSnapshot
+from tomo_core.conversation.models import ConversationRequest
+from tomo_core.models import InboundEnvelope, InboundMessage, InputBurst
+
+
+class ContextHydratorTests(unittest.TestCase):
+    def test_hydrate_copies_current_history_and_visible_frames_without_the_new_burst(self):
+        burst = InputBurst(
+            burst_id="burst-1",
+            generation_id="generation-1",
+            revision=1,
+            messages=(InboundMessage(1, 10, InboundEnvelope("telegram", "user-1", "m1", "latest user message")),),
+            visible_assistant_utterances=("first visible frame", "second visible frame"),
+        )
+        request = ConversationRequest(
+            burst=burst,
+            soul="SOUL",
+            history=(
+                {"role": "user", "content": "earlier user message"},
+                {"role": "assistant", "content": "earlier assistant reply"},
+            ),
+        )
+
+        snapshot = ContextHydrator().hydrate(request)
+
+        self.assertEqual(
+            snapshot,
+            ContextSnapshot(
+                history=(
+                    {"role": "user", "content": "earlier user message"},
+                    {"role": "assistant", "content": "earlier assistant reply"},
+                ),
+                visible_frames=("first visible frame", "second visible frame"),
+            ),
+        )
+        self.assertEqual(snapshot.facts, ())
+        self.assertNotIn("latest user message", "\n".join(item["content"] for item in snapshot.history))
+        self.assertIsNot(snapshot.history[0], request.history[0])
+
+    def test_context_fact_preserves_future_source_metadata(self):
+        fact = ContextFact("prefers concise answers", "current_conversation", "2026-07-12T00:00:00Z")
+
+        self.assertEqual(fact.confidence, "provided")
+        self.assertEqual(fact.sensitivity, "normal")
+
+
+if __name__ == "__main__":
+    unittest.main()

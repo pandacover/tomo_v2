@@ -75,37 +75,49 @@ class NamingMigrationTests(unittest.TestCase):
             token_path.write_text(json.dumps({"access_token": "supergrok-access"}), encoding="utf-8")
 
             class FakeResponse:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return None
+
                 def raise_for_status(self):
                     return None
 
-                def json(self):
-                    return {"choices": [{"message": {"content": "supergrok reply"}}]}
+                def iter_raw(self):
+                    yield b'data: {"choices":[{"delta":{"content":"supergrok reply"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
 
-            with patch("tomo_core.providers.httpx.post", return_value=FakeResponse()) as post:
+            with patch("tomo_core.providers.httpx.stream", return_value=FakeResponse()) as stream:
                 reply = OAuthBackedSuperGrokProvider(oauth=oauth).complete([{"role": "user", "content": "hi"}], actor_id="99")
 
             self.assertEqual(reply, "supergrok reply")
-            self.assertEqual(post.call_args.kwargs["headers"]["Authorization"], "Bearer supergrok-access")
-            request_body = post.call_args.kwargs["json"]
+            self.assertEqual(stream.call_args.kwargs["headers"]["Authorization"], "Bearer supergrok-access")
+            request_body = stream.call_args.kwargs["json"]
             self.assertEqual(request_body["reasoning_effort"], "high")
             self.assertNotIn("reasoning", request_body)
 
     def test_supergrok_fixed_token_provider_does_not_delegate_to_xai_api_provider(self):
         class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
             def raise_for_status(self):
                 return None
 
-            def json(self):
-                return {"choices": [{"message": {"content": "supergrok reply"}}]}
+            def iter_raw(self):
+                yield b'data: {"choices":[{"delta":{"content":"supergrok reply"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
 
         provider = SuperGrokOAuthProvider(token_store=SuperGrokTokenStore("supergrok-access"))
         with patch("tomo_core.providers.XaiApiProvider.complete", side_effect=AssertionError("must not use API-key provider semantics")), patch(
-            "tomo_core.providers.httpx.post", return_value=FakeResponse()
-        ) as post:
+            "tomo_core.providers.httpx.stream", return_value=FakeResponse()
+        ) as stream:
             reply = provider.complete([{"role": "user", "content": "hi"}])
 
         self.assertEqual(reply, "supergrok reply")
-        self.assertEqual(post.call_args.kwargs["headers"]["Authorization"], "Bearer supergrok-access")
+        self.assertEqual(stream.call_args.kwargs["headers"]["Authorization"], "Bearer supergrok-access")
 
 
 class FakeTelegramClient:

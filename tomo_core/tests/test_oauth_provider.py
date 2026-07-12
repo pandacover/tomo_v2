@@ -28,18 +28,24 @@ class OAuthBackedProviderTests(unittest.TestCase):
             token_path.write_text(json.dumps({"access_token": "actor-access"}), encoding="utf-8")
 
             class FakeResponse:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return None
+
                 def raise_for_status(self):
                     return None
 
-                def json(self):
-                    return {"choices": [{"message": {"content": "real supergrok reply"}}]}
+                def iter_raw(self):
+                    yield b'data: {"choices":[{"delta":{"content":"real supergrok reply"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
 
-            with patch("tomo_core.providers.httpx.post", return_value=FakeResponse()) as post:
+            with patch("tomo_core.providers.httpx.stream", return_value=FakeResponse()) as stream:
                 reply = OAuthBackedSuperGrokProvider(oauth=oauth).complete([{"role": "user", "content": "hi"}], actor_id="99")
 
             self.assertEqual(reply, "real supergrok reply")
-            self.assertEqual(post.call_args.kwargs["headers"]["Authorization"], "Bearer actor-access")
-            request_body = post.call_args.kwargs["json"]
+            self.assertEqual(stream.call_args.kwargs["headers"]["Authorization"], "Bearer actor-access")
+            request_body = stream.call_args.kwargs["json"]
             self.assertEqual(request_body["reasoning_effort"], "high")
             self.assertNotIn("reasoning", request_body)
 

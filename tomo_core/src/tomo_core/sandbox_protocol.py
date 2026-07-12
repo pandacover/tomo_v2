@@ -7,12 +7,14 @@ import re
 from dataclasses import asdict, dataclass
 from typing import Any, Iterable, Iterator, TypeAlias
 
-from .conversation import ConversationCompleted, ConversationMove, UtteranceReady
-from .conversation.models import ConversationResult, MoveConfidence, MovePlan
-from .conversation.parsing import ConversationOutputError, parse_utterances
-from .models import InboundEnvelope, InboundMessage, InputBurst, MessageAttachment, OutboundBubble, ResponseContract
+from .conversation import ConversationMove, FrameReady, MoveConfidence, MovePlan, SegmentFinish, TurnBudget, TurnRunCompleted, TurnRunStatus, TurnUsage
+from .conversation.parsing import _validate_strict_frame_text, parse_utterance, parse_utterances
+from .models import InboundEnvelope, InboundMessage, InputBurst, MessageAttachment, OutboundBubble, ResponseContract, RuntimeConfig
+from .runtime import RuntimeCompleted, RuntimeFrameReady
 
-PROTOCOL_VERSION = 2
+INBOUND_PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
+LEGACY_EVENT_PROTOCOL_VERSION = 2
 LEGACY_PROTOCOL_VERSION = 1
 EVENT_MARKER = "TOMO_SANDBOX_EVENT="
 RESULT_MARKER = "TOMO_SANDBOX_RESULT="
@@ -24,13 +26,16 @@ _PTY_PREFIX_RE = re.compile(r"(?:[\x00-\x08\x0b-\x1a\x1c-\x1f\x7f]+|\x1b\[[0-?]*
 _EXCEPTION_CLASS_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}\Z")
 _TRACEBACK_BASENAME_RE = re.compile(r"[A-Za-z0-9_.-]{1,255}\Z")
 _TRACEBACK_FUNCTION_RE = re.compile(r"(?:[A-Za-z_][A-Za-z0-9_]{0,127}|<[A-Za-z_][A-Za-z0-9_]{0,127}>)\Z")
+_SAFE_ERROR_CODE_RE = re.compile(r"[a-z][a-z0-9_]{0,127}\Z")
 
 
 @dataclass(frozen=True)
-class SandboxUtteranceEvent:
+class SandboxFrameEvent:
     sequence: int
-    move: ConversationMove
+    segment_index: int
+    frame_index: int
     text: str
+    legacy_move: ConversationMove | None = None
 
 
 @dataclass(frozen=True)
@@ -54,85 +59,53 @@ class SandboxErrorEvent:
     traceback: tuple[SandboxTracebackFrame, ...] = ()
 
 
-SandboxEvent: TypeAlias = SandboxUtteranceEvent | SandboxCompletedEvent | SandboxErrorEvent
+SandboxEvent: TypeAlias = SandboxFrameEvent | SandboxCompletedEvent | SandboxErrorEvent
 
 
 def encode_inbound(request_id: str, burst: InputBurst | InboundEnvelope) -> str:
-    """Serialize a v2 inbound request for the sandbox."""
+    """Serialize a v2 inbound request for the sandbox during rollout."""
     _validate_request_id(request_id)
     if isinstance(burst, InboundEnvelope):
-        burst = InputBurst(
-            burst_id=f"legacy-{burst.message_id}",
-            generation_id=f"legacy-{burst.message_id}",
-            revision=1,
-            messages=(InboundMessage(1, int(burst.native_metadata.get("update_id", 0)), burst),),
-        )
+        burst = InputBurst(f"legacy-{burst.message_id}", f"legacy-{burst.message_id}", 1, (InboundMessage(1, int(burst.native_metadata.get("update_id", 0)), burst),))
     if not isinstance(burst, InputBurst):
         raise TypeError("burst must be an InputBurst")
-    return _encode(
-        {
-            "version": PROTOCOL_VERSION,
-            "type": "inbound",
-            "request_id": request_id,
-            "burst": _burst_to_dict(burst),
-        }
-    )
+    return _encode({"version": INBOUND_PROTOCOL_VERSION, "type": "inbound", "request_id": request_id, "burst": _burst_to_dict(burst)})
 
 
 def decode_inbound(payload: str) -> tuple[str, InputBurst]:
-    """Parse and validate a v2 inbound request from the host."""
-    message = _decode(payload, "inbound")
-    raw_burst = message.get("burst")
-    if not isinstance(raw_burst, dict):
+    """Parse identical-shape v2 or v3 inbound data during rollout."""
+    message = _decode(payload, "inbound", {INBOUND_PROTOCOL_VERSION, PROTOCOL_VERSION})
+    if not isinstance(message.get("burst"), dict):
         raise ValueError("inbound burst must be an object")
-    return message["request_id"], _burst_from_dict(raw_burst)
+    return message["request_id"], _burst_from_dict(message["burst"])
 
 
 def encode_event(request_id: str, generation_id: str, sequence: int, event: object) -> str:
+    """Serialize frame, completion, or safe error events as v3."""
     _validate_request_id(request_id)
     _validate_generation_id(generation_id)
-    if not isinstance(sequence, int) or sequence < 0:
-        raise ValueError("event sequence must be non-negative")
-    payload: dict[str, Any] = {
-        "version": PROTOCOL_VERSION,
-        "request_id": request_id,
-        "generation_id": generation_id,
-        "sequence": sequence,
-    }
-    conversation_event = getattr(event, "event", event)
-    if isinstance(conversation_event, UtteranceReady):
-        bubble = getattr(event, "bubble", None)
-        text = getattr(bubble, "text", conversation_event.text)
-        payload.update(
-            {
-                "type": "utterance",
-                "move": conversation_event.move.value,
-                "text": text,
-            }
-        )
-    elif isinstance(conversation_event, ConversationCompleted):
-        result = conversation_event.result
-        payload.update(
-            {
-                "type": "completed",
-                "result": {
-                    "logical_text": result.logical_text,
-                    "utterances": list(result.utterances),
-                    "plan": {
-                        "primary_move": result.plan.primary.value,
-                        "supporting_moves": [move.value for move in result.plan.supporting],
-                        "move_sequence": [move.value for move in result.plan.sequence],
-                        "response_goal": result.plan.response_goal,
-                        "confidence": result.plan.confidence.value,
-                    },
-                },
-            }
-        )
+    _nonnegative(sequence, "event sequence")
+    payload: dict[str, Any] = {"version": PROTOCOL_VERSION, "request_id": request_id, "generation_id": generation_id, "sequence": sequence}
+    if isinstance(event, RuntimeFrameReady):
+        inner = event.event
+    elif isinstance(event, FrameReady):
+        inner = event
+    elif isinstance(event, RuntimeCompleted):
+        inner = event.event
+    elif isinstance(event, TurnRunCompleted):
+        inner = event
+    else:
+        inner = None
+    if isinstance(inner, FrameReady):
+        frame = inner.frame
+        payload.update({"type": "frame", "segment_index": frame.segment_index, "frame_index": frame.frame_index, "text": frame.text})
+    elif isinstance(inner, TurnRunCompleted):
+        payload.update({"type": "completed", "result": _safe_result(inner.result)})
     elif isinstance(event, SandboxErrorEvent):
-        if not event.code.strip():
-            raise ValueError("error code must be non-empty")
-        error = {"code": event.code}
         _validate_error_diagnostics(event.exception_class, event.traceback)
+        if not isinstance(event.code, str) or not _SAFE_ERROR_CODE_RE.fullmatch(event.code):
+            raise ValueError("error code must be non-empty")
+        error: dict[str, Any] = {"code": event.code}
         if event.exception_class is not None:
             error["exception_class"] = event.exception_class
         if event.traceback:
@@ -143,397 +116,344 @@ def encode_event(request_id: str, generation_id: str, sequence: int, event: obje
     return _encode(payload)
 
 
-def iter_event_markers(
-    chunks: Iterable[str],
-    expected_request_id: str,
-    expected_generation_id: str,
-    contract: ResponseContract | None = None,
-) -> Iterator[SandboxEvent]:
+def iter_event_markers(chunks: Iterable[str], expected_request_id: str, expected_generation_id: str, contract: ResponseContract | None = None, budget: TurnBudget | None = None) -> Iterator[SandboxEvent]:
+    """Parse one strictly version-consistent v2 or v3 event stream."""
     _validate_request_id(expected_request_id)
     _validate_generation_id(expected_generation_id)
     contract = contract or ResponseContract()
-    buffer = ""
-    expected_sequence = 0
+    budget = budget or RuntimeConfig().tool_turn_budget
+    buffer, expected_sequence, stream_version, terminal = "", 0, None, False
     seen: dict[int, str] = {}
-    emitted_utterances: list[str] = []
-    emitted_moves: list[ConversationMove] = []
-    terminal = False
+    frames: list[SandboxFrameEvent] = []
 
-    def process_line(line: str) -> SandboxEvent | None:
-        nonlocal expected_sequence, terminal
-        marker_position = line.find(EVENT_MARKER)
-        if marker_position < 0 or not _PTY_PREFIX_RE.fullmatch(line[:marker_position]):
+    def process(line: str) -> SandboxEvent | None:
+        nonlocal expected_sequence, stream_version, terminal
+        position = line.find(EVENT_MARKER)
+        if position < 0 or not _PTY_PREFIX_RE.fullmatch(line[:position]):
             return None
-        payload = line[marker_position + len(EVENT_MARKER) :]
-        message = _decode_event(payload, expected_request_id, expected_generation_id)
-        sequence = message["sequence"]
-        canonical = _encode(message)
-        previous = seen.get(sequence)
-        if previous is not None:
-            if previous != canonical:
+        message = _decode_event(line[position + len(EVENT_MARKER):], expected_request_id, expected_generation_id)
+        if stream_version is None:
+            stream_version = message["version"]
+        elif stream_version != message["version"]:
+            raise ValueError("mixed sandbox event protocol versions")
+        canonical, sequence = _encode(message), message["sequence"]
+        if sequence in seen:
+            if seen[sequence] != canonical:
                 raise ValueError("conflicting duplicate sandbox event")
             return None
         if terminal:
             raise ValueError("sandbox event after terminal")
         if sequence != expected_sequence:
             raise ValueError("sandbox event sequence gap")
-        seen[sequence] = canonical
-        expected_sequence += 1
-        event = _event_from_message(message, contract)
-        if isinstance(event, SandboxUtteranceEvent):
-            if len(emitted_utterances) >= contract.max_utterances:
+        event = _event_from_message(message, contract, budget)
+        if isinstance(event, SandboxFrameEvent):
+            if message["version"] == PROTOCOL_VERSION:
+                _validate_stream_frame(event, frames, budget)
+            elif len(frames) >= contract.max_utterances:
                 raise ValueError("sandbox event stream exceeds utterance contract")
-            emitted_utterances.append(event.text)
-            emitted_moves.append(event.move)
-        if isinstance(event, SandboxCompletedEvent):
-            completed_utterances, completed_moves = _completed_result_parts(event.result, contract)
-            if tuple(emitted_utterances) != completed_utterances:
-                raise ValueError("completed utterances do not match streamed utterances")
-            if tuple(emitted_moves) != completed_moves:
-                raise ValueError("completed moves do not match streamed moves")
+            frames.append(event)
+        elif isinstance(event, SandboxCompletedEvent):
+            if message["version"] == PROTOCOL_VERSION:
+                completed_frames = _v3_result_parts(event.result, budget)
+                if tuple((frame.segment_index, frame.frame_index, frame.text) for frame in frames) != completed_frames:
+                    raise ValueError("completed frames do not match streamed frames")
+            else:
+                completed_utterances, completed_moves = _v2_result_parts(event.result, contract)
+                if tuple(frame.text for frame in frames) != completed_utterances or tuple(frame.legacy_move for frame in frames) != completed_moves:
+                    raise ValueError("completed v2 result does not match streamed utterances")
             terminal = True
         elif isinstance(event, SandboxErrorEvent):
             terminal = True
+        seen[sequence] = canonical
+        expected_sequence += 1
         return event
 
     for chunk in chunks:
         buffer += chunk
         while "\n" in buffer:
             line, buffer = buffer.split("\n", 1)
-            event = process_line(line.rstrip("\r"))
+            event = process(line.rstrip("\r"))
             if event is not None:
                 yield event
     if buffer:
-        event = process_line(buffer.rstrip("\r"))
+        event = process(buffer.rstrip("\r"))
         if event is not None:
             yield event
     if not terminal:
         raise ValueError("sandbox event stream missing terminal event")
 
 
-class SandboxProtocolError(ValueError):
-    """A typed error returned by a valid sandbox result."""
-
-    def __init__(self, code: str) -> None:
-        self.code = code
-        super().__init__(f"sandbox returned {code}")
+def _safe_result(result: object) -> dict[str, Any]:
+    frames = [{"segment_index": frame.segment_index, "frame_index": frame.frame_index, "text": frame.text} for frame in result.frames]
+    return {"logical_text": result.logical_text, "frames": frames, "status": result.status.value, "plan": _plan_dict(result.plan), "segments": [{"index": segment.index, "finish": segment.finish.value, "frame_count": len(segment.frames), "tool_call_count": len(segment.tool_calls)} for segment in result.segments], "usage": {"model_segments": result.usage.model_segments, "tool_rounds": result.usage.tool_rounds, "tool_calls": result.usage.tool_calls, "visible_segments": result.usage.visible_segments, "contract_repairs": result.usage.contract_repairs, "input_tokens": result.usage.input_tokens, "output_tokens": result.usage.output_tokens}}
 
 
-def encode_result(request_id: str, bubbles: list[OutboundBubble]) -> str:
-    """Serialize a successful legacy v1 sandbox result."""
-    _validate_request_id(request_id)
-    _validate_bubbles(bubbles)
-    return _encode(
-        {
-            "version": LEGACY_PROTOCOL_VERSION,
-            "request_id": request_id,
-            "ok": True,
-            "bubbles": [asdict(bubble) for bubble in bubbles],
-        }
-    )
+def _plan_dict(plan: object) -> dict[str, Any]:
+    return {"primary_move": plan.primary.value, "supporting_moves": [move.value for move in plan.supporting], "move_sequence": [move.value for move in plan.sequence], "response_goal": plan.response_goal, "confidence": plan.confidence.value}
 
 
-def encode_error(request_id: str, code: str) -> str:
-    """Serialize a typed legacy v1 sandbox failure without exception details."""
-    _validate_request_id(request_id)
-    if not isinstance(code, str) or not code:
-        raise ValueError("error code must be a non-empty string")
-    return _encode(
-        {
-            "version": LEGACY_PROTOCOL_VERSION,
-            "request_id": request_id,
-            "ok": False,
-            "error": {"code": code},
-        }
-    )
-
-
-def parse_result_marker(output: str, expected_request_id: str) -> list[OutboundBubble]:
-    """Extract the sole legacy marked result from sandbox stdout and validate its request ID."""
-    _validate_request_id(expected_request_id)
-    marked_results = [line[len(RESULT_MARKER) :] for line in output.splitlines() if line.startswith(RESULT_MARKER)]
-    if len(marked_results) != 1:
-        raise ValueError("sandbox output must contain exactly one result marker")
-    message = _decode_result(marked_results[0])
-    if message["request_id"] != expected_request_id:
-        raise ValueError("result request_id does not match inbound request")
-
-    if message["ok"] is False:
-        error = message.get("error")
-        if not isinstance(error, dict) or not isinstance(error.get("code"), str) or not error["code"]:
-            raise ValueError("result error must contain a code")
-        if "bubbles" in message:
-            raise ValueError("error result must not contain bubbles")
-        raise SandboxProtocolError(error["code"])
-    if message["ok"] is not True or "error" in message:
-        raise ValueError("result ok must be a boolean with matching payload")
-    raw_bubbles = message.get("bubbles")
-    if not isinstance(raw_bubbles, list):
-        raise ValueError("result bubbles must be an array")
-    try:
-        bubbles = [OutboundBubble(**bubble) for bubble in raw_bubbles if isinstance(bubble, dict)]
-    except TypeError as error:
-        raise ValueError("invalid result bubble") from error
-    if len(bubbles) != len(raw_bubbles):
-        raise ValueError("result bubbles must be objects")
-    _validate_bubbles(bubbles)
-    return bubbles
-
-
-def _burst_to_dict(burst: InputBurst) -> dict[str, Any]:
-    return {
-        "burst_id": burst.burst_id,
-        "generation_id": burst.generation_id,
-        "revision": burst.revision,
-        "visible_assistant_utterances": list(burst.visible_assistant_utterances),
-        "accepted_generation_ids": list(burst.accepted_generation_ids),
-        "messages": [
-            {"ordinal": message.ordinal, "update_id": message.update_id, "envelope": asdict(message.envelope)}
-            for message in burst.messages
-        ],
-    }
-
-
-def _burst_from_dict(raw: dict[str, Any]) -> InputBurst:
-    messages = raw.get("messages")
-    if not isinstance(messages, list):
-        raise ValueError("inbound burst messages must be an array")
-    try:
-        return InputBurst(
-            burst_id=_required_string(raw, "burst_id"),
-            generation_id=_required_string(raw, "generation_id"),
-            revision=raw["revision"],
-            visible_assistant_utterances=tuple(raw.get("visible_assistant_utterances", ())),
-            accepted_generation_ids=tuple(raw.get("accepted_generation_ids", ())),
-            messages=tuple(
-                InboundMessage(
-                    ordinal=message["ordinal"],
-                    update_id=message["update_id"],
-                    envelope=_envelope_from_dict(message.get("envelope")),
-                )
-                for message in messages
-                if isinstance(message, dict)
-            ),
-        )
-    except (KeyError, TypeError, ValueError) as error:
-        raise ValueError("invalid inbound burst") from error
-
-
-def _envelope_from_dict(inbound: object) -> InboundEnvelope:
-    if not isinstance(inbound, dict):
-        raise ValueError("inbound envelope must be an object")
-    attachments = inbound.get("attachments", [])
-    if not isinstance(attachments, list) or not all(isinstance(item, dict) for item in attachments):
-        raise ValueError("inbound attachments must be an array of objects")
-    envelope = InboundEnvelope(
-        connector=_required_string(inbound, "connector"),
-        actor_id=_required_string(inbound, "actor_id"),
-        message_id=_required_string(inbound, "message_id"),
-        text=_required_string(inbound, "text"),
-        timestamp=_required_string(inbound, "timestamp"),
-        attachments=tuple(MessageAttachment(**attachment) for attachment in attachments),
-        location=inbound.get("location"),
-        native_metadata=inbound.get("native_metadata", {}),
-    )
-    if envelope.connector != "telegram":
-        raise ValueError("unsupported connector")
-    if not isinstance(envelope.native_metadata, dict):
-        raise ValueError("inbound native_metadata must be an object")
-    if envelope.location is not None and not isinstance(envelope.location, dict):
-        raise ValueError("inbound location must be an object")
-    return envelope
-
-
-def _decode_event(payload: str, expected_request_id: str, expected_generation_id: str) -> dict[str, Any]:
-    try:
-        message = json.loads(payload)
-    except (TypeError, json.JSONDecodeError) as error:
-        raise ValueError("protocol payload must be JSON") from error
-    if not isinstance(message, dict):
-        raise ValueError("protocol payload must be an object")
-    if message.get("version") != PROTOCOL_VERSION:
+def _decode_event(payload: str, request_id: str, generation_id: str) -> dict[str, Any]:
+    message = _json_object(payload)
+    version = message.get("version")
+    if version not in {LEGACY_EVENT_PROTOCOL_VERSION, PROTOCOL_VERSION}:
         raise ValueError("unsupported protocol version")
-    if message.get("request_id") != expected_request_id:
-        raise ValueError("event request_id does not match inbound request")
-    if message.get("generation_id") != expected_generation_id:
-        raise ValueError("event generation_id does not match inbound request")
-    sequence = message.get("sequence")
-    if not isinstance(sequence, int) or sequence < 0:
-        raise ValueError("event sequence must be non-negative")
-    event_type = message.get("type")
-    if event_type not in {"utterance", "completed", "error"}:
+    if message.get("request_id") != request_id or message.get("generation_id") != generation_id:
+        raise ValueError("event IDs do not match inbound request")
+    _nonnegative(message.get("sequence"), "event sequence")
+    allowed = {"utterance", "completed", "error"} if version == LEGACY_EVENT_PROTOCOL_VERSION else {"frame", "completed", "error"}
+    if message.get("type") not in allowed:
         raise ValueError("unsupported sandbox event type")
     return message
 
 
-def _event_from_message(message: dict[str, Any], contract: ResponseContract) -> SandboxEvent:
-    sequence = message["sequence"]
-    event_type = message["type"]
+def _event_from_message(message: dict[str, Any], contract: ResponseContract, budget: TurnBudget) -> SandboxEvent:
+    event_type, sequence = message["type"], message["sequence"]
+    if event_type == "frame":
+        if set(message) != {"version", "request_id", "generation_id", "sequence", "type", "segment_index", "frame_index", "text"}:
+            raise ValueError("frame event contains unsupported fields")
+        segment_index, frame_index, text = message.get("segment_index"), message.get("frame_index"), message.get("text")
+        _nonnegative(segment_index, "frame segment_index")
+        _nonnegative(frame_index, "frame frame_index")
+        _validate_frame_text(text, budget)
+        return SandboxFrameEvent(sequence, segment_index, frame_index, text)
     if event_type == "utterance":
+        if set(message) != {"version", "request_id", "generation_id", "sequence", "type", "move", "text"}:
+            raise ValueError("utterance event contains unsupported fields")
         text = message.get("text")
-        if not isinstance(text, str) or not text.strip() or len(text) > MAX_BUBBLE_CHARS:
-            raise ValueError("utterance text must contain 1 to 4096 characters")
         try:
-            utterance = parse_utterances(json.dumps({"utterances": [text]}), contract)[0]
-        except ConversationOutputError as error:
-            raise ValueError(f"utterance violates response contract: {error.code}") from error
-        return SandboxUtteranceEvent(sequence=sequence, move=ConversationMove(message.get("move")), text=utterance)
+            validated_text = parse_utterance(json.dumps({"utterance": text}), contract)
+        except Exception as error:
+            raise ValueError("utterance text violates response contract") from error
+        if text != validated_text or len(text) > MAX_BUBBLE_CHARS:
+            raise ValueError("utterance text violates response contract")
+        try:
+            move = ConversationMove(message.get("move"))
+        except ValueError as error:
+            raise ValueError("invalid utterance move") from error
+        return SandboxFrameEvent(sequence, 0, sequence, validated_text, move)
     if event_type == "completed":
-        result = message.get("result")
-        if not isinstance(result, dict) or not isinstance(result.get("logical_text"), str) or not result["logical_text"].strip():
-            raise ValueError("completed event requires a result")
-        _completed_result_parts(result, contract)
-        return SandboxCompletedEvent(sequence=sequence, result=result)
-    error = message.get("error")
-    if not isinstance(error, dict) or not isinstance(error.get("code"), str) or not error["code"].strip():
-        raise ValueError("error event requires a code")
-    if set(error) - {"code", "exception_class", "traceback"}:
-        raise ValueError("error event contains unsupported diagnostic fields")
-    exception_class = error.get("exception_class")
-    raw_traceback = error.get("traceback", [])
-    if not isinstance(raw_traceback, list):
-        raise ValueError("error traceback must be an array")
-    try:
-        traceback = tuple(
-            SandboxTracebackFrame(
-                basename=frame["basename"],
-                function=frame["function"],
-                line=frame["line"],
-            )
-            for frame in raw_traceback
-            if isinstance(frame, dict)
-        )
-    except (KeyError, TypeError) as decode_error:
-        raise ValueError("invalid error traceback frame") from decode_error
-    if len(traceback) != len(raw_traceback):
-        raise ValueError("error traceback frames must be objects")
-    if any(set(frame) != {"basename", "function", "line"} for frame in raw_traceback):
-        raise ValueError("error traceback frames contain unsupported fields")
-    _validate_error_diagnostics(exception_class, traceback)
-    return SandboxErrorEvent(sequence=sequence, code=error["code"], exception_class=exception_class, traceback=traceback)
+        if set(message) != {"version", "request_id", "generation_id", "sequence", "type", "result"} or not isinstance(message.get("result"), dict):
+            raise ValueError("completed event requires only a result")
+        return SandboxCompletedEvent(sequence, message["result"])
+    if set(message) != {"version", "request_id", "generation_id", "sequence", "type", "error"}:
+        raise ValueError("error event contains unsupported fields")
+    error = message["error"]
+    if not isinstance(error, dict) or set(error) - {"code", "exception_class", "traceback"} or not _SAFE_ERROR_CODE_RE.fullmatch(error.get("code", "")):
+        raise ValueError("error event requires a safe code")
+    raw_frames = error.get("traceback", [])
+    if not isinstance(raw_frames, list) or any(not isinstance(frame, dict) or set(frame) != {"basename", "function", "line"} for frame in raw_frames):
+        raise ValueError("invalid error traceback")
+    traceback = tuple(SandboxTracebackFrame(frame["basename"], frame["function"], frame["line"]) for frame in raw_frames)
+    _validate_error_diagnostics(error.get("exception_class"), traceback)
+    return SandboxErrorEvent(sequence, error["code"], error.get("exception_class"), traceback)
 
 
-def _completed_result_parts(result: dict[str, Any], contract: ResponseContract) -> tuple[tuple[str, ...], tuple[ConversationMove, ...]]:
-    utterances = result.get("utterances")
-    if not isinstance(utterances, list):
-        raise ValueError("completed result utterances must be an array")
+def _validate_stream_frame(frame: SandboxFrameEvent, frames: list[SandboxFrameEvent], budget: TurnBudget) -> None:
+    if len(frames) >= 3:
+        raise ValueError("sandbox event stream exceeds frame budget")
+    if frame.segment_index >= budget.max_model_segments:
+        raise ValueError("frame segment index exceeds model segment budget")
+    if frame.segment_index not in {prior.segment_index for prior in frames} and len({prior.segment_index for prior in frames}) >= budget.max_visible_segments:
+        raise ValueError("frame exceeds visible segment budget")
+    if frame.frame_index >= budget.max_frames_per_segment:
+        raise ValueError("frame index exceeds frame budget")
+    if frames:
+        prior = frames[-1]
+        if frame.segment_index < prior.segment_index:
+            raise ValueError("streamed segment indices must be nondecreasing")
+        expected = prior.frame_index + 1 if frame.segment_index == prior.segment_index else 0
+        if frame.frame_index != expected:
+            raise ValueError("streamed frame indices must be contiguous")
+    elif frame.frame_index != 0:
+        raise ValueError("first frame in a segment must have index zero")
+
+
+def _v3_result_parts(result: dict[str, Any], budget: TurnBudget) -> tuple[tuple[int, int, str], ...]:
+    if set(result) != {"logical_text", "frames", "status", "plan", "segments", "usage"}:
+        raise ValueError("completed result contains unsupported fields")
+    frames, segments, usage = result["frames"], result["segments"], result["usage"]
+    if not isinstance(frames, list) or not isinstance(segments, list) or not isinstance(usage, dict):
+        raise ValueError("completed result fields have invalid types")
+    tuples = []
+    for frame in frames:
+        if not isinstance(frame, dict) or set(frame) != {"segment_index", "frame_index", "text"}:
+            raise ValueError("completed frame contains unsupported fields")
+        _nonnegative(frame.get("segment_index"), "completed frame segment_index")
+        _nonnegative(frame.get("frame_index"), "completed frame frame_index")
+        _validate_frame_text(frame.get("text"), budget)
+        tuples.append((frame["segment_index"], frame["frame_index"], frame["text"]))
+    probe = [SandboxFrameEvent(index, *frame) for index, frame in enumerate(tuples)]
+    for item in probe:
+        _validate_stream_frame(item, probe[:item.sequence], budget)
+    _validate_plan(result["plan"])
+    if result.get("status") not in {TurnRunStatus.COMPLETED.value, TurnRunStatus.COMPLETED_PARTIAL.value}:
+        raise ValueError("completed result status is invalid")
+    expected_segments = list(range(len(segments)))
+    if [segment.get("index") if isinstance(segment, dict) else None for segment in segments] != expected_segments:
+        raise ValueError("completed segment indices must be contiguous")
+    frame_counts = {index: 0 for index in expected_segments}
+    for segment_index, _, _ in tuples:
+        if segment_index not in frame_counts:
+            raise ValueError("completed frame references an unknown segment")
+        frame_counts[segment_index] += 1
+    tool_rounds = tool_calls = visible = 0
+    for segment in segments:
+        if set(segment) != {"index", "finish", "frame_count", "tool_call_count"}:
+            raise ValueError("completed segment contains unsupported fields")
+        finish = segment.get("finish")
+        if finish not in {item.value for item in SegmentFinish}:
+            raise ValueError("completed segment finish is invalid")
+        _nonnegative(segment.get("frame_count"), "segment frame_count")
+        _nonnegative(segment.get("tool_call_count"), "segment tool_call_count")
+        if segment["frame_count"] != frame_counts[segment["index"]] or segment["frame_count"] > budget.max_frames_per_segment:
+            raise ValueError("completed segment frame count is inconsistent")
+        if finish == SegmentFinish.TOOL_BATCH.value:
+            if not segment["tool_call_count"]: raise ValueError("tool batch requires tool calls")
+            if segment["frame_count"] > 1: raise ValueError("tool batch may contain at most one frame")
+            tool_rounds += 1
+        elif segment["tool_call_count"]: raise ValueError("only tool batches may contain tool calls")
+        if finish == SegmentFinish.FAILED.value and segment["frame_count"]: raise ValueError("failed segment cannot contain frames")
+        if finish in {SegmentFinish.COMPLETE.value, SegmentFinish.PARTIAL.value} and not segment["frame_count"]: raise ValueError("visible segment requires frames")
+        tool_calls += segment["tool_call_count"]
+        visible += bool(segment["frame_count"])
+    if result["status"] == TurnRunStatus.COMPLETED.value and (not segments or segments[-1]["finish"] != SegmentFinish.COMPLETE.value or any(segment["finish"] != SegmentFinish.TOOL_BATCH.value for segment in segments[:-1])):
+        raise ValueError("completed result must end with a complete segment")
+    if result["status"] == TurnRunStatus.COMPLETED_PARTIAL.value and (
+        not tuples or not segments or segments[-1]["finish"] not in {SegmentFinish.PARTIAL.value, SegmentFinish.FAILED.value, SegmentFinish.TOOL_BATCH.value} or any(segment["finish"] != SegmentFinish.TOOL_BATCH.value for segment in segments[:-1])
+    ):
+        raise ValueError("partial completed result has an invalid terminal segment")
+    expected_usage = {"model_segments": len(segments), "tool_rounds": tool_rounds, "tool_calls": tool_calls, "visible_segments": visible}
+    if set(usage) != {"model_segments", "tool_rounds", "tool_calls", "visible_segments", "contract_repairs", "input_tokens", "output_tokens"}:
+        raise ValueError("completed usage contains unsupported fields")
+    for key, value in usage.items():
+        if key in {"input_tokens", "output_tokens"} and value is None: continue
+        _nonnegative(value, f"usage {key}")
+    if any(usage[key] != value for key, value in expected_usage.items()):
+        raise ValueError("completed usage is inconsistent")
     try:
-        cleaned = parse_utterances(json.dumps({"utterances": utterances}), contract)
-    except ConversationOutputError as error:
-        raise ValueError(f"completed result violates response contract: {error.code}") from error
-    plan = result.get("plan")
-    if not isinstance(plan, dict):
-        raise ValueError("completed result requires a plan")
-    raw_sequence = plan.get("move_sequence")
-    if not isinstance(raw_sequence, list):
-        raise ValueError("completed plan requires a move_sequence")
-    try:
-        moves = tuple(ConversationMove(move) for move in raw_sequence)
+        budget.validate_usage(TurnUsage(usage["model_segments"], usage["tool_rounds"], usage["tool_calls"], usage["visible_segments"], usage["contract_repairs"], usage["input_tokens"], usage["output_tokens"]))
     except ValueError as error:
-        raise ValueError("completed plan contains an invalid move") from error
-    if len(moves) != len(cleaned):
-        raise ValueError("completed plan move_sequence must match utterance count")
-    primary = plan.get("primary_move")
-    supporting = plan.get("supporting_moves")
-    response_goal = plan.get("response_goal")
-    confidence = plan.get("confidence")
-    logical_text = result.get("logical_text")
-    if not isinstance(supporting, list):
-        raise ValueError("completed plan requires supporting_moves")
+        raise ValueError("completed usage exceeds budget") from error
+    if result["logical_text"] != " ".join(frame[2] for frame in tuples):
+        raise ValueError("completed logical_text must match frames exactly")
+    return tuple(tuples)
+
+
+def _validate_plan(plan: object) -> None:
+    if not isinstance(plan, dict) or set(plan) != {"primary_move", "supporting_moves", "move_sequence", "response_goal", "confidence"}:
+        raise ValueError("completed plan contains unsupported fields")
+    if not isinstance(plan["supporting_moves"], list) or not isinstance(plan["move_sequence"], list):
+        raise ValueError("completed plan moves must be arrays")
     try:
-        move_plan = MovePlan(
-            ConversationMove(primary),
-            tuple(ConversationMove(move) for move in supporting),
-            response_goal,
-            MoveConfidence(confidence),
-            moves,
-        )
-        conversation_result = ConversationResult(move_plan, cleaned)
+        MovePlan(ConversationMove(plan["primary_move"]), tuple(ConversationMove(move) for move in plan["supporting_moves"]), plan["response_goal"], MoveConfidence(plan["confidence"]), tuple(ConversationMove(move) for move in plan["move_sequence"]))
     except (TypeError, ValueError) as error:
         raise ValueError("completed plan is inconsistent") from error
-    if primary not in raw_sequence:
-        raise ValueError("completed plan primary must be in move_sequence")
-    if set(supporting) - set(raw_sequence) or len(supporting) != len(set(supporting)):
-        raise ValueError("completed plan supporting_moves must be unique members of move_sequence")
-    if logical_text != conversation_result.logical_text:
-        raise ValueError("completed logical_text must match utterances exactly")
-    return cleaned, moves
 
 
-def _decode_result(payload: str) -> dict[str, Any]:
+def _v2_result_parts(result: dict[str, Any], contract: ResponseContract) -> tuple[tuple[str, ...], tuple[ConversationMove, ...]]:
+    if not isinstance(result.get("utterances"), list) or not isinstance(result.get("logical_text"), str):
+        raise ValueError("invalid v2 completed result")
     try:
-        message = json.loads(payload)
-    except (TypeError, json.JSONDecodeError) as error:
-        raise ValueError("protocol payload must be JSON") from error
-    if not isinstance(message, dict):
-        raise ValueError("protocol payload must be an object")
-    if message.get("version") != LEGACY_PROTOCOL_VERSION:
-        raise ValueError("unsupported protocol version")
-    _validate_request_id(message.get("request_id"))
-    if not isinstance(message.get("ok"), bool):
-        raise ValueError("result ok must be a boolean")
+        utterances = parse_utterances(json.dumps({"utterances": result["utterances"]}), contract)
+    except Exception as error:
+        raise ValueError("invalid v2 utterance") from error
+    plan = result.get("plan")
+    _validate_plan(plan)
+    moves = tuple(ConversationMove(move) for move in plan["move_sequence"])
+    if len(moves) != len(utterances) or result["logical_text"] != " ".join(utterances): raise ValueError("inconsistent v2 completed result")
+    return utterances, moves
+
+
+def _validate_frame_text(text: object, budget: TurnBudget) -> None:
+    try:
+        validated = _validate_strict_frame_text(text, max_chars=min(MAX_BUBBLE_CHARS, budget.max_chars_per_frame), max_sentences=budget.max_sentences_per_frame)
+    except ValueError as error:
+        raise ValueError("frame text violates frame contract") from error
+    if text != validated:
+        raise ValueError("frame text violates frame contract")
+
+
+def _nonnegative(value: object, name: str) -> None:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0: raise ValueError(f"{name} must be non-negative")
+
+
+def _burst_to_dict(burst: InputBurst) -> dict[str, Any]:
+    return {"burst_id": burst.burst_id, "generation_id": burst.generation_id, "revision": burst.revision, "visible_assistant_utterances": list(burst.visible_assistant_utterances), "accepted_generation_ids": list(burst.accepted_generation_ids), "messages": [{"ordinal": item.ordinal, "update_id": item.update_id, "envelope": asdict(item.envelope)} for item in burst.messages]}
+
+
+def _burst_from_dict(raw: dict[str, Any]) -> InputBurst:
+    try:
+        messages = raw["messages"]
+        if not isinstance(messages, list): raise ValueError
+        return InputBurst(raw["burst_id"], raw["generation_id"], raw["revision"], tuple(InboundMessage(item["ordinal"], item["update_id"], _envelope_from_dict(item["envelope"])) for item in messages), tuple(raw.get("visible_assistant_utterances", ())), tuple(raw.get("accepted_generation_ids", ())))
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("invalid inbound burst") from error
+
+
+def _envelope_from_dict(raw: object) -> InboundEnvelope:
+    if not isinstance(raw, dict): raise ValueError("inbound envelope must be an object")
+    try:
+        attachments = raw.get("attachments", [])
+        if not isinstance(attachments, list) or not all(isinstance(item, dict) for item in attachments): raise ValueError
+        return InboundEnvelope(raw["connector"], raw["actor_id"], raw["message_id"], raw["text"], raw.get("timestamp", ""), tuple(MessageAttachment(**item) for item in attachments), raw.get("location"), raw.get("native_metadata", {}))
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("invalid inbound envelope") from error
+
+
+class SandboxProtocolError(ValueError):
+    def __init__(self, code: str) -> None: self.code = code; super().__init__(f"sandbox returned {code}")
+
+
+def encode_result(request_id: str, bubbles: list[OutboundBubble]) -> str:
+    _validate_request_id(request_id); _validate_bubbles(bubbles)
+    return _encode({"version": LEGACY_PROTOCOL_VERSION, "request_id": request_id, "ok": True, "bubbles": [asdict(item) for item in bubbles]})
+
+
+def encode_error(request_id: str, code: str) -> str:
+    _validate_request_id(request_id)
+    if not isinstance(code, str) or not code: raise ValueError("error code must be a non-empty string")
+    return _encode({"version": LEGACY_PROTOCOL_VERSION, "request_id": request_id, "ok": False, "error": {"code": code}})
+
+
+def parse_result_marker(output: str, expected_request_id: str) -> list[OutboundBubble]:
+    marked = [line[len(RESULT_MARKER):] for line in output.splitlines() if line.startswith(RESULT_MARKER)]
+    if len(marked) != 1: raise ValueError("sandbox output must contain exactly one result marker")
+    message = _json_object(marked[0])
+    if message.get("version") != LEGACY_PROTOCOL_VERSION or message.get("request_id") != expected_request_id: raise ValueError("invalid result marker")
+    if message.get("ok") is False: raise SandboxProtocolError(message.get("error", {}).get("code", "unknown"))
+    if message.get("ok") is not True or not isinstance(message.get("bubbles"), list): raise ValueError("invalid result")
+    try: bubbles = [OutboundBubble(**item) for item in message["bubbles"]]
+    except (TypeError, ValueError) as error: raise ValueError("invalid result bubble") from error
+    _validate_bubbles(bubbles); return bubbles
+
+
+def _decode(payload: str, message_type: str, versions: set[int]) -> dict[str, Any]:
+    message = _json_object(payload)
+    if message.get("version") not in versions: raise ValueError("unsupported protocol version")
+    if message.get("type") != message_type: raise ValueError(f"expected {message_type} payload")
+    _validate_request_id(message.get("request_id")); return message
+
+
+def _json_object(payload: str) -> dict[str, Any]:
+    try: message = json.loads(payload)
+    except (TypeError, json.JSONDecodeError) as error: raise ValueError("protocol payload must be JSON") from error
+    if not isinstance(message, dict): raise ValueError("protocol payload must be an object")
     return message
 
 
-def _decode(payload: str, message_type: str) -> dict[str, Any]:
-    try:
-        message = json.loads(payload)
-    except (TypeError, json.JSONDecodeError) as error:
-        raise ValueError("protocol payload must be JSON") from error
-    if not isinstance(message, dict):
-        raise ValueError("protocol payload must be an object")
-    if message.get("version") != PROTOCOL_VERSION:
-        raise ValueError("unsupported protocol version")
-    if message.get("type") != message_type:
-        raise ValueError(f"expected {message_type} payload")
-    _validate_request_id(message.get("request_id"))
-    return message
-
-
-def _encode(message: dict[str, Any]) -> str:
-    return json.dumps(message, separators=(",", ":"), ensure_ascii=True)
-
-
-def _validate_request_id(request_id: object) -> None:
-    if not isinstance(request_id, str) or not _REQUEST_ID_RE.fullmatch(request_id):
-        raise ValueError("request_id must be 1-128 URL-safe characters")
-
-
-def _validate_generation_id(generation_id: object) -> None:
-    if not isinstance(generation_id, str) or not generation_id.strip():
-        raise ValueError("generation_id must be non-empty")
-
-
+def _encode(message: dict[str, Any]) -> str: return json.dumps(message, separators=(",", ":"), ensure_ascii=True)
+def _validate_request_id(value: object) -> None:
+    if not isinstance(value, str) or not _REQUEST_ID_RE.fullmatch(value): raise ValueError("request_id must be 1-128 URL-safe characters")
+def _validate_generation_id(value: object) -> None:
+    if not isinstance(value, str) or not value.strip(): raise ValueError("generation_id must be non-empty")
 def _validate_error_diagnostics(exception_class: object, traceback: object) -> None:
-    if exception_class is not None and (
-        not isinstance(exception_class, str) or not _EXCEPTION_CLASS_RE.fullmatch(exception_class)
-    ):
-        raise ValueError("error exception_class must be a safe class name")
-    if not isinstance(traceback, tuple) or len(traceback) > MAX_ERROR_TRACEBACK_FRAMES:
-        raise ValueError("error traceback must contain at most 12 frames")
+    if exception_class is not None and (not isinstance(exception_class, str) or not _EXCEPTION_CLASS_RE.fullmatch(exception_class)): raise ValueError("error exception_class must be a safe class name")
+    if not isinstance(traceback, tuple) or len(traceback) > MAX_ERROR_TRACEBACK_FRAMES: raise ValueError("error traceback must contain at most 12 frames")
     for frame in traceback:
-        if not isinstance(frame, SandboxTracebackFrame):
-            raise ValueError("error traceback frames must be SandboxTracebackFrame values")
-        if not isinstance(frame.basename, str) or not _TRACEBACK_BASENAME_RE.fullmatch(frame.basename):
-            raise ValueError("error traceback basename must be a filename")
-        if not isinstance(frame.function, str) or not _TRACEBACK_FUNCTION_RE.fullmatch(frame.function):
-            raise ValueError("error traceback function must be a safe function name")
-        if not isinstance(frame.line, int) or isinstance(frame.line, bool) or frame.line < 1:
-            raise ValueError("error traceback line must be positive")
-
-
-def _required_string(message: dict[str, Any], name: str) -> str:
-    value = message.get(name)
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"inbound {name} must be a non-empty string")
-    return value
-
-
+        if (not isinstance(frame, SandboxTracebackFrame) or not isinstance(frame.basename, str) or not _TRACEBACK_BASENAME_RE.fullmatch(frame.basename)
+                or not isinstance(frame.function, str) or not _TRACEBACK_FUNCTION_RE.fullmatch(frame.function)
+                or not isinstance(frame.line, int) or isinstance(frame.line, bool) or frame.line < 1):
+            raise ValueError("invalid error traceback frame")
 def _validate_bubbles(bubbles: list[OutboundBubble]) -> None:
-    if not 1 <= len(bubbles) <= MAX_BUBBLES:
-        raise ValueError("result must contain 1 to 4 bubbles")
-    for bubble in bubbles:
-        if not isinstance(bubble.text, str) or not bubble.text or len(bubble.text) > MAX_BUBBLE_CHARS:
-            raise ValueError("bubble text must contain 1 to 4096 characters")
-        if bubble.reply_to_message_id is not None and not isinstance(bubble.reply_to_message_id, str):
-            raise ValueError("bubble reply_to_message_id must be a string or null")
+    if not 1 <= len(bubbles) <= MAX_BUBBLES: raise ValueError("result must contain 1 to 4 bubbles")
+    if any(not isinstance(item.text, str) or not item.text or len(item.text) > MAX_BUBBLE_CHARS for item in bubbles): raise ValueError("invalid bubble")

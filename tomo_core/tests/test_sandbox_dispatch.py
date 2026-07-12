@@ -2,21 +2,62 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from tomo_core.daytona_client import ExecResult, SandboxHandle, SessionCommandHandle
+from tomo_core.daytona_client import DaytonaClientError, ExecResult, SandboxHandle, SessionCommandHandle
 from tomo_core.models import InboundEnvelope
 from tomo_core.onboarding_store import InterruptedGeneration, TelegramGenerationInput, TelegramGenerationWork
 from tomo_core.sandbox_dispatch import SandboxDispatch, SandboxDispatchError
 from tomo_core.sandbox_registry import SandboxRegistry
 from tomo_core.sandbox_protocol import EVENT_MARKER, RESULT_MARKER, SandboxErrorEvent, SandboxTracebackFrame, encode_error, encode_event, encode_result
-from tomo_core.conversation.models import ConversationCompleted, ConversationMove, ConversationResult, MoveConfidence, MovePlan, UtteranceReady
+from tomo_core.conversation.models import ConversationMove, Frame, FrameReady, MoveConfidence, MovePlan, SegmentFinish, SegmentResult, ToolCall, TurnBudget, TurnRunCompleted, TurnRunResult, TurnRunStatus, TurnUsage
+from tomo_core.runtime import RuntimeCompleted, RuntimeFrameReady
 from tomo_core.models import OutboundBubble
 from tomo_core.onboarding_store import TelegramInstallation
 
 
+def legacy_event(request_id, generation_id, sequence, event_type, **fields):
+    import json
+    return EVENT_MARKER + json.dumps({
+        "version": 2,
+        "request_id": request_id,
+        "generation_id": generation_id,
+        "sequence": sequence,
+        "type": event_type,
+        **fields,
+    }) + "\n"
+
+
 def completed_marker(request_id, generation_id, sequence, text, move=ConversationMove.ANSWER):
-    plan = MovePlan(move, (), move.value, MoveConfidence.HIGH, (move,))
-    completed = ConversationCompleted(ConversationResult(plan, (text,)))
-    return EVENT_MARKER + encode_event(request_id, generation_id, sequence, completed) + "\n"
+    return legacy_event(
+        request_id,
+        generation_id,
+        sequence,
+        "completed",
+        result={"logical_text": text, "utterances": [text], "plan": {"primary_move": move.value, "supporting_moves": [], "move_sequence": [move.value], "response_goal": move.value, "confidence": "high"}},
+    )
+
+
+def v3_markers(request_id, generation_id, text):
+    frame = Frame(0, 0, text)
+    plan = MovePlan(ConversationMove.ANSWER, (), "answer", MoveConfidence.HIGH, (ConversationMove.ANSWER,))
+    result = TurnRunResult(plan, (SegmentResult(0, (frame,), (), SegmentFinish.COMPLETE),), (frame,), TurnUsage(1, 0, 0, 1), TurnRunStatus.COMPLETED)
+    return (
+        EVENT_MARKER + encode_event(request_id, generation_id, 0, RuntimeFrameReady(FrameReady(0, frame), OutboundBubble(text))) + "\n",
+        EVENT_MARKER + encode_event(request_id, generation_id, 1, RuntimeCompleted(TurnRunCompleted(result))) + "\n",
+    )
+
+
+def v3_tool_turn_markers(request_id, generation_id):
+    frame = Frame(4, 0, "complete.")
+    plan = MovePlan(ConversationMove.ANSWER, (), "answer", MoveConfidence.HIGH, (ConversationMove.ANSWER,))
+    segments = tuple(
+        SegmentResult(index, (), (ToolCall(f"call-{index}", "lookup", {}),), SegmentFinish.TOOL_BATCH)
+        for index in range(4)
+    ) + (SegmentResult(4, (frame,), (), SegmentFinish.COMPLETE),)
+    result = TurnRunResult(plan, segments, (frame,), TurnUsage(5, 4, 4, 1), TurnRunStatus.COMPLETED)
+    return (
+        EVENT_MARKER + encode_event(request_id, generation_id, 0, RuntimeFrameReady(FrameReady(0, frame), OutboundBubble(frame.text))) + "\n",
+        EVENT_MARKER + encode_event(request_id, generation_id, 1, RuntimeCompleted(TurnRunCompleted(result))) + "\n",
+    )
 
 
 class SandboxDispatchTests(unittest.TestCase):
@@ -104,14 +145,7 @@ class SandboxDispatchTests(unittest.TestCase):
         self.daytona.iter_session_logs.return_value = iter(
             [
                 "log line\n",
-                EVENT_MARKER
-                + encode_event(
-                    "telegram-generation-burst-one-r1",
-                    "burst:one/r1",
-                    0,
-                    UtteranceReady(0, ConversationMove.ACKNOWLEDGE, "hello."),
-                )
-                + "\n",
+                legacy_event("telegram-generation-burst-one-r1", "burst:one/r1", 0, "utterance", move="acknowledge", text="hello."),
                 completed_marker("telegram-generation-burst-one-r1", "burst:one/r1", 1, "hello.", ConversationMove.ACKNOWLEDGE),
             ]
         )
@@ -120,6 +154,7 @@ class SandboxDispatchTests(unittest.TestCase):
         events = list(self.dispatch.iter_telegram_events(self.installation, work))
 
         self.assertEqual(events[0].text, "hello.")
+        self.assertEqual((events[0].segment_index, events[0].frame_index, events[0].legacy_move), (0, 0, ConversationMove.ACKNOWLEDGE))
         self.daytona.start_session_command.assert_called_once()
         sandbox, session_id, command = self.daytona.start_session_command.call_args.args
         self.assertEqual(sandbox.id, "sbx-1")
@@ -131,6 +166,59 @@ class SandboxDispatchTests(unittest.TestCase):
         self.assertNotIn("hello", command)
         self.daytona.iter_session_logs.assert_called_once_with(sandbox, SessionCommandHandle("telegram-burst-one-r1", "cmd-1"))
         self.daytona.delete_session.assert_called_once_with(sandbox, "persisted-session")
+
+    def test_iter_telegram_events_streams_v3_frame_coordinates(self):
+        work = self._work()
+        self.daytona.start_session_command.return_value = SessionCommandHandle("telegram-burst-one-r1", "cmd-1")
+        self.daytona.iter_session_logs.return_value = iter(v3_markers("telegram-generation-burst-one-r1", "burst:one/r1", "hello."))
+        self.daytona.session_command_exit_code.return_value = 0
+
+        events = list(self.dispatch.iter_telegram_events(self.installation, work))
+
+        self.assertEqual((events[0].segment_index, events[0].frame_index, events[0].legacy_move), (0, 0, None))
+
+    def test_iter_telegram_events_uses_the_configured_tool_budget(self):
+        work = self._work()
+        self.daytona.start_session_command.return_value = SessionCommandHandle("telegram-burst-one-r1", "cmd-1")
+        markers = v3_tool_turn_markers("telegram-generation-burst-one-r1", "burst:one/r1")
+        self.daytona.iter_session_logs.return_value = iter(markers)
+        self.daytona.session_command_exit_code.return_value = 0
+
+        events = list(self.dispatch.iter_telegram_events(self.installation, work))
+
+        self.assertEqual(events[0].segment_index, 4)
+
+        limited = SandboxDispatch(self.supervisor, self.daytona, self.auth, data_dir="/var/lib/tomo", xai_model="grok-4.5", xai_reasoning_effort="high", budget=TurnBudget(4, 3, 3, 3, 3, 3, 800))
+        self.daytona.iter_session_logs.return_value = iter(markers)
+        with self.assertRaises(SandboxDispatchError) as raised:
+            list(limited.iter_telegram_events(self.installation, work))
+        self.assertEqual(raised.exception.code, "invalid_result")
+
+    def test_iter_telegram_events_does_not_start_when_inactive(self):
+        self.assertEqual(list(self.dispatch.iter_telegram_events(self.installation, self._work(), is_active=lambda: False)), [])
+        self.daytona.start_session_command.assert_not_called()
+
+    def test_iter_telegram_events_stops_after_a_frame_becomes_stale(self):
+        work = self._work()
+        self.daytona.start_session_command.return_value = SessionCommandHandle("telegram-burst-one-r1", "cmd-1")
+        self.daytona.iter_session_logs.return_value = iter(v3_markers("telegram-generation-burst-one-r1", "burst:one/r1", "hello."))
+        self.daytona.session_command_exit_code.return_value = 0
+        active = [True]
+        events = self.dispatch.iter_telegram_events(self.installation, work, is_active=lambda: active[0])
+
+        self.assertEqual(next(events).text, "hello.")
+        active[0] = False
+        self.assertEqual(list(events), [])
+        self.daytona.delete_session.assert_called_once()
+
+    def test_iter_telegram_events_ignores_session_cleanup_failure(self):
+        work = self._work()
+        self.daytona.start_session_command.return_value = SessionCommandHandle("telegram-burst-one-r1", "cmd-1")
+        self.daytona.iter_session_logs.return_value = iter(v3_markers("telegram-generation-burst-one-r1", "burst:one/r1", "hello."))
+        self.daytona.session_command_exit_code.return_value = 0
+        self.daytona.delete_session.side_effect = DaytonaClientError("cleanup failed")
+
+        self.assertEqual([event.text for event in self.dispatch.iter_telegram_events(self.installation, work) if hasattr(event, "text")], ["hello."])
 
     def test_iter_telegram_events_preserves_photo_attachment_boundary(self):
         work = TelegramGenerationWork(
@@ -153,14 +241,7 @@ class SandboxDispatchTests(unittest.TestCase):
         self.daytona.start_session_command.return_value = SessionCommandHandle("photo-session", "photo-session")
         self.daytona.iter_session_logs.return_value = iter(
             [
-                EVENT_MARKER
-                + encode_event(
-                    "telegram-generation-gen-photo",
-                    "gen-photo",
-                    0,
-                    UtteranceReady(0, ConversationMove.ANSWER, "done."),
-                )
-                + "\n",
+                legacy_event("telegram-generation-gen-photo", "gen-photo", 0, "utterance", move="answer", text="done."),
                 completed_marker("telegram-generation-gen-photo", "gen-photo", 1, "done."),
             ]
         )
@@ -177,14 +258,7 @@ class SandboxDispatchTests(unittest.TestCase):
         self.daytona.start_session_command.return_value = SessionCommandHandle("telegram-burst-one-r1", "cmd-1")
         self.daytona.iter_session_logs.return_value = iter(
             [
-                EVENT_MARKER
-                + encode_event(
-                    "telegram-generation-burst-one-r1",
-                    "other-generation",
-                    0,
-                    UtteranceReady(0, ConversationMove.ANSWER, "wrong."),
-                )
-                + "\n"
+                legacy_event("telegram-generation-burst-one-r1", "other-generation", 0, "utterance", move="answer", text="wrong.")
             ]
         )
 
@@ -209,7 +283,7 @@ class SandboxDispatchTests(unittest.TestCase):
             iter([EVENT_MARKER + encode_event("telegram-generation-burst-one-r1", "burst:one/r1", 0, SandboxErrorEvent(0, "auth_expired")) + "\n"]),
             iter(
                 [
-                    EVENT_MARKER + encode_event("telegram-generation-burst-one-r1", "burst:one/r1", 0, UtteranceReady(0, ConversationMove.ANSWER, "ok.")) + "\n",
+                    legacy_event("telegram-generation-burst-one-r1", "burst:one/r1", 0, "utterance", move="answer", text="ok."),
                     completed_marker("telegram-generation-burst-one-r1", "burst:one/r1", 1, "ok."),
                 ]
             ),

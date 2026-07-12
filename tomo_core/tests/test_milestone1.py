@@ -63,12 +63,12 @@ class MilestoneOneTests(unittest.TestCase):
 
         with self.assertRaises(ConversationOutputError) as raised:
             ConversationEngine(provider).respond(request)
-        self.assertEqual(raised.exception.code, "sentence_limit")
+        self.assertEqual(raised.exception.code, "frame_sentence_limit")
 
     def test_static_provider_preserves_the_configured_smoke_response(self):
         response = "yo. telegram is wired."
         request = ConversationRequest.from_history(envelope=InboundEnvelope("telegram", "u", "m", "go"), soul="soul", history=())
-        self.assertEqual(ConversationEngine(StaticProvider(response)).respond(request).utterances, (response,))
+        self.assertEqual(tuple(frame.text for frame in ConversationEngine(StaticProvider(response)).respond(request).frames), (response,))
 
     def test_sentence_boundaries_do_not_split_urls_versions_or_decimals(self):
         text = "use https://example.com/a with v2.1 and 3.14 values. then continue."

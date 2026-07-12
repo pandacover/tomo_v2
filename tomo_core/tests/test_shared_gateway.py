@@ -10,7 +10,7 @@ from tomo_core.onboarding_store import TelegramOnboardingStore
 from tomo_core.providers import StaticProvider
 from tomo_core.shared_gateway import InProcessTelegramRuntimeDispatch, SharedTelegramGateway
 from tomo_core.sandbox_dispatch import SandboxDispatchError
-from tomo_core.sandbox_protocol import SandboxCompletedEvent, SandboxUtteranceEvent
+from tomo_core.sandbox_protocol import SandboxCompletedEvent, SandboxFrameEvent
 from tomo_core.telegram import FakeTelegramClient
 from tomo_core.telegram_router import RetryableTelegramUpdateError
 
@@ -48,8 +48,8 @@ class FakeRuntimeDispatch:
 
     def iter_telegram_events(self, installation, work, is_active=None):
         self.calls.append(("iter", installation, work))
-        yield SandboxUtteranceEvent(0, "acknowledge", "first.")
-        yield SandboxUtteranceEvent(1, "answer", "second.")
+        yield SandboxFrameEvent(0, 0, 0, "first.")
+        yield SandboxFrameEvent(1, 0, 1, "second.")
         yield SandboxCompletedEvent(2, {"logical_text": "first. second."})
 
 
@@ -118,6 +118,7 @@ class SharedGatewayTests(unittest.TestCase):
 
             self.assertEqual(client.typing_actor_ids, ["123"])
             self.assertEqual(client.sent_messages[-1]["actor_id"], "123")
+            self.assertEqual(client.sent_messages[-1]["text"], "hello")
             session = instances.get(installation.tomo_id).sessions.load("telegram:actor:999")
             self.assertEqual(session.model_history()[-2]["content"], "hi")
 
@@ -214,7 +215,7 @@ class SharedGatewayTests(unittest.TestCase):
             self.assertEqual([message["text"] for message in client.sent_messages], ["first.", "second."])
             self.assertEqual([message["reply_to_message_id"] for message in client.sent_messages], ["2", None])
             self.assertFalse(store.is_generation_active(work.generation_id, work.revision))
-            self.assertFalse(store.reserve_delivery(work.generation_id, work.revision, 2, "answer", "late.", None))
+            self.assertFalse(store.reserve_delivery(work.generation_id, work.revision, 2, 0, 2, "late.", None))
 
     def test_generation_work_sends_event_zero_before_event_one_is_generated(self):
         with self._store() as store:
@@ -224,9 +225,9 @@ class SharedGatewayTests(unittest.TestCase):
 
             class InspectingDispatch(FakeRuntimeDispatch):
                 def iter_telegram_events(self, installation, work, is_active=None):
-                    yield SandboxUtteranceEvent(0, "acknowledge", "first.")
+                    yield SandboxFrameEvent(0, 0, 0, "first.")
                     self.calls.append(("after-first", len(client.sent_messages)))
-                    yield SandboxUtteranceEvent(1, "answer", "second.")
+                    yield SandboxFrameEvent(1, 0, 1, "second.")
                     yield SandboxCompletedEvent(2, {"logical_text": "first. second."})
 
             dispatch = InspectingDispatch()
@@ -247,6 +248,7 @@ class SharedGatewayTests(unittest.TestCase):
             self.assertTrue(gateway.process_update(work))
 
             self.assertEqual(client.sent_messages, [])
+            self.assertIsNone(store.delivery_status(work.generation_id, 0))
 
     def test_generation_work_marks_reservation_suppressed_if_revision_turns_stale_after_reserve(self):
         with self._store() as store:
@@ -290,6 +292,26 @@ class SharedGatewayTests(unittest.TestCase):
             replacement = store.claim_next_work(now=time.time() + 1)
             self.assertIsNotNone(replacement)
             self.assertEqual(replacement.visible_assistant_utterances, ("first.",))
+
+    def test_generation_work_marks_sent_frame_unknown_when_acknowledgement_fails(self):
+        with self._store() as store:
+            installation = self._installation(store, chat_id="123", actor_id="999")
+            work = self._generation_work(store, installation.tomo_id)
+            original_mark_sent = store.mark_delivery_sent
+
+            def fail_acknowledgement(*args, **kwargs):
+                return False
+
+            store.mark_delivery_sent = fail_acknowledgement
+            client = FakeTelegramClient()
+            gateway = SharedTelegramGateway(client=client, store=store, dispatch=FakeRuntimeDispatch(), pace_seconds=0)
+
+            gateway.process_update(work)
+
+            self.assertEqual([message["text"] for message in client.sent_messages], ["first.", "second."])
+            self.assertEqual(store.delivery_status(work.generation_id, 0), "unknown")
+            self.assertTrue(store.is_generation_active(work.generation_id, work.revision))
+            store.mark_delivery_sent = original_mark_sent
 
     def test_in_process_dispatch_passes_active_predicate_to_runtime(self):
         with self._store() as store:

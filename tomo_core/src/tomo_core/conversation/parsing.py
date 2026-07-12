@@ -24,26 +24,39 @@ class ConversationOutputError(ValueError):
         super().__init__(f"invalid conversation output: {code}")
 
 
-def parse_move_plan(raw: str) -> MovePlan:
-    try:
-        payload = json.loads(raw)
-        if not isinstance(payload, dict) or set(payload) - _ALLOWED_MOVE_PLAN_KEYS or not _REQUIRED_MOVE_PLAN_KEYS <= set(payload):
-            raise ValueError("invalid move plan keys")
-        supporting = payload["supporting_moves"]
-        if not isinstance(supporting, list):
-            raise ValueError("supporting_moves must be a list")
-        response_goal = payload["response_goal"]
-        if not isinstance(response_goal, str):
-            raise ValueError("response_goal must be text")
-        return MovePlan(
-            primary=ConversationMove(payload["primary_move"]),
-            supporting=tuple(ConversationMove(item) for item in supporting),
-            response_goal=response_goal,
-            confidence=MoveConfidence(payload["confidence"]),
-            sequence=tuple(ConversationMove(item) for item in payload.get("move_sequence", (payload["primary_move"], *supporting))),
-        )
-    except (TypeError, ValueError, KeyError, json.JSONDecodeError):
-        return MovePlan.direct_answer()
+def _parse_strict_move_plan_payload(payload: object) -> MovePlan:
+    if not isinstance(payload, dict) or set(payload) - _ALLOWED_MOVE_PLAN_KEYS or not _REQUIRED_MOVE_PLAN_KEYS <= set(payload):
+        raise ValueError("invalid move plan keys")
+    supporting = payload["supporting_moves"]
+    if not isinstance(supporting, list):
+        raise ValueError("supporting_moves must be a list")
+    response_goal = payload["response_goal"]
+    if not isinstance(response_goal, str):
+        raise ValueError("response_goal must be text")
+    return MovePlan(
+        primary=ConversationMove(payload["primary_move"]),
+        supporting=tuple(ConversationMove(item) for item in supporting),
+        response_goal=response_goal,
+        confidence=MoveConfidence(payload["confidence"]),
+        sequence=tuple(ConversationMove(item) for item in payload.get("move_sequence", (payload["primary_move"], *supporting))),
+    )
+
+
+def _validate_strict_frame_text(text: object, *, max_chars: int, max_sentences: int) -> str:
+    if not isinstance(text, str) or not text.strip() or "\n" in text or "\r" in text:
+        raise ValueError("invalid_frame")
+    cleaned = text.strip()
+    if len(cleaned) > max_chars:
+        raise ValueError("frame_too_long")
+    if "—" in cleaned or "–" in cleaned:
+        raise ValueError("banned_dash")
+    if _MARKDOWN_RE.search(cleaned):
+        raise ValueError("markdown")
+    if _INTERNAL_LABEL_RE.search(cleaned):
+        raise ValueError("internal_label")
+    if len(split_sentences(cleaned)) > max_sentences:
+        raise ValueError("frame_sentence_limit")
+    return cleaned
 
 
 def parse_utterances(raw: str, contract: ResponseContract | None = None) -> tuple[str, ...]:

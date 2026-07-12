@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Sequence, TypeAlias
+from math import isfinite
+from types import MappingProxyType
+from typing import Mapping, Sequence, TypeAlias
 
 from ..models import InboundEnvelope, InboundMessage, InputBurst
 
@@ -24,6 +26,272 @@ class MoveConfidence(str, Enum):
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
+
+
+class SegmentFinish(str, Enum):
+    COMPLETE = "complete"
+    TOOL_BATCH = "tool_batch"
+    PARTIAL = "partial"
+    FAILED = "failed"
+
+
+class TurnRunStatus(str, Enum):
+    COMPLETED = "completed"
+    COMPLETED_PARTIAL = "completed_partial"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+
+
+def _compact_text(value: object, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be text")
+    value = value.strip()
+    if not value or "\n" in value or "\r" in value:
+        raise ValueError(f"{field_name} must be a compact nonblank string")
+    return value
+
+
+def _nonblank_text(value: object, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be text")
+    value = value.strip()
+    if not value:
+        raise ValueError(f"{field_name} must be nonblank")
+    return value
+
+
+def _nonnegative_integer(value: object, field_name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(f"{field_name} must be a non-negative integer")
+    return value
+
+
+@dataclass(frozen=True)
+class Frame:
+    segment_index: int
+    frame_index: int
+    text: str
+
+    def __post_init__(self) -> None:
+        _nonnegative_integer(self.segment_index, "frame segment_index")
+        _nonnegative_integer(self.frame_index, "frame frame_index")
+        object.__setattr__(self, "text", _compact_text(self.text, "frame text"))
+
+
+@dataclass(frozen=True)
+class TurnBudget:
+    max_model_segments: int
+    max_tool_rounds: int
+    max_tool_calls: int
+    max_visible_segments: int
+    max_frames_per_segment: int
+    max_sentences_per_frame: int
+    max_chars_per_frame: int
+    max_contract_repairs: int = 1
+    max_elapsed_seconds: float = 120.0
+
+    def __post_init__(self) -> None:
+        for field_name in ("max_model_segments", "max_visible_segments", "max_frames_per_segment", "max_sentences_per_frame", "max_chars_per_frame"):
+            if _nonnegative_integer(getattr(self, field_name), field_name) < 1:
+                raise ValueError(f"{field_name} must be positive")
+        for field_name in ("max_tool_rounds", "max_tool_calls", "max_contract_repairs"):
+            _nonnegative_integer(getattr(self, field_name), field_name)
+        if self.max_frames_per_segment > 3:
+            raise ValueError("max_frames_per_segment cannot exceed 3")
+        if self.max_sentences_per_frame > 3:
+            raise ValueError("max_sentences_per_frame cannot exceed 3")
+        if self.max_chars_per_frame > 4096:
+            raise ValueError("max_chars_per_frame cannot exceed 4096")
+        if self.max_tool_rounds > self.max_tool_calls:
+            raise ValueError("max_tool_rounds cannot exceed max_tool_calls")
+        if not isinstance(self.max_elapsed_seconds, (int, float)) or isinstance(self.max_elapsed_seconds, bool) or not isfinite(self.max_elapsed_seconds) or self.max_elapsed_seconds <= 0:
+            raise ValueError("max_elapsed_seconds must be positive")
+
+    def validate_usage(self, usage: "TurnUsage") -> None:
+        if not isinstance(usage, TurnUsage):
+            raise ValueError("usage must be a TurnUsage")
+        limits = {
+            "model_segments": self.max_model_segments,
+            "tool_rounds": self.max_tool_rounds,
+            "tool_calls": self.max_tool_calls,
+            "visible_segments": self.max_visible_segments,
+            "contract_repairs": self.max_contract_repairs,
+        }
+        for field_name, limit in limits.items():
+            if getattr(usage, field_name) > limit:
+                raise ValueError(f"usage {field_name} exceeds its budget")
+
+
+@dataclass(frozen=True)
+class TurnUsage:
+    model_segments: int = 0
+    tool_rounds: int = 0
+    tool_calls: int = 0
+    visible_segments: int = 0
+    contract_repairs: int = 0
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+    def __post_init__(self) -> None:
+        for field_name in ("model_segments", "tool_rounds", "tool_calls", "visible_segments", "contract_repairs"):
+            _nonnegative_integer(getattr(self, field_name), field_name)
+        for field_name in ("input_tokens", "output_tokens"):
+            value = getattr(self, field_name)
+            if value is not None:
+                _nonnegative_integer(value, field_name)
+        if self.tool_rounds > self.tool_calls:
+            raise ValueError("tool_rounds cannot exceed tool_calls")
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    call_id: str
+    name: str
+    arguments: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "call_id", _compact_text(self.call_id, "tool call_id"))
+        object.__setattr__(self, "name", _compact_text(self.name, "tool name"))
+        if not isinstance(self.arguments, Mapping):
+            raise ValueError("tool arguments must be a mapping")
+        object.__setattr__(self, "arguments", MappingProxyType(dict(self.arguments)))
+
+
+@dataclass(frozen=True)
+class ToolObservation:
+    call_id: str
+    name: str
+    ok: bool
+    content: str
+    error_code: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "call_id", _compact_text(self.call_id, "tool observation call_id"))
+        object.__setattr__(self, "name", _compact_text(self.name, "tool observation name"))
+        if not isinstance(self.ok, bool):
+            raise ValueError("tool observation ok must be a boolean")
+        object.__setattr__(self, "content", _nonblank_text(self.content, "tool observation content"))
+        if self.error_code is not None:
+            object.__setattr__(self, "error_code", _compact_text(self.error_code, "tool observation error_code"))
+
+
+@dataclass(frozen=True)
+class SegmentResult:
+    index: int
+    frames: tuple[Frame, ...]
+    tool_calls: tuple[ToolCall, ...]
+    finish: SegmentFinish
+
+    def __post_init__(self) -> None:
+        _nonnegative_integer(self.index, "segment index")
+        frames = tuple(self.frames)
+        tool_calls = tuple(self.tool_calls)
+        if len(frames) > 3:
+            raise ValueError("a segment can contain at most three frames")
+        if any(not isinstance(frame, Frame) for frame in frames):
+            raise ValueError("segment frames must be Frames")
+        if any(frame.segment_index != self.index for frame in frames):
+            raise ValueError("segment frame indices must match the segment")
+        if [frame.frame_index for frame in frames] != list(range(len(frames))):
+            raise ValueError("segment frame indices must be contiguous from zero")
+        if any(not isinstance(call, ToolCall) for call in tool_calls):
+            raise ValueError("segment tool calls must be ToolCalls")
+        if len({call.call_id for call in tool_calls}) != len(tool_calls):
+            raise ValueError("segment tool call IDs must be unique")
+        finish = SegmentFinish(self.finish)
+        if finish is SegmentFinish.FAILED:
+            if frames or tool_calls:
+                raise ValueError("a failed segment cannot contain frames or tool calls")
+        elif finish is SegmentFinish.TOOL_BATCH:
+            if not tool_calls:
+                raise ValueError("a tool batch segment requires tool calls")
+        elif tool_calls:
+            raise ValueError("only a tool batch segment can contain tool calls")
+        elif not frames:
+            raise ValueError("a completed or partial segment requires frames")
+        object.__setattr__(self, "frames", frames)
+        object.__setattr__(self, "tool_calls", tool_calls)
+        object.__setattr__(self, "finish", finish)
+
+
+@dataclass(frozen=True)
+class TurnRunResult:
+    plan: "MovePlan"
+    segments: tuple[SegmentResult, ...]
+    frames: tuple[Frame, ...]
+    usage: TurnUsage
+    status: TurnRunStatus
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.plan, MovePlan):
+            raise ValueError("turn run requires a move plan")
+        segments = tuple(self.segments)
+        frames = tuple(self.frames)
+        if not segments or any(not isinstance(segment, SegmentResult) for segment in segments):
+            raise ValueError("turn run requires segment results")
+        if [segment.index for segment in segments] != list(range(len(segments))):
+            raise ValueError("turn run segment indices must be contiguous from zero")
+        expected_frames = tuple(frame for segment in segments for frame in segment.frames)
+        if frames != expected_frames:
+            raise ValueError("turn run frames must flatten segment frames in order")
+        tool_call_ids = [call.call_id for segment in segments for call in segment.tool_calls]
+        if len(set(tool_call_ids)) != len(tool_call_ids):
+            raise ValueError("turn run tool call IDs must be unique")
+        if not isinstance(self.usage, TurnUsage):
+            raise ValueError("turn run requires usage")
+        expected_usage = {
+            "model_segments": len(segments),
+            "tool_rounds": sum(segment.finish is SegmentFinish.TOOL_BATCH for segment in segments),
+            "tool_calls": sum(len(segment.tool_calls) for segment in segments),
+            "visible_segments": sum(bool(segment.frames) for segment in segments),
+        }
+        for field_name, expected in expected_usage.items():
+            if getattr(self.usage, field_name) != expected:
+                raise ValueError(f"turn run usage {field_name} must match its segments")
+        status = TurnRunStatus(self.status)
+        if status is TurnRunStatus.COMPLETED and segments[-1].finish is not SegmentFinish.COMPLETE:
+            raise ValueError("a completed turn run must end with a complete segment")
+        if status is TurnRunStatus.COMPLETED_PARTIAL:
+            if not frames or segments[-1].finish not in {SegmentFinish.PARTIAL, SegmentFinish.FAILED, SegmentFinish.TOOL_BATCH}:
+                raise ValueError("a partial turn run requires visible frames and a partial boundary")
+        if status is TurnRunStatus.FAILED and segments[-1].finish is not SegmentFinish.FAILED:
+            raise ValueError("a failed turn run must end with a failed segment")
+        object.__setattr__(self, "segments", segments)
+        object.__setattr__(self, "frames", frames)
+        object.__setattr__(self, "status", status)
+
+    @property
+    def logical_text(self) -> str:
+        return " ".join(frame.text for frame in self.frames)
+
+
+@dataclass(frozen=True)
+class FrameReady:
+    sequence: int
+    frame: Frame
+
+    def __post_init__(self) -> None:
+        _nonnegative_integer(self.sequence, "frame sequence")
+        if not isinstance(self.frame, Frame):
+            raise ValueError("frame ready requires a Frame")
+
+
+@dataclass(frozen=True)
+class TurnRunStarted:
+    plan: "MovePlan"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.plan, MovePlan):
+            raise ValueError("turn run start requires a move plan")
+
+
+@dataclass(frozen=True)
+class TurnRunCompleted:
+    result: TurnRunResult
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.result, TurnRunResult):
+            raise ValueError("turn run completion requires a TurnRunResult")
 
 
 @dataclass(frozen=True)
@@ -103,53 +371,4 @@ class MovePlan:
         )
 
 
-@dataclass(frozen=True)
-class ConversationResult:
-    plan: MovePlan
-    utterances: tuple[str, ...]
-
-    def __post_init__(self) -> None:
-        if not 1 <= len(self.utterances) <= 4:
-            raise ValueError("conversation result must contain 1 to 4 utterances")
-        if any(not utterance.strip() for utterance in self.utterances):
-            raise ValueError("utterances cannot be empty")
-
-    @property
-    def logical_text(self) -> str:
-        return " ".join(utterance.strip() for utterance in self.utterances)
-
-
-@dataclass(frozen=True)
-class ConversationStarted:
-    plan: MovePlan
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.plan, MovePlan):
-            raise ValueError("conversation start requires a move plan")
-
-
-@dataclass(frozen=True)
-class UtteranceReady:
-    sequence: int
-    move: ConversationMove
-    text: str
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.sequence, int) or self.sequence < 0:
-            raise ValueError("utterance sequence must be non-negative")
-        object.__setattr__(self, "move", ConversationMove(self.move))
-        if not isinstance(self.text, str) or not self.text.strip():
-            raise ValueError("utterance text cannot be empty")
-        object.__setattr__(self, "text", self.text.strip())
-
-
-@dataclass(frozen=True)
-class ConversationCompleted:
-    result: ConversationResult
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.result, ConversationResult):
-            raise ValueError("conversation completion requires a result")
-
-
-ConversationEvent: TypeAlias = ConversationStarted | UtteranceReady | ConversationCompleted
+TurnRunEvent: TypeAlias = TurnRunStarted | FrameReady | TurnRunCompleted

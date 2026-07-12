@@ -1,15 +1,23 @@
 from .engine import ConversationEngine
-from .models import ConversationCompleted, ConversationEvent, ConversationMove, ConversationRequest, ConversationResult, ConversationStarted, MoveConfidence, MovePlan, UtteranceReady
+from .models import ConversationMove, ConversationRequest, Frame, FrameReady, MoveConfidence, MovePlan, SegmentFinish, SegmentResult, ToolCall, ToolObservation, TurnBudget, TurnRunCompleted, TurnRunEvent, TurnRunResult, TurnRunStarted, TurnRunStatus, TurnUsage
 
 __all__ = [
     "ConversationEngine",
     "ConversationMove",
-    "ConversationCompleted",
-    "ConversationEvent",
     "ConversationRequest",
-    "ConversationResult",
-    "ConversationStarted",
+    "Frame",
+    "FrameReady",
     "MoveConfidence",
     "MovePlan",
-    "UtteranceReady",
+    "SegmentFinish",
+    "SegmentResult",
+    "ToolCall",
+    "ToolObservation",
+    "TurnBudget",
+    "TurnRunCompleted",
+    "TurnRunEvent",
+    "TurnRunResult",
+    "TurnRunStarted",
+    "TurnRunStatus",
+    "TurnUsage",
 ]

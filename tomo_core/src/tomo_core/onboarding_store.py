@@ -340,7 +340,26 @@ class TelegramOnboardingStore:
         finally:
             db.close()
 
-    def reserve_delivery(self, generation_id: str, revision: int, sequence: int, move: str, text: str, reply_to_message_id: str | None, *, now: float | None = None) -> bool:
+    def reserve_delivery(
+        self,
+        generation_id: str,
+        revision: int,
+        sequence: int,
+        segment_index: int,
+        frame_index: int,
+        text: str,
+        reply_to_message_id: str | None,
+        legacy_move: str | None = None,
+        *,
+        now: float | None = None,
+    ) -> bool:
+        coordinates = (sequence, segment_index, frame_index)
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in coordinates):
+            raise ValueError("delivery coordinates must be non-negative integers")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("delivery text must be non-blank")
+        if legacy_move is not None and (not isinstance(legacy_move, str) or not legacy_move.strip()):
+            raise ValueError("legacy_move must be a string or None")
         now = time.time() if now is None else now
         db = self._connect()
         try:
@@ -354,10 +373,12 @@ class TelegramOnboardingStore:
                 return False
             result = db.execute(
                 """
-                insert or ignore into telegram_delivery_events(generation_id, sequence, move, text, reply_to_message_id, status, telegram_message_id, created_at, updated_at)
-                values (?, ?, ?, ?, ?, 'reserved', null, ?, ?)
+                insert or ignore into telegram_delivery_events(
+                  generation_id, sequence, segment_index, frame_index, move, text,
+                  reply_to_message_id, status, telegram_message_id, created_at, updated_at
+                ) values (?, ?, ?, ?, ?, ?, ?, 'reserved', null, ?, ?)
                 """,
-                (generation_id, sequence, move, text, reply_to_message_id, now, now),
+                (generation_id, sequence, segment_index, frame_index, legacy_move, text, reply_to_message_id, now, now),
             )
             db.commit()
             return result.rowcount == 1
@@ -641,6 +662,7 @@ class TelegramOnboardingStore:
         db = sqlite3.connect(self.db_path)
         db.row_factory = sqlite3.Row
         try:
+            db.execute("begin immediate")
             db.execute("""
                 create table if not exists telegram_install_tokens(
                   token_hash text primary key,
@@ -724,23 +746,59 @@ class TelegramOnboardingStore:
                   primary key(generation_id, update_id)
                 )
             """)
-            db.execute("""
-                create table if not exists telegram_delivery_events(
-                  generation_id text not null,
-                  sequence integer not null,
-                  move text not null,
-                  text text not null,
-                  reply_to_message_id text,
-                  status text not null check(status in ('reserved','sent','unknown','suppressed')),
-                  telegram_message_id text,
-                  created_at real not null,
-                  updated_at real not null,
-                  primary key(generation_id, sequence)
-                )
-            """)
+            self._ensure_delivery_events_schema(db)
             db.commit()
+        except Exception:
+            db.rollback()
+            raise
         finally:
             db.close()
+
+    def _ensure_delivery_events_schema(self, db: sqlite3.Connection) -> None:
+        columns = {row["name"]: row for row in db.execute("pragma table_info(telegram_delivery_events)")}
+        if not columns:
+            self._create_delivery_events_table(db)
+            return
+        if {"segment_index", "frame_index"}.issubset(columns) and not columns["move"]["notnull"]:
+            return
+        stale_table = db.execute(
+            "select 1 from sqlite_master where type = 'table' and name = 'telegram_delivery_events_v3'"
+        ).fetchone()
+        if stale_table is not None:
+            db.execute("drop table telegram_delivery_events_v3")
+        self._create_delivery_events_table(db, "telegram_delivery_events_v3")
+        db.execute(
+            """
+            insert into telegram_delivery_events_v3(
+              generation_id, sequence, segment_index, frame_index, move, text,
+              reply_to_message_id, status, telegram_message_id, created_at, updated_at
+            )
+            select generation_id, sequence, 0, sequence, move, text,
+              reply_to_message_id, status, telegram_message_id, created_at, updated_at
+            from telegram_delivery_events
+            """
+        )
+        db.execute("drop table telegram_delivery_events")
+        db.execute("alter table telegram_delivery_events_v3 rename to telegram_delivery_events")
+
+    @staticmethod
+    def _create_delivery_events_table(db: sqlite3.Connection, table: str = "telegram_delivery_events") -> None:
+        db.execute(f"""
+            create table {table}(
+              generation_id text not null,
+              sequence integer not null,
+              segment_index integer not null default 0 check(segment_index >= 0),
+              frame_index integer not null default 0 check(frame_index >= 0),
+              move text,
+              text text not null,
+              reply_to_message_id text,
+              status text not null check(status in ('reserved','sent','unknown','suppressed')),
+              telegram_message_id text,
+              created_at real not null,
+              updated_at real not null,
+              primary key(generation_id, sequence)
+            )
+        """)
 
     def _ensure_columns(self, db, table: str, columns: dict[str, str]) -> None:
         existing = {row["name"] for row in db.execute(f"pragma table_info({table})")}

@@ -19,7 +19,7 @@ class InterruptibleTelegramTurnTests(unittest.TestCase):
                 tomo_id="tomo-1",
             )
             first = store.claim_next_work(now=1)
-            self.assertTrue(store.reserve_delivery(first.generation_id, first.revision, 0, "acknowledge", "visible.", "1", now=1.1))
+            self.assertTrue(store.reserve_delivery(first.generation_id, first.revision, 0, 0, 0, "visible.", "1", legacy_move="acknowledge", now=1.1))
             self.assertTrue(store.mark_delivery_sent(first.generation_id, 0, "telegram-10", now=1.2))
 
             supersede = store.enqueue_update(

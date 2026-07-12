@@ -22,19 +22,25 @@ class GrokAuthTests(unittest.TestCase):
             auth_path.write_text(json.dumps({"access_token": "grok-access"}), encoding="utf-8")
 
             class FakeResponse:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return None
+
                 def raise_for_status(self):
                     return None
 
-                def json(self):
-                    return {"choices": [{"message": {"content": "cached grok reply"}}]}
+                def iter_raw(self):
+                    yield b'data: {"choices":[{"delta":{"content":"cached grok reply"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
 
-            with patch("tomo_core.providers.httpx.post", return_value=FakeResponse()) as post:
+            with patch("tomo_core.providers.httpx.stream", return_value=FakeResponse()) as stream:
                 reply = GrokAuthProvider(auth_store=GrokAuthStore(auth_path=auth_path)).complete(
                     [{"role": "user", "content": "hi"}], actor_id="99"
                 )
 
             self.assertEqual(reply, "cached grok reply")
-            self.assertEqual(post.call_args.kwargs["headers"]["Authorization"], "Bearer grok-access")
+            self.assertEqual(stream.call_args.kwargs["headers"]["Authorization"], "Bearer grok-access")
 
     def test_missing_grok_auth_returns_login_guidance(self):
         with tempfile.TemporaryDirectory() as tmp:
