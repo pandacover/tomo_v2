@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import io
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -32,6 +33,17 @@ from .sandbox_registry import SandboxRegistry
 from .sandbox_protocol import RESULT_MARKER, decode_inbound, encode_result
 from .personal_data_transfer import export_owner
 from .sqlite_personal_data import SqlitePersonalDataRepository
+
+
+def _log_shared_gateway_error(error: Exception) -> None:
+    raw_code = getattr(error, "error_code", "processing_error")
+    code = re.sub(r"[^a-z0-9]+", "_", str(raw_code).lower()).strip("_")[:64] or "processing_error"
+    exception_class = re.sub(r"[^A-Za-z0-9_]+", "_", type(error).__name__)[:64] or "Exception"
+    print(
+        f"telegram worker failure code={code} exception_class={exception_class}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def build_provider(args: argparse.Namespace, oauth: OAuthManager):
@@ -220,6 +232,7 @@ def run_shared_gateway_foreground(args: argparse.Namespace, config: HostedRuntim
             cancel_generation=getattr(gateway.dispatch, "cancel_generation", None),
             poll_timeout=config.poll_timeout,
             worker_count=config.worker_count,
+            on_error=_log_shared_gateway_error,
         ).run_forever()
     finally:
         if _read_pid(pid_path) == os.getpid():

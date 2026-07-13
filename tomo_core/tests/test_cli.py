@@ -4,10 +4,23 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from tomo_core.cli import main
+from tomo_core.cli import _log_shared_gateway_error, main
+from tomo_core.telegram_router import RetryableTelegramUpdateError
 
 
 class CliTests(unittest.TestCase):
+    def test_shared_gateway_error_log_excludes_exception_messages(self):
+        error = RetryableTelegramUpdateError("storage_operation_failed")
+        error.__cause__ = RuntimeError("token=sensitive-value")
+
+        with patch("sys.stderr", io.StringIO()) as stderr:
+            _log_shared_gateway_error(error)
+
+        output = stderr.getvalue()
+        self.assertIn("code=storage_operation_failed", output)
+        self.assertIn("exception_class=RetryableTelegramUpdateError", output)
+        self.assertNotIn("sensitive-value", output)
+
     def test_control_start_invokes_uvicorn(self):
         with patch("uvicorn.run") as run:
             code = main(["control", "start", "--host", "127.0.0.1", "--port", "9999"])
