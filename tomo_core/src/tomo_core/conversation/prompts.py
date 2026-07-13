@@ -74,6 +74,37 @@ def build_segment_repair_messages(
     return messages
 
 
+def build_first_segment_repair_messages(
+    request: ConversationRequest,
+    context: ContextSnapshot,
+    budget: TurnBudget,
+    safe_code: str,
+    prior_messages: Sequence[dict[str, object]] = (),
+) -> list[dict[str, object]]:
+    """Build a tool-free replacement when no valid turn plan was produced."""
+    messages = build_segment_messages(
+        request,
+        context,
+        budget,
+        segment_index=0,
+        prior_messages=prior_messages,
+        tools_available=(),
+    )
+    frame_count = _frame_count_phrase(budget.max_frames_per_segment)
+    messages.append(
+        {
+            "role": "system",
+            "content": (
+                f"the previous segment violated the JSONL contract: {safe_code}.\n"
+                "replace the entire segment. begin with exactly one turn_plan JSONL record, then emit "
+                f"{frame_count} frame JSONL records. native tools are disabled for this repair. "
+                "do not emit a native tool call, explanation, markdown, or any text outside JSONL records."
+            ),
+        }
+    )
+    return messages
+
+
 def _first_segment_system(soul: str, budget: TurnBudget, tool_schemas: tuple[dict[str, object], ...]) -> str:
     frame_count = _frame_count_phrase(budget.max_frames_per_segment)
     tool_guidance = (

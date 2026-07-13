@@ -13,7 +13,7 @@ from ..tools import ToolRegistry
 from .framing import SegmentFrameParser
 from .models import ConversationRequest, Frame, FrameReady, MemoryControlReady, MovePlan, ReactionWindowReady, SegmentFinish, SegmentResult, TurnBudget, TurnRunCompleted, TurnRunEvent, TurnRunResult, TurnRunStarted, TurnRunStatus, TurnUsage
 from .parsing import ConversationOutputError
-from .prompts import build_segment_messages, build_segment_repair_messages
+from .prompts import build_first_segment_repair_messages, build_segment_messages, build_segment_repair_messages
 
 
 class ConversationEngine:
@@ -101,6 +101,7 @@ class ConversationEngine:
             allow_tools = bool(self.tool_registry.schemas()) and index < self.budget.max_model_segments - 1 and sum(bool(s.frames) for s in segments) < self.budget.max_visible_segments - 1 and sum(s.finish is SegmentFinish.TOOL_BATCH for s in segments) < self.budget.max_tool_rounds and sum(len(s.tool_calls) for s in segments) < self.budget.max_tool_calls
             schemas = self.tool_registry.schemas() if allow_tools else ()
             replacement = False
+            repair_code: str | None = None
             while True:
                 remaining_frames = 3 - len(frames)
                 if remaining_frames < 1:
@@ -110,8 +111,17 @@ class ConversationEngine:
                     raise ConversationOutputError("frame_limit")
                 segment_budget = replace(self.budget, max_frames_per_segment=min(self.budget.max_frames_per_segment, remaining_frames))
                 parser = SegmentFrameParser(index, first_segment=plan is None, budget=segment_budget)
-                if replacement and plan is not None:
-                    messages = build_segment_repair_messages(request, context, segment_budget, plan, "replacement_required", prior_messages=prior_messages)
+                if replacement and plan is None:
+                    messages = build_first_segment_repair_messages(
+                        request,
+                        context,
+                        segment_budget,
+                        repair_code or "replacement_required",
+                        prior_messages=prior_messages,
+                    )
+                    schemas = ()
+                elif replacement and plan is not None:
+                    messages = build_segment_repair_messages(request, context, segment_budget, plan, repair_code or "replacement_required", prior_messages=prior_messages)
                     schemas = ()
                 else:
                     messages = build_segment_messages(request, context, segment_budget, segment_index=index, plan=plan, prior_messages=prior_messages, tools_available=schemas)
@@ -330,12 +340,14 @@ class ConversationEngine:
                         raise ConversationOutputError("elapsed_budget_exhausted")
                     if segments or repairs >= self.budget.max_contract_repairs:
                         raise ConversationOutputError(failure.code)
+                    repair_code = failure.code
                     repairs += 1
                     replacement = True
                     continue
                 if plan is None or not segment_frames:
                     if segments or repairs >= self.budget.max_contract_repairs:
                         raise ConversationOutputError("missing_frame")
+                    repair_code = "missing_frame"
                     repairs += 1
                     replacement = True
                     continue

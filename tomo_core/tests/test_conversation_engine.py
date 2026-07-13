@@ -145,6 +145,24 @@ class ConversationEngineTests(unittest.TestCase):
         self.assertEqual(len(provider.calls), 2)
         self.assertTrue(all(call[1] == () for call in provider.calls))
 
+    def test_planless_native_tool_attempt_gets_explicit_tool_free_plan_repair(self):
+        from tomo_core.tools import BoundTool, ToolRegistry, ToolSpec
+
+        provider = ScriptedProvider([
+            [ProviderToolCallReady("call-1", "search", "{}"), ProviderStreamCompleted("tool_calls")],
+            [ProviderTextDelta(PLAN + '{"type":"frame","text":"Recovered answer."}\n'), ProviderStreamCompleted("stop")],
+        ])
+        registry = ToolRegistry((BoundTool(ToolSpec("search", "search", {"type": "object", "properties": {}}), lambda _: "found"),))
+
+        result = ConversationEngine(provider, tool_registry=registry).respond(self.request())
+
+        self.assertEqual(result.frames[0].text, "Recovered answer.")
+        self.assertNotEqual(provider.calls[0][1], ())
+        self.assertEqual(provider.calls[1][1], ())
+        repair_instruction = provider.calls[1][0][-1]["content"]
+        self.assertIn("missing_plan", repair_instruction)
+        self.assertIn("begin with exactly one turn_plan", repair_instruction)
+
     def test_setup_guidance_bypasses_structured_parsing(self):
         provider = ScriptedProvider([ProviderSetupRequired("use /connect first.")])
 
