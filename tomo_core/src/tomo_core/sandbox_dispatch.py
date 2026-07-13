@@ -6,6 +6,7 @@ import os
 import json
 import logging
 import re
+import traceback
 from collections import defaultdict
 from threading import Lock
 from typing import Callable, Iterator, Protocol
@@ -153,6 +154,11 @@ class SandboxDispatch:
                     return
                 continue
             except ValueError as error:
+                frames = [
+                    (os.path.basename(frame.filename)[:128], frame.name[:128], frame.lineno)
+                    for frame in traceback.extract_tb(error.__traceback__)[-8:]
+                ]
+                _logger.warning("sandbox parser failure code=invalid_result traceback=%s", frames)
                 raise SandboxDispatchError("invalid_result") from error
             except DaytonaClientError as error:
                 raise SandboxDispatchError("sandbox_exec_failed") from error

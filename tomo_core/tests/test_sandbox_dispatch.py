@@ -329,6 +329,25 @@ class SandboxDispatchTests(unittest.TestCase):
         self.assertNotIn("tomo-a", logs.output[0])
         self.assertNotIn("hello", logs.output[0])
 
+    def test_iter_telegram_events_logs_parser_location_without_exception_text(self):
+        work = self._work()
+        self.daytona.start_session_command.return_value = SessionCommandHandle("telegram-burst-one-r1", "cmd-1")
+
+        def reject_stream(*args, **kwargs):
+            raise ValueError("token=sensitive-value")
+
+        with patch("tomo_core.sandbox_dispatch.iter_event_markers", side_effect=reject_stream):
+            with self.assertLogs("tomo_core.sandbox_dispatch", level="WARNING") as logs:
+                with self.assertRaises(SandboxDispatchError) as raised:
+                    list(self.dispatch.iter_telegram_events(self.installation, work))
+
+        self.assertEqual(raised.exception.code, "invalid_result")
+        self.assertIn("sandbox parser failure code=invalid_result", logs.output[0])
+        self.assertIn("reject_stream", logs.output[0])
+        self.assertNotIn("sensitive-value", logs.output[0])
+        self.assertNotIn("burst:one/r1", logs.output[0])
+        self.assertNotIn("tomo-a", logs.output[0])
+
     def test_burst_from_work_excludes_destination_chat_ids_from_sandbox_metadata(self):
         burst = __import__("tomo_core.sandbox_dispatch", fromlist=["burst_from_work"]).burst_from_work(self.installation, self._work())
 
