@@ -96,7 +96,9 @@ stateDiagram-v2
 
 Only `TelegramUpdateRouter.process_next` moves a claimed generation from `active` to failed/retry on retryable errors. Gateway and dispatch code raise typed safe failures and leave the bounded failure/backoff transition to the router, so missing or rebound installations cannot make a claimed generation look successfully processed.
 
-The same Railway volume also holds installations, the sandbox registry, and the broker's refreshed auth. Each `tomo_id` maps deterministically to one Daytona sandbox name and one volume name. Reconciliation creates a missing volume, resumes a stopped sandbox, replaces invalid or snapshot-mismatched sandboxes, smoke-tests new/resumed sandboxes, and keeps the volume when replacing a sandbox. Sandboxes have Daytona auto-stop disabled.
+The same Railway volume also holds installations, the sandbox registry, and the broker's refreshed auth. Each `tomo_id` maps deterministically to one Daytona sandbox name and one volume name. A durable checkpoint prefix/volume may have exactly one active sandbox/local working copy. Reconciliation must delete or stop the old sandbox before attaching its volume to a replacement; if deletion fails, it must not create a parallel writer. Reconciliation creates a missing volume, resumes a stopped sandbox, replaces invalid or snapshot-mismatched sandboxes, smoke-tests new/resumed sandboxes, and keeps the volume when replacing a sandbox. Sandboxes have Daytona auto-stop disabled. This is an operational ownership rule, not a distributed lock on the incompatible durable volume.
+
+Personal-data mutations commit locally and synchronously checkpoint before reporting success. If checkpointing fails, the operation reports a storage failure even though the local working copy can be ahead of durable state. Preserve and restart that same sandbox, or reconcile from the latest valid checkpoint; never blindly create a parallel writer for the durable prefix/volume.
 
 ## Logs and safe recovery
 

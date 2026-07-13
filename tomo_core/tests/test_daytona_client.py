@@ -2,9 +2,9 @@ import unittest
 import threading
 from unittest.mock import Mock
 
-from daytona import PtySize, SessionExecuteRequest
+from daytona import DaytonaNotFoundError, PtySize, SessionExecuteRequest
 
-from tomo_core.daytona_client import DaytonaClient, DaytonaClientError, SandboxHandle, SessionCommandHandle, VolumeHandle
+from tomo_core.daytona_client import DaytonaClient, DaytonaClientError, DaytonaNotFoundClientError, SandboxHandle, SessionCommandHandle, VolumeHandle
 
 
 class DaytonaClientTests(unittest.TestCase):
@@ -80,6 +80,15 @@ class DaytonaClientTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.operation, "exec")
         self.assertNotIn("sensitive-value", str(raised.exception))
+
+    def test_get_preserves_a_typed_not_found_boundary(self):
+        self.sdk.get.side_effect = DaytonaNotFoundError("missing")
+
+        with self.assertRaises(DaytonaNotFoundClientError) as raised:
+            self.client.get("missing")
+
+        self.assertEqual(raised.exception.operation, "get")
+        self.assertNotIn("missing", str(raised.exception))
 
     def test_async_session_command_streams_logs_and_deletes_session_idempotently(self):
         handle = self.client.get("agent")

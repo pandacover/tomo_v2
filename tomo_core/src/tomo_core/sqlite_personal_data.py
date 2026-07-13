@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -9,7 +10,7 @@ import struct
 import tempfile
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
@@ -167,8 +168,10 @@ class SqlitePersonalDataRepository:
     def _checkpoint_payload(self, path):
         try:
             raw = path.read_bytes()
-        except OSError:
+        except FileNotFoundError:
             return None
+        except OSError:
+            raise StorageBusyError("storage_operation_failed") from None
         if len(raw) < _CHECKPOINT_HEADER.size:
             return None
         magic, version, generation, length, digest = _CHECKPOINT_HEADER.unpack(raw[:_CHECKPOINT_HEADER.size])
@@ -180,11 +183,32 @@ class SqlitePersonalDataRepository:
         return generation, payload
 
     def _newest_checkpoint(self):
-        checkpoints = [self._checkpoint_payload(self._checkpoint_slot(index)) for index in (0, 1)]
-        valid = sorted((checkpoint for checkpoint in checkpoints if checkpoint is not None), reverse=True)
+        checkpoints = []
+        any_slot_exists = False
+        for index in (0, 1):
+            slot = self._checkpoint_slot(index)
+            try:
+                slot.stat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                raise StorageBusyError("storage_operation_failed") from None
+            any_slot_exists = True
+            checkpoint = self._checkpoint_payload(slot)
+            if checkpoint is not None:
+                checkpoints.append(checkpoint)
+        valid = sorted(checkpoints, reverse=True)
         for _, payload in valid:
-            if self._snapshot_is_integral(payload):
+            try:
+                integral = self._snapshot_is_integral(payload)
+            except StorageBusyError:
+                raise
+            except OSError:
+                raise StorageBusyError("storage_operation_failed") from None
+            if integral:
                 return payload
+        if any_slot_exists:
+            raise StorageBusyError("storage_operation_failed")
         return None
 
     def _snapshot_is_integral(self, payload):
@@ -197,10 +221,13 @@ class SqlitePersonalDataRepository:
                 return con.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
             finally:
                 con.close()
-        except (OSError, sqlite3.Error):
+        except sqlite3.Error:
             return False
         finally:
-            Path(temporary).unlink(missing_ok=True)
+            try:
+                Path(temporary).unlink(missing_ok=True)
+            except OSError:
+                raise StorageBusyError("storage_operation_failed") from None
 
     def _restore_local(self, payload):
         descriptor, temporary = tempfile.mkstemp(prefix=".restore-", dir=self._local_work_dir)
@@ -220,49 +247,83 @@ class SqlitePersonalDataRepository:
         if self._local_work_dir is None:
             yield
             return
-        with self._lock_path.open("a+b") as lock:
+        lock = None
+        try:
+            try:
+                lock = self._lock_path.open("r+b")
+            except FileNotFoundError:
+                try:
+                    lock = self._lock_path.open("x+b")
+                except FileExistsError:
+                    lock = self._lock_path.open("r+b")
+            lock.seek(0, os.SEEK_END)
+            if lock.tell() == 0:
+                lock.write(b"0")
+                lock.flush()
+            if os.name == "nt":
+                import msvcrt
+
+                deadline = time.monotonic() + 5
+                while True:
+                    try:
+                        lock.seek(0)
+                        msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            raise StorageBusyError("storage_busy") from None
+                        time.sleep(0.05)
+            else:
+                import fcntl
+
+                deadline = time.monotonic() + 5
+                while True:
+                    try:
+                        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            raise StorageBusyError("storage_busy") from None
+                        time.sleep(0.05)
+        except StorageBusyError:
+            if lock is not None:
+                lock.close()
+            raise
+        except OSError:
+            if lock is not None:
+                lock.close()
+            raise StorageBusyError("storage_busy") from None
+        try:
+            yield
+        finally:
             try:
                 if os.name == "nt":
                     import msvcrt
-
                     lock.seek(0)
-                    lock.write(b"0")
-                    lock.flush()
-                    deadline = time.monotonic() + 5
-                    while True:
-                        try:
-                            lock.seek(0)
-                            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
-                            break
-                        except OSError:
-                            if time.monotonic() >= deadline:
-                                raise StorageBusyError("storage_busy") from None
-                            time.sleep(0.05)
-                    try:
-                        yield
-                    finally:
-                        lock.seek(0)
-                        msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
                 else:
                     import fcntl
-
-                    deadline = time.monotonic() + 5
-                    while True:
-                        try:
-                            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                            break
-                        except BlockingIOError:
-                            if time.monotonic() >= deadline:
-                                raise StorageBusyError("storage_busy") from None
-                            time.sleep(0.05)
-                    try:
-                        yield
-                    finally:
-                        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-            except StorageBusyError:
-                raise
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
             except OSError:
                 raise StorageBusyError("storage_busy") from None
+            finally:
+                try:
+                    lock.close()
+                except OSError:
+                    raise StorageBusyError("storage_busy") from None
+
+    def _fsync_checkpoint_directory(self, directory):
+        if os.name == "nt":
+            return
+        try:
+            descriptor = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        except OSError as error:
+            if error.errno not in (errno.EINVAL, errno.ENOSYS, errno.ENOTSUP, getattr(errno, "EOPNOTSUPP", errno.ENOTSUP)):
+                raise
 
     def _checkpoint(self, *, scrub=False):
         if self._local_work_dir is None:
@@ -277,25 +338,20 @@ class SqlitePersonalDataRepository:
                 descriptor, temporary = tempfile.mkstemp(prefix=".checkpoint-", dir=self._local_work_dir)
                 os.chmod(temporary, 0o600)
                 os.close(descriptor)
-                target = sqlite3.connect(temporary)
-                source = sqlite3.connect(self.path)
-                try:
+                with ExitStack() as connections:
+                    target = connections.enter_context(closing(sqlite3.connect(temporary)))
+                    source = connections.enter_context(closing(sqlite3.connect(self.path)))
                     source.backup(target)
-                finally:
-                    target.close()
-                    source.close()
-                check = sqlite3.connect(temporary)
-                try:
+                with closing(sqlite3.connect(temporary)) as check:
                     if check.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                         raise StorageBusyError("storage_operation_failed")
-                finally:
-                    check.close()
                 payload = Path(temporary).read_bytes()
                 digest = hashlib.sha256(payload).digest()
                 for index in slots:
                     generation += 1
                     framed = _CHECKPOINT_HEADER.pack(_CHECKPOINT_MAGIC, _CHECKPOINT_VERSION, generation, len(payload), digest) + payload
                     slot = self._checkpoint_slot(index)
+                    new_slot = not slot.exists()
                     slot.parent.mkdir(parents=True, exist_ok=True)
                     with slot.open("wb") as file:
                         try:
@@ -305,6 +361,8 @@ class SqlitePersonalDataRepository:
                         file.write(framed)
                         file.flush()
                         os.fsync(file.fileno())
+                    if new_slot:
+                        self._fsync_checkpoint_directory(slot.parent)
             except sqlite3.Error as error:
                 raise self._safe(error) from None
             except StorageBusyError:

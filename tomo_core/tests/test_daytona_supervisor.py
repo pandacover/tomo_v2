@@ -3,7 +3,7 @@ import threading
 import unittest
 from unittest.mock import Mock
 
-from tomo_core.daytona_client import DaytonaClientError, SandboxHandle, VolumeHandle
+from tomo_core.daytona_client import DaytonaClientError, DaytonaNotFoundClientError, SandboxHandle, VolumeHandle
 from tomo_core.daytona_supervisor import DaytonaSupervisor, SandboxSupervisorError
 from tomo_core.sandbox_registry import SandboxRegistry
 from tomo_core.sandbox_protocol import RESULT_MARKER, encode_result
@@ -96,7 +96,7 @@ class DaytonaSupervisorTests(unittest.TestCase):
 
     def test_reconcile_recreates_a_record_when_its_sandbox_is_missing(self):
         self.registry.upsert("tomo-a", "old", "base-v1", "ready")
-        self.daytona.get.side_effect = DaytonaClientError("get")
+        self.daytona.get.side_effect = DaytonaNotFoundClientError("get")
 
         record = self.supervisor.reconcile("tomo-a")
 
@@ -106,7 +106,7 @@ class DaytonaSupervisorTests(unittest.TestCase):
     def test_reconcile_recovers_a_stale_id_from_its_deterministic_remote_name(self):
         existing = self.registry.upsert("tomo-a", "stale-id", "base-v1", "ready")
         recovered = SandboxHandle("sbx-remote", existing.sandbox_name, state="started", snapshot="base-v1")
-        self.daytona.get.side_effect = [DaytonaClientError("get"), recovered]
+        self.daytona.get.side_effect = [DaytonaNotFoundClientError("get"), recovered]
 
         record = self.supervisor.reconcile("tomo-a")
 
@@ -149,6 +149,27 @@ class DaytonaSupervisorTests(unittest.TestCase):
         self.daytona.delete.assert_called_once_with(old)
         self.daytona.create_snapshot.assert_called_once_with(existing.sandbox_name, "base-v1", "vol-1", "/var/lib/tomo")
         self.daytona.create_volume.assert_not_called()
+        calls = [call[0] for call in self.daytona.mock_calls]
+        self.assertLess(calls.index("delete"), calls.index("create_snapshot"))
+
+    def test_reconcile_does_not_attach_volume_to_replacement_when_old_delete_fails(self):
+        existing = self.registry.upsert("tomo-a", "old-id", "base-v0", "ready")
+        self.daytona.get.return_value = SandboxHandle("old-id", existing.sandbox_name, state="started", snapshot="base-v0")
+        self.daytona.delete.side_effect = DaytonaClientError("delete")
+
+        with self.assertRaisesRegex(SandboxSupervisorError, "sandbox_delete_failed"):
+            self.supervisor.reconcile("tomo-a")
+
+        self.daytona.create_snapshot.assert_not_called()
+
+    def test_reconcile_does_not_create_parallel_writer_when_recorded_sandbox_lookup_fails(self):
+        self.registry.upsert("tomo-a", "old-id", "base-v1", "ready")
+        self.daytona.get.side_effect = DaytonaClientError("get")
+
+        with self.assertRaisesRegex(SandboxSupervisorError, "sandbox_lookup_failed"):
+            self.supervisor.reconcile("tomo-a")
+
+        self.daytona.create_snapshot.assert_not_called()
 
     def test_reconcile_keeps_users_on_distinct_deterministic_resources(self):
         alice = self.supervisor.reconcile("tomo-alice")

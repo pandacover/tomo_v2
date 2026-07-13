@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from daytona import CreateSandboxFromSnapshotParams, Daytona, PtySize, VolumeMount
+from daytona import CreateSandboxFromSnapshotParams, Daytona, DaytonaNotFoundError, PtySize, VolumeMount
 
 
 # Progressive sandbox turns emit long single-line protocol markers. Daytona's
@@ -23,6 +23,10 @@ class DaytonaClientError(RuntimeError):
     def __init__(self, operation: str) -> None:
         self.operation = operation
         super().__init__(f"Daytona {operation} failed")
+
+
+class DaytonaNotFoundClientError(DaytonaClientError):
+    """A Daytona resource is known to be absent."""
 
 
 @dataclass(frozen=True)
@@ -232,5 +236,7 @@ class DaytonaClient:
     def _run(self, operation: str, action: Any) -> Any:
         try:
             return action()
+        except DaytonaNotFoundError as error:
+            raise DaytonaNotFoundClientError(operation) from error
         except Exception as error:
             raise DaytonaClientError(operation) from error

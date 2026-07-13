@@ -1,3 +1,5 @@
+import errno
+import sqlite3
 import tempfile
 import unittest
 import struct
@@ -6,8 +8,8 @@ from unittest.mock import Mock, patch
 
 from tomo_core.models import RuntimeConfig
 from tomo_core.personal_data import (MemoryGovernanceControl, MemorySearchQuery,
-                                     MemorySourceRef, MemoryWriteControl,
-                                     PendingMemoryActionControl)
+                                      MemorySourceRef, MemoryWriteControl,
+                                      PendingMemoryActionControl, StorageBusyError)
 from tomo_core.sandbox_inbound import build_runtime
 from tomo_core.sessions import ConversationSession, StoredMessage
 from tomo_core.sqlite_personal_data import SqlitePersonalDataRepository
@@ -48,6 +50,41 @@ class SqliteWorkingCopyTests(unittest.TestCase):
 
             restored = SqlitePersonalDataRepository(durable, local_work_dir=work)
             self.assertEqual([message.content for message in restored.load_session("owner", session.session_key).messages], ["remember this"])
+
+    def test_both_absent_checkpoint_slots_allow_first_boot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            durable, work = root / "durable" / "tomo.sqlite3", root / "work"
+
+            repository = SqlitePersonalDataRepository(durable, local_work_dir=work)
+
+            self.assertEqual(repository.load_session("owner", "telegram:actor:one").messages, [])
+            self.assertTrue(Path(repository.path).is_file())
+
+    def test_corrupt_only_checkpoint_fails_closed_without_creating_local_database(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            durable, work = root / "durable" / "tomo.sqlite3", root / "work"
+            slot = durable.with_name(f"{durable.name}.checkpoint.0")
+            slot.parent.mkdir()
+            slot.write_bytes(b"corrupt")
+
+            with self.assertRaisesRegex(StorageBusyError, "storage_operation_failed"):
+                SqlitePersonalDataRepository(durable, local_work_dir=work)
+
+            self.assertFalse(any(work.glob("*.sqlite3")))
+
+    def test_checkpoint_read_access_error_is_a_safe_storage_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            durable, work = root / "durable" / "tomo.sqlite3", root / "work"
+            slot = durable.with_name(f"{durable.name}.checkpoint.0")
+            slot.parent.mkdir()
+            slot.write_bytes(b"present")
+
+            with patch.object(Path, "read_bytes", side_effect=OSError(errno.EACCES, "denied")):
+                with self.assertRaisesRegex(StorageBusyError, "storage_operation_failed"):
+                    SqlitePersonalDataRepository(durable, local_work_dir=work)
 
     def test_truncated_newest_checkpoint_falls_back_to_prior_generation(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -102,6 +139,54 @@ class SqliteWorkingCopyTests(unittest.TestCase):
             self.assertFalse(durable.exists())
             self.assertEqual(list(durable.parent.glob("*.checkpoint.*-wal")), [])
             self.assertEqual(list(durable.parent.glob("*.checkpoint.*-shm")), [])
+
+    def test_checkpoint_body_oserror_maps_to_storage_operation_failed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            durable, work = root / "durable" / "tomo.sqlite3", root / "work"
+            repository = SqlitePersonalDataRepository(durable, local_work_dir=work)
+            session = ConversationSession("telegram:actor:one")
+            session.append(StoredMessage("user", "stored", metadata={"burst_id": "b1", "update_id": 1}))
+            original_open = Path.open
+
+            def fail_checkpoint_open(path, *args, **kwargs):
+                if ".checkpoint." in path.name:
+                    raise OSError(errno.ENOSPC, "full")
+                return original_open(path, *args, **kwargs)
+
+            with patch.object(Path, "open", new=fail_checkpoint_open):
+                with self.assertRaisesRegex(StorageBusyError, "storage_operation_failed"):
+                    repository.save_session("owner", session)
+
+    def test_repeated_checkpoints_do_not_grow_lock_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            durable, work = root / "durable" / "tomo.sqlite3", root / "work"
+            repository = SqlitePersonalDataRepository(durable, local_work_dir=work)
+            session = ConversationSession("telegram:actor:one")
+            session.append(StoredMessage("user", "one", metadata={"burst_id": "b1", "update_id": 1}))
+            repository.save_session("owner", session)
+            session.append(StoredMessage("user", "two", metadata={"burst_id": "b2", "update_id": 2}))
+            repository.save_session("owner", session)
+
+            self.assertLessEqual(repository._lock_path.stat().st_size, 1)
+
+    def test_checkpoint_closes_backup_target_when_source_connect_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repository = SqlitePersonalDataRepository(root / "durable" / "tomo.sqlite3", local_work_dir=root / "work")
+            target = Mock()
+
+            def connect(path, *args, **kwargs):
+                if path == repository.path:
+                    raise sqlite3.OperationalError("source unavailable")
+                return target
+
+            with patch("tomo_core.sqlite_personal_data.sqlite3.connect", side_effect=connect):
+                with self.assertRaises(StorageBusyError):
+                    repository._checkpoint()
+
+            target.close.assert_called_once_with()
 
     def test_direct_path_mode_keeps_using_the_configured_sqlite_file(self):
         with tempfile.TemporaryDirectory() as tmp:

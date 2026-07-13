@@ -7,7 +7,7 @@ from collections import defaultdict
 from threading import Lock
 from typing import Protocol
 
-from .daytona_client import DaytonaClient, DaytonaClientError, SandboxHandle
+from .daytona_client import DaytonaClient, DaytonaClientError, DaytonaNotFoundClientError, SandboxHandle
 from .sandbox_registry import SandboxRecord, SandboxRegistry
 from .models import InboundEnvelope, OutboundBubble
 from .sandbox_protocol import encode_inbound, parse_result_marker
@@ -56,27 +56,34 @@ class DaytonaSupervisor:
         with self._locks[tomo_id]:
             record = self.registry.get(tomo_id)
             if record is not None and record.snapshot != self.snapshot:
-                self._delete_recorded_sandbox(record)
+                if not self._delete_recorded_sandbox(record):
+                    return self._fail(tomo_id, "sandbox_delete_failed")
                 return self._create(tomo_id)
             if record is not None and record.status == "ready" and record.sandbox_id:
-                sandbox = self._recorded_sandbox(record)
-                if sandbox is not None:
-                    if sandbox.snapshot is not None and sandbox.snapshot != self.snapshot:
+                try:
+                    sandbox = self._recorded_sandbox(record)
+                except DaytonaClientError:
+                    return self._fail(tomo_id, "sandbox_lookup_failed")
+                if sandbox is None:
+                    return self._create(tomo_id)
+                if sandbox.snapshot is not None and sandbox.snapshot != self.snapshot:
+                    if not self._delete(sandbox):
+                        return self._fail(tomo_id, "sandbox_delete_failed")
+                    return self._create(tomo_id)
+                if sandbox.state == "stopped":
+                    try:
+                        self.daytona.start(sandbox)
+                        self._smoke_test(sandbox, tomo_id)
+                    except SandboxSupervisorError as error:
                         self._delete(sandbox)
-                        return self._create(tomo_id)
-                    if sandbox.state == "stopped":
-                        try:
-                            self.daytona.start(sandbox)
-                            self._smoke_test(sandbox, tomo_id)
-                        except SandboxSupervisorError as error:
-                            self._delete(sandbox)
-                            return self._fail(tomo_id, error.code)
-                        except DaytonaClientError:
-                            return self._fail(tomo_id, "sandbox_create_failed")
-                    elif sandbox.state not in (None, "started"):
-                        self._delete(sandbox)
-                        return self._create(tomo_id)
-                    return self.registry.upsert(tomo_id, sandbox.id, self.snapshot, "ready")
+                        return self._fail(tomo_id, error.code)
+                    except DaytonaClientError:
+                        return self._fail(tomo_id, "sandbox_create_failed")
+                elif sandbox.state not in (None, "started"):
+                    if not self._delete(sandbox):
+                        return self._fail(tomo_id, "sandbox_delete_failed")
+                    return self._create(tomo_id)
+                return self.registry.upsert(tomo_id, sandbox.id, self.snapshot, "ready")
             return self._create(tomo_id)
 
     def _create(self, tomo_id: str) -> SandboxRecord:
@@ -108,25 +115,30 @@ class DaytonaSupervisor:
     def _recorded_sandbox(self, record: SandboxRecord) -> SandboxHandle | None:
         try:
             return self.daytona.get(record.sandbox_id)
-        except DaytonaClientError:
+        except DaytonaNotFoundClientError:
             return self._sandbox_named(record.sandbox_name)
 
     def _sandbox_named(self, name: str) -> SandboxHandle | None:
         try:
             return self.daytona.get(name)
-        except DaytonaClientError:
+        except DaytonaNotFoundClientError:
             return None
 
-    def _delete_recorded_sandbox(self, record: SandboxRecord) -> None:
-        sandbox = self._recorded_sandbox(record) if record.sandbox_id else self._sandbox_named(record.sandbox_name)
+    def _delete_recorded_sandbox(self, record: SandboxRecord) -> bool:
+        try:
+            sandbox = self._recorded_sandbox(record) if record.sandbox_id else self._sandbox_named(record.sandbox_name)
+        except DaytonaClientError:
+            return False
         if sandbox is not None:
-            self._delete(sandbox)
+            return self._delete(sandbox)
+        return True
 
-    def _delete(self, sandbox: SandboxHandle) -> None:
+    def _delete(self, sandbox: SandboxHandle) -> bool:
         try:
             self.daytona.delete(sandbox)
         except DaytonaClientError:
-            pass
+            return False
+        return True
 
     def _smoke_test(self, sandbox: SandboxHandle, tomo_id: str) -> None:
         request_id = "health-1"
