@@ -11,7 +11,7 @@ from ..providers import ProviderAdapter, ProviderSetupRequired, ProviderStreamCo
 from ..tool_execution import ToolBatchCancelled, ToolBatchValidationError, ToolExecutor
 from ..tools import ToolRegistry
 from .framing import SegmentFrameParser
-from .models import ConversationRequest, Frame, FrameReady, MovePlan, SegmentFinish, SegmentResult, TurnBudget, TurnRunCompleted, TurnRunEvent, TurnRunResult, TurnRunStarted, TurnRunStatus, TurnUsage
+from .models import ConversationRequest, Frame, FrameReady, MemoryControlReady, MovePlan, ReactionWindowReady, SegmentFinish, SegmentResult, TurnBudget, TurnRunCompleted, TurnRunEvent, TurnRunResult, TurnRunStarted, TurnRunStatus, TurnUsage
 from .parsing import ConversationOutputError
 from .prompts import build_segment_messages, build_segment_repair_messages
 
@@ -72,9 +72,11 @@ class ConversationEngine:
         segments: list[SegmentResult] = []
         frames: list[Frame] = []
         prior_messages: list[dict[str, object]] = []
+        tool_observation_ids: set[str] = set()
         repairs = 0
         input_tokens: int | None = None
         output_tokens: int | None = None
+        reaction_window_emitted = False
 
         def expired() -> bool:
             return self.monotonic_clock() - started_at >= self.budget.max_elapsed_seconds
@@ -116,6 +118,7 @@ class ConversationEngine:
                 raw: list[str] = []
                 native_calls: list[ProviderToolCallReady] = []
                 segment_frames: list[Frame] = []
+                segment_memory_controls = []
                 terminal: ProviderStreamCompleted | None = None
                 failure: ConversationOutputError | None = None
                 try:
@@ -179,6 +182,13 @@ class ConversationEngine:
                                             if not is_active():
                                                 return
                                             yield TurnRunStarted(plan)
+                                        elif not isinstance(record, Frame):
+                                            if sum(len(segment.memory_controls) for segment in segments) + len(segment_memory_controls) >= 8:
+                                                raise ConversationOutputError("memory_control_turn_limit")
+                                            segment_memory_controls.append(record)
+                                            if not is_active():
+                                                return
+                                            yield MemoryControlReady(index, record, tuple(sorted(tool_observation_ids)))
                                         else:
                                             if len(frames) >= 3:
                                                 raise ConversationOutputError("frame_limit")
@@ -189,6 +199,11 @@ class ConversationEngine:
                                                 break
                                             segment_frames.append(record)
                                             frames.append(record)
+                                            if index == 0 and plan is not None and plan.reaction is not None and not reaction_window_emitted:
+                                                reaction_window_emitted = True
+                                                if not is_active():
+                                                    return
+                                                yield ReactionWindowReady()
                                             if not is_active():
                                                 return
                                             yield FrameReady(len(frames) - 1, record)
@@ -230,6 +245,13 @@ class ConversationEngine:
                                 if not is_active():
                                     return
                                 yield TurnRunStarted(plan)
+                            elif not isinstance(record, Frame):
+                                if sum(len(segment.memory_controls) for segment in segments) + len(segment_memory_controls) >= 8:
+                                    raise ConversationOutputError("memory_control_turn_limit")
+                                segment_memory_controls.append(record)
+                                if not is_active():
+                                    return
+                                yield MemoryControlReady(index, record, tuple(sorted(tool_observation_ids)))
                             else:
                                 if len(frames) >= 3:
                                     raise ConversationOutputError("frame_limit")
@@ -237,6 +259,11 @@ class ConversationEngine:
                                     raise ConversationOutputError("visible_segment_limit")
                                 segment_frames.append(record)
                                 frames.append(record)
+                                if index == 0 and plan is not None and plan.reaction is not None and not reaction_window_emitted:
+                                    reaction_window_emitted = True
+                                    if not is_active():
+                                        return
+                                    yield ReactionWindowReady()
                                 if not is_active():
                                     return
                                 yield FrameReady(len(frames) - 1, record)
@@ -250,6 +277,9 @@ class ConversationEngine:
                 if failure is None and tool_finish and len(segment_frames) > 1:
                     failure = ConversationOutputError("tool_frame_limit")
                 if failure is None and tool_finish:
+                    if index == 0 and plan is not None and plan.reaction is not None and not reaction_window_emitted:
+                        reaction_window_emitted = True
+                        yield ReactionWindowReady()
                     if not is_active():
                         return
                     if expired():
@@ -270,9 +300,10 @@ class ConversationEngine:
                         except Exception:
                             failure = ConversationOutputError("tool_executor_failure")
                         else:
-                            segments.append(SegmentResult(index, tuple(segment_frames), batch.tool_calls, SegmentFinish.TOOL_BATCH))
+                            segments.append(SegmentResult(index, tuple(segment_frames), batch.tool_calls, SegmentFinish.TOOL_BATCH, tuple(segment_memory_controls)))
                             prior_messages.append(_assistant_continuation("".join(raw) or None, batch.tool_calls))
                             prior_messages.extend(_tool_continuation(observation) for observation in batch.observations)
+                            tool_observation_ids.update(observation.call_id for observation in batch.observations)
                             if not is_active():
                                 return
                             if expired():
@@ -284,7 +315,7 @@ class ConversationEngine:
                             break
                 if failure is not None:
                     if segment_frames:
-                        segments.append(SegmentResult(index, tuple(segment_frames), (), SegmentFinish.PARTIAL))
+                        segments.append(SegmentResult(index, tuple(segment_frames), (), SegmentFinish.PARTIAL, tuple(segment_memory_controls)))
                         if not is_active():
                             return
                         yield completed(TurnRunStatus.COMPLETED_PARTIAL)
@@ -308,11 +339,11 @@ class ConversationEngine:
                     repairs += 1
                     replacement = True
                     continue
-                segments.append(SegmentResult(index, tuple(segment_frames), (), SegmentFinish.COMPLETE))
+                segments.append(SegmentResult(index, tuple(segment_frames), (), SegmentFinish.COMPLETE, tuple(segment_memory_controls)))
                 if not is_active() or expired():
                     if not is_active():
                         return
-                    segments[-1] = SegmentResult(index, tuple(segment_frames), (), SegmentFinish.PARTIAL)
+                    segments[-1] = SegmentResult(index, tuple(segment_frames), (), SegmentFinish.PARTIAL, tuple(segment_memory_controls))
                     yield completed(TurnRunStatus.COMPLETED_PARTIAL)
                     return
                 yield completed(TurnRunStatus.COMPLETED)

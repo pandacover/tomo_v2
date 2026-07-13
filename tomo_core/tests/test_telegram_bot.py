@@ -7,7 +7,7 @@ from tomo_core import RuntimeConfig
 from tomo_core.providers import StaticProvider
 from tomo_core.runtime import PersonalAgentRuntime
 from tomo_core.telegram import TelegramDeliverySink, TelegramSendReceipt
-from tomo_core.telegram_bot import TelegramBotApiClient, TelegramPollingBot, envelope_from_update
+from tomo_core.telegram_bot import TelegramBotApiClient, TelegramPollingBot, TelegramReactionError, envelope_from_update
 
 
 class FakeBotApiClient:
@@ -121,6 +121,34 @@ class TelegramBotTests(unittest.TestCase):
         self.assertEqual(receipt, TelegramSendReceipt("123"))
         payload = post.call_args.kwargs["json"]
         self.assertEqual(payload["reply_parameters"], {"message_id": 7})
+
+    def test_bot_api_reaction_uses_one_non_big_emoji_payload(self):
+        client = TelegramBotApiClient("token")
+        with patch.object(client, "request") as request:
+            client.set_message_reaction("chat", "7", "👍")
+
+        request.assert_called_once_with(
+            "setMessageReaction",
+            {"chat_id": "chat", "message_id": 7, "reaction": [{"type": "emoji", "emoji": "👍"}], "is_big": False},
+        )
+
+    def test_bot_api_reaction_maps_failures_to_safe_codes(self):
+        client = TelegramBotApiClient("token")
+        with self.assertRaises(TelegramReactionError) as invalid:
+            client.set_message_reaction("chat", "not-an-id", "👍")
+        self.assertEqual((invalid.exception.code, invalid.exception.retryable), ("telegram_reaction_invalid_target", False))
+        with patch.object(client, "request", side_effect=RuntimeError("telegram rejected reaction")):
+            with self.assertRaises(TelegramReactionError) as rejected:
+                client.set_message_reaction("chat", "7", "👍")
+        self.assertEqual((rejected.exception.code, rejected.exception.retryable), ("telegram_reaction_rejected", False))
+        self.assertNotIn("telegram rejected reaction", str(rejected.exception))
+
+        import httpx
+        with patch.object(client, "request", side_effect=httpx.ReadTimeout("upstream secret body")):
+            with self.assertRaises(TelegramReactionError) as retryable:
+                client.set_message_reaction("chat", "7", "👍")
+        self.assertEqual((retryable.exception.code, retryable.exception.retryable), ("telegram_reaction_retryable", True))
+        self.assertNotIn("upstream secret body", str(retryable.exception))
 
 
 if __name__ == "__main__":

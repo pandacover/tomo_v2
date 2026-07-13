@@ -17,6 +17,15 @@ class TelegramBotApiError(RuntimeError):
     pass
 
 
+class TelegramReactionError(RuntimeError):
+    """Safe classification for a best-effort reaction failure."""
+
+    def __init__(self, code: str, retryable: bool) -> None:
+        self.code = code
+        self.retryable = retryable
+        super().__init__(code)
+
+
 TELEGRAM_COMMANDS = [{"command": "connect", "description": "connect supergrok or calendar"}]
 
 
@@ -64,6 +73,18 @@ class TelegramBotApiClient:
         result = data.get("result") if isinstance(data, dict) else None
         message_id = result.get("message_id") if isinstance(result, dict) else None
         return TelegramSendReceipt(str(message_id))
+
+    def set_message_reaction(self, actor_id: str, message_id: str, emoji: str) -> None:
+        try:
+            numeric_message_id = int(message_id)
+        except (TypeError, ValueError) as error:
+            raise TelegramReactionError("telegram_reaction_invalid_target", False) from error
+        try:
+            self.request("setMessageReaction", {"chat_id": actor_id, "message_id": numeric_message_id, "reaction": [{"type": "emoji", "emoji": emoji}], "is_big": False})
+        except (httpx.TimeoutException, httpx.NetworkError) as error:
+            raise TelegramReactionError("telegram_reaction_retryable", True) from error
+        except Exception as error:
+            raise TelegramReactionError("telegram_reaction_rejected", False) from error
 
     def answer_callback_query(self, callback_query_id: str, text: str | None = None) -> None:
         payload: dict[str, Any] = {"callback_query_id": callback_query_id}

@@ -30,6 +30,8 @@ from .shared_gateway import InProcessTelegramRuntimeDispatch, SharedTelegramGate
 from .sandbox_dispatch import SandboxDispatch
 from .sandbox_registry import SandboxRegistry
 from .sandbox_protocol import RESULT_MARKER, decode_inbound, encode_result
+from .personal_data_transfer import export_owner
+from .sqlite_personal_data import SqlitePersonalDataRepository
 
 
 def build_provider(args: argparse.Namespace, oauth: OAuthManager):
@@ -293,7 +295,38 @@ def main(argv: list[str] | None = None) -> int:
     sandbox_inbound = sub.add_parser("sandbox-inbound", help="handle one sandbox protocol envelope from TOMO_INBOUND_JSON")
     sandbox_inbound.add_argument("--health", action="store_true", help="validate the sandbox boundary without calling a model")
 
+    personal_data = sub.add_parser("personal-data", help="personal-data maintenance commands")
+    personal_data_sub = personal_data.add_subparsers(dest="personal_data_command", required=True)
+    for name, help_text in (("rebuild-index", "rebuild disposable search indexes"), ("integrity-check", "check SQLite integrity")):
+        command = personal_data_sub.add_parser(name, help=help_text)
+        command.add_argument("--data-dir", default=os.getenv("TOMO_CORE_DATA_DIR", ".tomo_core"))
+        command.add_argument("--owner")
+    export = personal_data_sub.add_parser("export", help="export one owner's canonical JSONL")
+    export.add_argument("--data-dir", default=os.getenv("TOMO_CORE_DATA_DIR", ".tomo_core")); export.add_argument("--owner", required=True); export.add_argument("--output", required=True)
+    delete_owner = personal_data_sub.add_parser("delete-owner", help="permanently delete one owner's data")
+    delete_owner.add_argument("--data-dir", default=os.getenv("TOMO_CORE_DATA_DIR", ".tomo_core")); delete_owner.add_argument("--owner", required=True); delete_owner.add_argument("--confirm", action="store_true")
+    settings = personal_data_sub.add_parser("settings", help="inspect or update owner memory settings")
+    settings.add_argument("--data-dir", default=os.getenv("TOMO_CORE_DATA_DIR", ".tomo_core")); settings.add_argument("--owner", required=True)
+    settings.add_argument("--capture-enabled", choices=("true", "false")); settings.add_argument("--retrieval-enabled", choices=("true", "false")); settings.add_argument("--reactions-enabled", choices=("true", "false"))
+
     args = parser.parse_args(argv)
+    if args.command == "personal-data":
+        repository = SqlitePersonalDataRepository(Path(args.data_dir) / "tomo.sqlite3")
+        if args.personal_data_command == "rebuild-index":
+            repository.rebuild_index(args.owner); print("search indexes rebuilt"); return 0
+        if args.personal_data_command == "integrity-check":
+            healthy = repository.integrity_check(); print("ok" if healthy else "failed"); return 0 if healthy else 1
+        if args.personal_data_command == "export":
+            with Path(args.output).open("w", encoding="utf-8") as output: export_owner(repository, args.owner, output)
+            return 0
+        if args.personal_data_command == "delete-owner":
+            if not args.confirm:
+                print("refusing owner deletion without --confirm", file=sys.stderr); return 2
+            repository.delete_owner(args.owner); return 0
+        for setting in ("capture_enabled", "retrieval_enabled", "reactions_enabled"):
+            value = getattr(args, setting)
+            if value is not None: repository.update_memory_setting(args.owner, setting, value == "true")
+        print(repository.memory_settings(args.owner)); return 0
     if args.command == "telegram" and args.telegram_command == "start":
         if not args.token:
             print("missing telegram bot token. set TELEGRAM_BOT_TOKEN or pass --token.", file=sys.stderr)
@@ -352,6 +385,10 @@ def main(argv: list[str] | None = None) -> int:
         if not data_dir:
             emit_failure(sys.stdout, "missing_data_dir")
             return 1
+        owner_id = os.getenv("TOMO_INSTANCE_ID")
+        if not owner_id:
+            emit_failure(sys.stdout, "missing_owner_id")
+            return 1
         try:
             provider = supergrok_oauth_provider_from_access_token(
                 access_token,
@@ -364,6 +401,7 @@ def main(argv: list[str] | None = None) -> int:
                 config=RuntimeConfig(
                     data_dir=data_dir,
                     soul_path=os.getenv("TOMO_CORE_SOUL", "SOUL.md"),
+                    owner_id=owner_id,
                 ),
                 provider=provider,
                 secret_values=(access_token,),

@@ -7,6 +7,7 @@ from tomo_core.conversation.parsing import ConversationOutputError
 from tomo_core.delivery import DeliveryPlanner, split_sentences
 from tomo_core.providers import StaticProvider
 from tomo_core.sessions import JsonSessionStore, StoredMessage
+from tomo_core.sqlite_personal_data import SqlitePersonalDataRepository
 from tomo_core.telegram import FakeTelegramClient, TelegramDeliverySink
 
 
@@ -31,7 +32,7 @@ class MilestoneOneTests(unittest.TestCase):
             self.assertEqual(client.typing_actor_ids, ["user-1"])
             self.assertEqual(client.sent_messages[0]["reply_to_message_id"], "msg-9")
             self.assertEqual(bubbles[0]["reply_to_message_id"], "msg-9")
-            session = JsonSessionStore(tmp).load("telegram:actor:user-1")
+            session = SqlitePersonalDataRepository(Path(tmp) / "tomo.sqlite3").load_session("local", "telegram:actor:user-1")
             self.assertEqual([m.role for m in session.messages], ["user", "assistant"])
             self.assertEqual(session.messages[0].content, "hi tomo")
 

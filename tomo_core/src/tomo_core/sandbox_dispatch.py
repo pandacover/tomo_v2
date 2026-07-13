@@ -127,6 +127,7 @@ class SandboxDispatch:
                     expected_request_id=request_id,
                     expected_generation_id=work.generation_id,
                     budget=self.budget,
+                    expected_reaction_binding=(installation.tomo_id, installation.actor_id, installation.chat_id, str(work.inputs[-1].message_id), work.revision),
                 ):
                     if not is_active():
                         return

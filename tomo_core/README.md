@@ -15,7 +15,7 @@ what is included:
 - static provider fallback for local bot smoke tests
 - langgraph-shaped turn graph, with a linear fallback when langgraph is not installed
 - soul injection into the model messages
-- two-stage conversational loop: soul-aware move selection followed by move-specific realization
+- TurnRun planning, validated progressive frames, and bounded read-only personal-data search tools
 - one primary conversational move plus up to two supporting moves
 - 1-4 intentional telegram utterances, each capped at three sentences
 - compact move metadata stored with one logical assistant turn
@@ -27,14 +27,14 @@ what is included:
 - delivery planner that emits 1 to 4 plain-text bubbles
 - first bubble replies to the triggering telegram message
 - no tool execution message bubbles
+- owner-scoped SQLite sessions, provenance-bearing autonomous memory, and canonical JSONL export
+- sparse, allowlisted Telegram reactions delivered as best-effort side effects
 
 what is intentionally not included yet:
 - google calendar event tools
 - web search tools
 - geolocation tools
-- durable agent memories
 - image receive/send plumbing
-- reactions
 
 ## run tests
 
@@ -46,6 +46,18 @@ PYTHONPATH=src python -m unittest discover -s tests -v
 ## hosted operations
 
 For the shared Telegram gateway on Railway and per-user Daytona sandboxes, see [../docs/daytona-railway.md](../docs/daytona-railway.md). User onboarding and local hosted-mode setup are in [../docs/onboarding-telegram.md](../docs/onboarding-telegram.md).
+
+## personal data operations
+
+`TOMO_CORE_DATA_DIR` selects the data directory for CLI commands and runtime
+startup; when unset it is `.tomo_core` relative to the process working
+directory. The personal-data database is `<data-dir>/tomo.sqlite3`. Local
+direct startup uses owner `local`; hosted sandbox startup requires
+`TOMO_INSTANCE_ID` and fails safely without it. `actor_id` identifies a
+Telegram endpoint, not a data owner.
+
+See [docs/operations/session-json-to-sqlite.md](docs/operations/session-json-to-sqlite.md)
+for migration, restore, security, and exact maintenance commands.
 
 ## run a real telegram bot
 
@@ -88,7 +100,7 @@ supergrok oauth now uses the same public xai oauth client id/scopes as `uv run t
 ```bash
 TELEGRAM_BOT_TOKEN='123:abc' \
 GOOGLE_OAUTH_CLIENT_ID='google-client-id' \
-GOOGLE_OAUTH_CLIENT_SECRET='google-client-secret' \
+GOOGLE_OAUTH_CLIENT_SECRET='<set-in-environment>' \
 PYTHONPATH=src python -m tomo_core.cli telegram start
 ```
 

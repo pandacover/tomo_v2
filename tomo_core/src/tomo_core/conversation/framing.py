@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 
+from ..personal_data import MemoryControl
 from .models import Frame, MovePlan, TurnBudget
-from .parsing import ConversationOutputError, _parse_strict_move_plan_payload, _validate_strict_frame_text
+from .parsing import ConversationOutputError, _parse_memory_control_payload, _parse_strict_move_plan_payload, _validate_strict_frame_text
 
 
 class SegmentFrameParser:
@@ -22,25 +23,26 @@ class SegmentFrameParser:
         self._buffer = ""
         self._plan_seen = False
         self._frame_count = 0
+        self._memory_control_count = 0
 
-    def feed(self, delta: str) -> list[MovePlan | Frame]:
+    def feed(self, delta: str) -> list[MovePlan | MemoryControl | Frame]:
         if not isinstance(delta, str):
             raise ConversationOutputError("invalid_delta")
         self._buffer += delta
-        records: list[MovePlan | Frame] = []
+        records: list[MovePlan | MemoryControl | Frame] = []
         while "\n" in self._buffer:
             line, self._buffer = self._buffer.split("\n", 1)
             records.extend(self._parse_line(line))
         return records
 
-    def finish(self) -> list[MovePlan | Frame]:
+    def finish(self) -> list[MovePlan | MemoryControl | Frame]:
         records = self._parse_line(self._buffer)
         self._buffer = ""
         if self._first_segment and not self._plan_seen:
             raise ConversationOutputError("missing_plan")
         return records
 
-    def _parse_line(self, line: str) -> list[MovePlan | Frame]:
+    def _parse_line(self, line: str) -> list[MovePlan | MemoryControl | Frame]:
         if not line.strip():
             return []
         try:
@@ -54,6 +56,8 @@ class SegmentFrameParser:
             return [self._parse_plan(payload)]
         if record_type == "frame":
             return [self._parse_frame(payload)]
+        if record_type == "memory_control":
+            return [self._parse_memory_control(payload)]
         raise ConversationOutputError("invalid_record")
 
     def _parse_plan(self, payload: dict[str, object]) -> MovePlan:
@@ -63,7 +67,8 @@ class SegmentFrameParser:
             raise ConversationOutputError("duplicate_plan")
         if self._frame_count:
             raise ConversationOutputError("late_plan")
-        if set(payload) != {"type", "primary_move", "supporting_moves", "response_goal", "confidence"} and set(payload) != {"type", "primary_move", "supporting_moves", "move_sequence", "response_goal", "confidence"}:
+        plan_keys = set(payload) - {"type"}
+        if plan_keys not in ({"primary_move", "supporting_moves", "response_goal", "confidence"}, {"primary_move", "supporting_moves", "move_sequence", "response_goal", "confidence"}, {"primary_move", "supporting_moves", "response_goal", "confidence", "reaction"}, {"primary_move", "supporting_moves", "move_sequence", "response_goal", "confidence", "reaction"}):
             raise ConversationOutputError("invalid_plan")
         plan_payload = dict(payload)
         del plan_payload["type"]
@@ -92,3 +97,19 @@ class SegmentFrameParser:
         frame = Frame(self._segment_index, self._frame_count, text)
         self._frame_count += 1
         return frame
+
+    def _parse_memory_control(self, payload: dict[str, object]) -> MemoryControl:
+        if self._first_segment and not self._plan_seen:
+            raise ConversationOutputError("missing_plan")
+        if self._frame_count:
+            raise ConversationOutputError("late_memory_control")
+        if self._memory_control_count >= 5:
+            raise ConversationOutputError("memory_control_limit")
+        control_payload = dict(payload)
+        del control_payload["type"]
+        try:
+            control = _parse_memory_control_payload(control_payload)
+        except (TypeError, ValueError, KeyError):
+            raise ConversationOutputError("invalid_memory_control") from None
+        self._memory_control_count += 1
+        return control

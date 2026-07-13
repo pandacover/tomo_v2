@@ -9,10 +9,10 @@ from .daytona_supervisor import SandboxSupervisorError
 from .instances import RuntimeInstanceRegistry
 from .models import InboundEnvelope, OutboundBubble
 from .onboarding_store import TelegramGenerationWork, TelegramInstallation, TelegramOnboardingStore
-from .runtime import RuntimeCompleted, RuntimeFrameReady
+from .runtime import RuntimeCompleted, RuntimeFrameReady, RuntimeReactionReady
 from .sandbox_dispatch import TelegramRuntimeDispatchError, burst_from_work
-from .sandbox_protocol import SandboxCompletedEvent, SandboxErrorEvent, SandboxFrameEvent, encode_event
-from .telegram import TelegramClient, TelegramSendReceipt
+from .sandbox_protocol import SandboxCompletedEvent, SandboxErrorEvent, SandboxFrameEvent, SandboxReactionEvent, encode_event
+from .telegram import TelegramClient, TelegramDeliverySink, TelegramSendReceipt
 from .telegram_router import RetryableTelegramUpdateError
 
 
@@ -22,7 +22,7 @@ class TelegramRuntimeDispatch(Protocol):
 
     def deliver_telegram(
         self, installation: TelegramInstallation, update_id: int, envelope: InboundEnvelope
-    ) -> list[OutboundBubble]:
+    ) -> list[OutboundBubble] | DirectTelegramDelivery:
         ...
 
     def iter_telegram_events(self, installation: TelegramInstallation, work: TelegramGenerationWork, is_active: Callable[[], bool] | None = None):
@@ -40,7 +40,7 @@ class InProcessTelegramRuntimeDispatch:
 
     def deliver_telegram(
         self, installation: TelegramInstallation, update_id: int, envelope: InboundEnvelope
-    ) -> list[OutboundBubble]:
+    ) -> DirectTelegramDelivery:
         runtime = self.instances.get(installation.tomo_id)
         original_client = runtime.telegram.client
         collector = _BubbleCollector()
@@ -49,13 +49,15 @@ class InProcessTelegramRuntimeDispatch:
             runtime.handle_telegram_text(envelope)
         finally:
             runtime.telegram.client = original_client
-        return collector.bubbles
+        return DirectTelegramDelivery(collector.bubbles, collector.reactions)
 
     def iter_telegram_events(self, installation: TelegramInstallation, work: TelegramGenerationWork, is_active: Callable[[], bool] | None = None):
         runtime = self.instances.get(installation.tomo_id)
         burst = burst_from_work(installation, work)
         for sequence, event in enumerate(runtime.handle_telegram_burst_iter(burst, is_active=is_active)):
-            if isinstance(event, RuntimeFrameReady):
+            if isinstance(event, RuntimeReactionReady):
+                yield SandboxReactionEvent(sequence, event.owner_id, event.actor_id, event.chat_id, event.target_message_id, event.generation_id, event.revision, event.emoji)
+            elif isinstance(event, RuntimeFrameReady):
                 frame = event.event.frame
                 yield SandboxFrameEvent(sequence, frame.segment_index, frame.frame_index, event.bubble.text)
             elif isinstance(event, RuntimeCompleted):
@@ -63,11 +65,18 @@ class InProcessTelegramRuntimeDispatch:
                 yield SandboxCompletedEvent(sequence, payload["result"])
 
 
+@dataclass(frozen=True)
+class DirectTelegramDelivery:
+    bubbles: list[OutboundBubble]
+    reactions: list[tuple[str, str, str]]
+
+
 class _BubbleCollector:
     bubbles: list[OutboundBubble]
 
     def __init__(self) -> None:
         self.bubbles = []
+        self.reactions: list[tuple[str, str, str]] = []
 
     def send_typing(self, actor_id: str) -> None:
         pass
@@ -75,6 +84,9 @@ class _BubbleCollector:
     def send_message(self, actor_id: str, text: str, reply_to_message_id: str | None = None) -> TelegramSendReceipt:
         self.bubbles.append(OutboundBubble(text, reply_to_message_id))
         return TelegramSendReceipt(str(len(self.bubbles)))
+
+    def set_message_reaction(self, actor_id: str, message_id: str, emoji: str) -> None:
+        self.reactions.append((actor_id, message_id, emoji))
 
 
 @dataclass
@@ -121,7 +133,7 @@ class SharedTelegramGateway:
 
         self.client.send_typing(installation.chat_id)
         try:
-            bubbles = self.dispatch.deliver_telegram(
+            delivery = self.dispatch.deliver_telegram(
                 installation,
                 int(update.get("update_id", message_id)),
                 InboundEnvelope(
@@ -144,6 +156,15 @@ class SharedTelegramGateway:
                 reply_to_message_id=message_id,
             )
             raise RetryableTelegramUpdateError(error.code) from error
+        if isinstance(delivery, DirectTelegramDelivery):
+            for _, target_message_id, emoji in delivery.reactions:
+                try:
+                    TelegramDeliverySink(self.client).react_to_message(installation.chat_id, target_message_id, emoji)
+                except Exception:
+                    pass
+            bubbles = delivery.bubbles
+        else:
+            bubbles = delivery
         for index, bubble in enumerate(bubbles):
             self.client.send_message(
                 installation.chat_id,
@@ -160,11 +181,31 @@ class SharedTelegramGateway:
             raise RetryableTelegramUpdateError("installation_rebound")
         self.client.send_typing(installation.chat_id)
         last_send_at: float | None = None
+        first_frame_delivered = False
         delivery_uncertain = False
         try:
             is_active = lambda: self.store.is_generation_active(work.generation_id, work.revision)
             for event in self.dispatch.iter_telegram_events(installation, work, is_active=is_active):
-                if isinstance(event, SandboxFrameEvent):
+                if isinstance(event, SandboxReactionEvent):
+                    target = work.inputs[-1].message_id
+                    if (event.owner_id != installation.tomo_id or event.actor_id != installation.actor_id or event.chat_id != installation.chat_id
+                            or event.target_message_id != str(target) or event.generation_id != work.generation_id
+                            or event.revision != work.revision):
+                        continue
+                    if target is None or not self.store.is_generation_active(work.generation_id, work.revision):
+                        continue
+                    if not self.store.reserve_reaction(work.generation_id, work.revision, target, event.emoji):
+                        continue
+                    if not self.store.is_generation_active(work.generation_id, work.revision):
+                        self.store.mark_reaction_suppressed(work.generation_id, work.revision, target)
+                        continue
+                    try:
+                        self.client.set_message_reaction(installation.chat_id, target, event.emoji)
+                    except Exception:
+                        self.store.mark_reaction_failed(work.generation_id, work.revision, target)
+                    else:
+                        self.store.mark_reaction_sent(work.generation_id, work.revision, target)
+                elif isinstance(event, SandboxFrameEvent):
                     if not self.store.is_generation_active(work.generation_id, work.revision):
                         continue
                     if last_send_at is not None and self.pace_seconds > 0:
@@ -179,7 +220,7 @@ class SharedTelegramGateway:
                         event.segment_index,
                         event.frame_index,
                         event.text,
-                        work.inputs[-1].message_id if event.sequence == 0 else None,
+                        work.inputs[-1].message_id if not first_frame_delivered else None,
                         legacy_move=event.legacy_move.value if event.legacy_move is not None else None,
                     ):
                         continue
@@ -190,7 +231,7 @@ class SharedTelegramGateway:
                         receipt = self.client.send_message(
                             installation.chat_id,
                             event.text,
-                            reply_to_message_id=work.inputs[-1].message_id if event.sequence == 0 else None,
+                            reply_to_message_id=work.inputs[-1].message_id if not first_frame_delivered else None,
                         )
                     except Exception:
                         self.store.mark_delivery_unknown(work.generation_id, event.sequence)
@@ -201,6 +242,7 @@ class SharedTelegramGateway:
                         delivery_uncertain = True
                         continue
                     last_send_at = time.monotonic()
+                    first_frame_delivered = True
                 elif isinstance(event, SandboxCompletedEvent):
                     if not delivery_uncertain:
                         self.store.complete_generation(work.generation_id, work.revision)

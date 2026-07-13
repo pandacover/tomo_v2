@@ -134,6 +134,7 @@ class RuntimeConfig:
     max_chars_per_frame: int = 800
     data_dir: str = ".tomo_core"
     soul_path: str = "SOUL.md"
+    owner_id: str | None = "local"
 
     def __post_init__(self) -> None:
         self.response_contract
@@ -141,6 +142,8 @@ class RuntimeConfig:
             raise ValueError("max_frames_per_segment must be at least 1")
         if not isinstance(self.max_chars_per_frame, int) or isinstance(self.max_chars_per_frame, bool) or not 1 <= self.max_chars_per_frame <= 4096:
             raise ValueError("max_chars_per_frame must be between 1 and 4096")
+        if self.owner_id is not None and (not isinstance(self.owner_id, str) or not self.owner_id.strip()):
+            raise ValueError("owner_id must be a non-empty string when supplied")
 
     @property
     def response_contract(self) -> ResponseContract:

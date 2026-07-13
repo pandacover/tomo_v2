@@ -7,6 +7,7 @@ from types import MappingProxyType
 from typing import Mapping, Sequence, TypeAlias
 
 from ..models import InboundEnvelope, InboundMessage, InputBurst
+from ..personal_data import MemoryControl, MemoryGovernanceControl, MemoryWriteControl, OwnerSettingControl, PendingMemoryActionControl
 
 
 class ConversationMove(str, Enum):
@@ -40,6 +41,18 @@ class TurnRunStatus(str, Enum):
     COMPLETED_PARTIAL = "completed_partial"
     CANCELLED = "cancelled"
     FAILED = "failed"
+
+
+REACTION_EMOJI_ALLOWLIST = frozenset({"👍", "❤️", "😂", "🔥", "🥰", "👏", "🤔", "👀", "🙏", "🫡"})
+
+
+@dataclass(frozen=True)
+class ReactionIntent:
+    emoji: str
+
+    def __post_init__(self) -> None:
+        if self.emoji not in REACTION_EMOJI_ALLOWLIST:
+            raise ValueError("reaction emoji is not allowed")
 
 
 def _compact_text(value: object, field_name: str) -> str:
@@ -181,11 +194,13 @@ class SegmentResult:
     frames: tuple[Frame, ...]
     tool_calls: tuple[ToolCall, ...]
     finish: SegmentFinish
+    memory_controls: tuple[MemoryControl, ...] = ()
 
     def __post_init__(self) -> None:
         _nonnegative_integer(self.index, "segment index")
         frames = tuple(self.frames)
         tool_calls = tuple(self.tool_calls)
+        memory_controls = tuple(self.memory_controls)
         if len(frames) > 3:
             raise ValueError("a segment can contain at most three frames")
         if any(not isinstance(frame, Frame) for frame in frames):
@@ -196,6 +211,10 @@ class SegmentResult:
             raise ValueError("segment frame indices must be contiguous from zero")
         if any(not isinstance(call, ToolCall) for call in tool_calls):
             raise ValueError("segment tool calls must be ToolCalls")
+        if any(not isinstance(control, (MemoryWriteControl, MemoryGovernanceControl, PendingMemoryActionControl, OwnerSettingControl)) for control in memory_controls):
+            raise ValueError("segment memory controls must be MemoryControls")
+        if len(memory_controls) > 5:
+            raise ValueError("a segment can contain at most five memory controls")
         if len({call.call_id for call in tool_calls}) != len(tool_calls):
             raise ValueError("segment tool call IDs must be unique")
         finish = SegmentFinish(self.finish)
@@ -211,6 +230,7 @@ class SegmentResult:
             raise ValueError("a completed or partial segment requires frames")
         object.__setattr__(self, "frames", frames)
         object.__setattr__(self, "tool_calls", tool_calls)
+        object.__setattr__(self, "memory_controls", memory_controls)
         object.__setattr__(self, "finish", finish)
 
 
@@ -237,6 +257,8 @@ class TurnRunResult:
         tool_call_ids = [call.call_id for segment in segments for call in segment.tool_calls]
         if len(set(tool_call_ids)) != len(tool_call_ids):
             raise ValueError("turn run tool call IDs must be unique")
+        if sum(len(segment.memory_controls) for segment in segments) > 8:
+            raise ValueError("a turn run can contain at most eight memory controls")
         if not isinstance(self.usage, TurnUsage):
             raise ValueError("turn run requires usage")
         expected_usage = {
@@ -277,12 +299,31 @@ class FrameReady:
 
 
 @dataclass(frozen=True)
+class MemoryControlReady:
+    segment_index: int
+    control: MemoryControl
+    tool_observation_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        _nonnegative_integer(self.segment_index, "memory control segment_index")
+        if not isinstance(self.control, (MemoryWriteControl, MemoryGovernanceControl, PendingMemoryActionControl, OwnerSettingControl)):
+            raise ValueError("memory control ready requires a MemoryControl")
+        if any(not isinstance(observation_id, str) or not observation_id for observation_id in self.tool_observation_ids):
+            raise ValueError("memory control tool observation IDs must be nonempty text")
+
+
+@dataclass(frozen=True)
 class TurnRunStarted:
     plan: "MovePlan"
 
     def __post_init__(self) -> None:
         if not isinstance(self.plan, MovePlan):
             raise ValueError("turn run start requires a move plan")
+
+
+@dataclass(frozen=True)
+class ReactionWindowReady:
+    """Segment zero controls are complete; a reaction may precede tool execution."""
 
 
 @dataclass(frozen=True)
@@ -329,6 +370,7 @@ class MovePlan:
     response_goal: str
     confidence: MoveConfidence
     sequence: tuple[ConversationMove, ...] | None = None
+    reaction: ReactionIntent | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.response_goal, str):
@@ -345,6 +387,8 @@ class MovePlan:
         object.__setattr__(self, "supporting", supporting)
         object.__setattr__(self, "response_goal", response_goal)
         object.__setattr__(self, "confidence", confidence)
+        if self.reaction is not None and not isinstance(self.reaction, ReactionIntent):
+            raise ValueError("reaction must be a ReactionIntent or None")
         if len(supporting) > 2:
             raise ValueError("a move plan can have at most two supporting moves")
         ordered = (primary, *supporting)
@@ -367,8 +411,8 @@ class MovePlan:
             supporting=(),
             response_goal="respond directly and honestly to the user's latest message",
             confidence=MoveConfidence.LOW,
-            sequence=(ConversationMove.ANSWER,),
+            sequence=(ConversationMove.ANSWER,), reaction=None,
         )
 
 
-TurnRunEvent: TypeAlias = TurnRunStarted | FrameReady | TurnRunCompleted
+TurnRunEvent: TypeAlias = TurnRunStarted | ReactionWindowReady | MemoryControlReady | FrameReady | TurnRunCompleted

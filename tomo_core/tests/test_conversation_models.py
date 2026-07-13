@@ -1,7 +1,8 @@
 import unittest
 
-from tomo_core.conversation import ConversationMove, ConversationRequest, Frame, FrameReady, MoveConfidence, MovePlan, SegmentFinish, SegmentResult, ToolCall, ToolObservation, TurnBudget, TurnRunCompleted, TurnRunResult, TurnRunStarted, TurnRunStatus, TurnUsage
+from tomo_core.conversation import ConversationMove, ConversationRequest, Frame, FrameReady, MemoryControlReady, MoveConfidence, MovePlan, SegmentFinish, SegmentResult, ToolCall, ToolObservation, TurnBudget, TurnRunCompleted, TurnRunResult, TurnRunStarted, TurnRunStatus, TurnUsage
 from tomo_core.models import InboundEnvelope, ResponseContract, RuntimeConfig
+from tomo_core.personal_data import MemoryWriteControl
 
 
 class ConversationModelTests(unittest.TestCase):
@@ -36,6 +37,14 @@ class ConversationModelTests(unittest.TestCase):
         observation = ToolObservation("call-1", "search", True, " \n  title: tomo\n  results:\n    - first\n ")
 
         self.assertEqual(observation.content, "title: tomo\n  results:\n    - first")
+
+    def test_segment_results_audit_bounded_memory_controls(self):
+        control = MemoryWriteControl("upsert", "autonomous", None, None, "preference", "self", "food", {"likes": "tea"}, "The user likes tea", 0.9, 0.8, "contextual", None, None, ())
+        segment = SegmentResult(0, (Frame(0, 0, "noted"),), (), SegmentFinish.COMPLETE, (control,))
+        self.assertEqual(segment.memory_controls, (control,))
+        self.assertEqual(MemoryControlReady(0, control).control, control)
+        with self.assertRaises(ValueError):
+            SegmentResult(0, (Frame(0, 0, "noted"),), (), SegmentFinish.COMPLETE, (control,) * 6)
 
     def test_turn_run_models_reject_invalid_indices_strings_and_finish_shapes(self):
         for factory in (

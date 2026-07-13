@@ -15,17 +15,15 @@ In scope:
 - allow one undelivered contract-repair generation after malformed first-segment output;
 - preserve one logical assistant turn even when Telegram receives several bubbles.
 
-`PersonalAgentRuntime` continues to own transport, current session loading and saving, and delivery. The conversation module has no connector, session-store, tool, or hosted-infrastructure dependencies.
+`PersonalAgentRuntime` owns transport and delivery while `PersonalDataRepository` is the only runtime boundary for owner-scoped sessions, memories, and settings. SQLite is its first adapter; SQL, FTS, and connection mechanics do not enter conversation code. The owner is the Tomo instance ID, never a connector actor ID. Local direct use defaults to owner `local`; hosted sandbox use requires `TOMO_INSTANCE_ID`. JSON session files are import-only compatibility artifacts after cutover.
 
 Explicitly deferred:
 
-- durable memory, retrieval, Dream, embeddings, and memory curation;
-- session identity/schema changes, atomic writes, idempotent persistence, and delivery-retry duplication;
-- concrete durable-memory, cross-session, and location context providers;
 - mutating tools, approvals, idempotent side effects, and action-result observation;
 - durable background jobs and milestone notifications;
-- group chat, `room_id`, other connectors, reactions, and typing refresh;
+- group chat, `room_id`, other connectors, and typing refresh;
 - Railway/Daytona deployment and immutable snapshot rollout, which require a separate user-approved operation.
+- dashboard UI for personal-data settings and application-managed encryption.
 
 ## canonical terms
 
@@ -97,20 +95,56 @@ API remains a compatibility wrapper for callers that still expect one completed
 logical result.
 
 Sandbox inbound requests remain protocol v2 during the staged rollout because
-their `InputBurst` shape is unchanged. Sandbox event output is protocol v3; the
-host accepts v2 and v3 inbound payloads and event streams while old snapshots
-are still active.
+their `InputBurst` shape is unchanged. Sandbox event output is protocol v3;
+v3 permits at most one reaction event before frames. The host accepts v2 and
+v3 inbound payloads and event streams while old snapshots are still active.
 
 Railway keeps one logical assistant turn even when it sends multiple Telegram bubbles. SQLite tracks burst revisions, active generations, and delivery reservations. A newer normal message supersedes the active generation immediately; already visible bubbles remain in Telegram and become visible context for the replacement generation. Stale completions and stale sends are fenced by generation ID and revision.
 
-Context hydration produces no frame or visible execution telemetry. Concrete
-durable-memory, prior-session, and location sources are deferred; when added,
-they are silent by default and must carry provenance and freshness. Safe,
+Context hydration produces no frame or visible execution telemetry. Personal
+memory has no semantic whitelist other than credentials and authentication
+secrets; provenance captures uncertainty rather than blocking inference. FTS
+tables are rebuildable indexes, prompt caps are not retention limits, and
+reactions are delivery side effects rather than memories. Safe,
 independent, bound read-only tool calls may be batched in one tool round only
 when their arguments are resolved, none depends on another result, and their
 parallel execution, approval, cancellation, and failure semantics are
 compatible. Tool calls and observations remain internal unless a later
 validated frame naturally communicates a verified result.
+
+## personal-data lifecycle
+
+The runtime persists inbound session data before generation, then accepts prior
+generation IDs. It hydrates highest-salience `always` memory plus relevant
+`contextual` memory as labeled user-trust data, subject to record and character
+caps. `archive` memory is available only through `search_memories`; both
+personal search tools are owner-scoped, read-only, and return no data when
+retrieval is disabled.
+
+The first plan may contain a sparse allowlisted reaction or `null`. After the
+plan and leading owner-setting controls validate, the runtime rechecks
+`reactions_enabled` and may emit one reaction before tools or frame 0. The
+sandbox v3 event binds it to owner, actor, chat, generation, revision, and the
+latest inbound message; the Telegram gateway fences stale revisions, dedupes a
+delivery key, and isolates Telegram failures from frames. There is no hard
+cooldown. Reaction intent is transient and is never stored as memory.
+
+Autonomous memory controls stage generation-bound provisional rows during
+segments. Only a later accepted generation activates them. User governance and
+the three independent owner settings, `capture_enabled`, `retrieval_enabled`,
+and `reactions_enabled`, apply immediately. All default to enabled. Capture
+does not imply retrieval; retrieval does not imply reactions. Natural-language
+forgetting disables exact owner-bound memory reversibly; permanent deletion
+creates a ten-minute pending confirmation and does not infer confirmation from
+an unrelated message. Session deletion is independent by default and marks
+provenance unavailable; an explicit cascade option is required to remove
+derived memories.
+
+Accepted sessions and memories have no automatic expiry. Maintenance may prune
+only stale provisional memories and expired pending deletion actions. FTS5 is
+required at SQLite initialization. A missing FTS5 capability raises a safe
+storage capability error; busy storage is surfaced as a safe storage error.
+FTS indexes are rebuildable and are not canonical data.
 
 ## invariants
 
@@ -124,7 +158,9 @@ validated frame naturally communicates a verified result.
 8. the full SOUL.md shapes turn planning and segment generation.
 9. a new model generation requires new information, except one undelivered contract repair.
 10. no action is claimed without an observed result; tool call != visible announcement.
-11. context hydration is silent, and concrete memory, session, and location providers are deferred.
+11. context hydration is silent; personal-memory and session-search providers are owner-bound, while location context remains deferred.
 12. side effects, approvals, and background jobs are deferred and must not be advertised as available.
 13. progressive events contain only validated outward frames, never chain-of-thought, token deltas, move labels, tool arguments, or observations.
 14. cancellation, persistence, generation/revision fencing, and pre-send delivery checks remain authoritative.
+15. the application persists no credential or authentication-secret memory, FTS content, logs, metrics, or sandbox completion summary.
+16. local SQLite is not application-encrypted in v1; deployment isolation, restrictive permissions, encrypted volumes, backups, and encrypted transport are operational requirements.

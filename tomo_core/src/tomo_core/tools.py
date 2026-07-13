@@ -127,3 +127,8 @@ class ToolRegistry:
         if tool is None:
             raise ToolRegistryError("unknown_tool")
         return tool
+
+    def extend(self, other: "ToolRegistry") -> "ToolRegistry":
+        if not isinstance(other, ToolRegistry):
+            raise ValueError("other must be a ToolRegistry")
+        return ToolRegistry((*self._tools, *other._tools))

@@ -11,7 +11,7 @@ import httpx
 
 from .models import OutboundBubble, RuntimeConfig
 from .providers import ProviderAdapter
-from .runtime import PersonalAgentRuntime, RuntimeCompleted, RuntimeFrameReady
+from .runtime import PersonalAgentRuntime, RuntimeCompleted, RuntimeFrameReady, RuntimeReactionReady
 from .sandbox_protocol import EVENT_MARKER, SandboxErrorEvent, SandboxTracebackFrame, decode_inbound, encode_event
 
 
@@ -41,8 +41,13 @@ class CollectingTelegramSink:
     def send_bubbles(self, actor_id: str, bubbles: list[OutboundBubble]) -> None:
         self.bubbles.extend(bubbles)
 
+    def react_to_message(self, actor_id: str, message_id: str, emoji: str) -> None:
+        pass
+
 
 def build_runtime(provider: ProviderAdapter, config: RuntimeConfig) -> PersonalAgentRuntime:
+    if config.owner_id is None:
+        raise SandboxInboundError("missing_owner_id")
     return PersonalAgentRuntime(provider=provider, telegram=CollectingTelegramSink(), config=config)
 
 
@@ -67,9 +72,19 @@ def run_once(
     try:
         runtime = build_runtime(provider, config)
         for event in runtime.handle_telegram_burst_iter(burst):
-            if not isinstance(event, (RuntimeFrameReady, RuntimeCompleted)):
+            if not isinstance(event, (RuntimeReactionReady, RuntimeFrameReady, RuntimeCompleted)):
                 raise TypeError("runtime emitted an unsupported sandbox event")
-            _write_payload(stdout, encode_event(request_id, generation_id, sequence, event))
+            expected_reaction_binding = None
+            if isinstance(event, RuntimeReactionReady):
+                expected_reaction_binding = (
+                    config.owner_id,
+                    burst.latest.actor_id,
+                    str(burst.latest.native_metadata.get("chat_id") or burst.latest.actor_id),
+                    burst.latest.message_id,
+                    burst.generation_id,
+                    burst.revision,
+                )
+            _write_payload(stdout, encode_event(request_id, generation_id, sequence, event, expected_reaction_binding=expected_reaction_binding))
             sequence += 1
             if isinstance(event, RuntimeCompleted):
                 return 0

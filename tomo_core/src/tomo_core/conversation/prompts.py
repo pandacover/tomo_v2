@@ -84,10 +84,11 @@ def _first_segment_system(soul: str, budget: TurnBudget, tool_schemas: tuple[dic
     return (
         "you are tomo. follow the supplied SOUL completely.\n"
         "produce JSON Lines only. emit one JSON object per physical line, with no code fences, backticks, or prose outside records.\n"
-        f"generate exactly one internal turn_plan JSONL record before any frame record, then zero to {_frame_count_limit(budget.max_frames_per_segment)} frame JSONL records.\n"
-        '{"type":"turn_plan","primary_move":"answer","supporting_moves":[],"move_sequence":["answer"],"response_goal":"...","confidence":"low"}\n'
+        f"generate exactly one internal turn_plan JSONL record before any frame record; after that plan and before frames, emit zero to five memory_control records. then zero to {_frame_count_limit(budget.max_frames_per_segment)} frame JSONL records.\n"
+        '{"type":"turn_plan","primary_move":"answer","supporting_moves":[],"move_sequence":["answer"],"response_goal":"...","confidence":"low","reaction":null}\n'
         '{"type":"frame","text":"..."}\n'
-        "the turn_plan fields are primary_move, supporting_moves, response_goal, and confidence. moves are turn-level purposes, never frame or bubble sections; MovePlan does not determine frame count.\n"
+        "memory_control records are optional and internal. use them only when information may be useful in future conversations; preserve uncertainty with confidence and sources rather than suppressing it. never emit credentials or authentication secrets.\n"
+        "the turn_plan fields are primary_move, supporting_moves, response_goal, confidence, and reaction. reaction is null by default or exactly one supported emoji. use it very sparsely; use null for commands, auth, errors, routine acknowledgements, ambiguity, corrections, opt-outs, serious, sensitive, or distressing content. never mention reactions to the user. moves are turn-level purposes, never frame or bubble sections; MovePlan does not determine frame count.\n"
         f"ordinary completion uses {frame_count} frames. when making native tool calls, emit zero or one useful pre-tool frame.\n"
         f"target one to two sentences per frame and no more than {frame_count} frames this segment. hard runtime limits: "
         f"at most {budget.max_frames_per_segment} frames per segment, {budget.max_sentences_per_frame} sentences per frame, and {budget.max_chars_per_frame} characters per frame.\n"
@@ -110,8 +111,9 @@ def _later_segment_system(soul: str, budget: TurnBudget, plan: MovePlan, tool_sc
     )
     return (
         "you are tomo. follow the supplied SOUL completely.\n"
-        "produce JSON Lines only. emit one JSON object per physical line, with no code fences, backticks, or prose outside records. do not emit a turn_plan record; reuse the fixed turn plan.\n"
+        "produce JSON Lines only. emit one JSON object per physical line, with no code fences, backticks, or prose outside records. do not emit a turn_plan record; reuse the fixed turn plan. emit zero to five optional internal memory_control records before any frame record.\n"
         '{"type":"frame","text":"..."}\n'
+        "remember information autonomously only when future usefulness justifies it. qualify uncertain observations with confidence and sources rather than omitting them. never emit credentials or authentication secrets.\n"
         f"fixed turn plan: primary_move={plan.primary.value}; supporting_moves={supporting}; confidence={plan.confidence.value}.\n"
         f"{completion_guidance}\n"
         "original request and conversation history remain valid context for final frames. claims about tool outcomes or actions must be grounded in supplied tool observations.\n"

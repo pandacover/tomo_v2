@@ -50,7 +50,7 @@ class CliTests(unittest.TestCase):
     def test_sandbox_inbound_reads_environment_payload_and_uses_only_the_supergrok_access_token(self):
         token = "supergrok-access-token"
         with (
-            patch.dict("os.environ", {"TOMO_SUPERGROK_ACCESS_TOKEN": token, "TOMO_INBOUND_JSON": "payload", "TOMO_CORE_DATA_DIR": "/data", "TOMO_CORE_SOUL": "/soul"}, clear=True),
+            patch.dict("os.environ", {"TOMO_SUPERGROK_ACCESS_TOKEN": token, "TOMO_INBOUND_JSON": "payload", "TOMO_CORE_DATA_DIR": "/data", "TOMO_CORE_SOUL": "/soul", "TOMO_INSTANCE_ID": "tomo-1"}, clear=True),
             patch("tomo_core.cli.supergrok_oauth_provider_from_access_token") as provider_factory,
             patch("tomo_core.cli.run_once", return_value=0) as run_once,
             patch("tomo_core.cli.RuntimeConfig") as runtime_config,
@@ -60,7 +60,7 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         provider_factory.assert_called_once_with(token, model="grok-4.5", reasoning_effort="high")
-        runtime_config.assert_called_once_with(data_dir="/data", soul_path="/soul")
+        runtime_config.assert_called_once_with(data_dir="/data", soul_path="/soul", owner_id="tomo-1")
         self.assertEqual(run_once.call_args.args[0].read(), "payload")
         self.assertIs(run_once.call_args.kwargs["config"], runtime_config.return_value)
         self.assertEqual(run_once.call_args.kwargs["secret_values"], (token,))
@@ -74,6 +74,7 @@ class CliTests(unittest.TestCase):
                     "TOMO_SUPERGROK_ACCESS_TOKEN": token,
                     "TOMO_INBOUND_JSON": "payload",
                     "TOMO_CORE_DATA_DIR": "/data",
+                    "TOMO_INSTANCE_ID": "tomo-1",
                     "TOMO_XAI_MODEL": "grok-test-next",
                     "TOMO_XAI_REASONING_EFFORT": "low",
                 },
@@ -105,3 +106,8 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertIn("TOMO_SANDBOX_RESULT=", stdout.getvalue())
+
+    def test_personal_data_owner_deletion_requires_confirmation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(main(["personal-data", "delete-owner", "--data-dir", tmp, "--owner", "owner"]), 2)
+            self.assertEqual(main(["personal-data", "integrity-check", "--data-dir", tmp]), 0)

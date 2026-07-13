@@ -32,8 +32,10 @@ class RuntimeInstanceRegistryTests(unittest.TestCase):
                 tool_registry=tool_registry,
             )
 
-        self.assertIs(runtime.conversation.tool_registry, tool_registry)
-        self.assertEqual(runtime.conversation.tool_registry.schemas(), tool_registry.schemas())
+        self.assertEqual(
+            [schema["function"]["name"] for schema in runtime.conversation.tool_registry.schemas()],
+            ["search_memories", "search_sessions", "lookup"],
+        )
         self.assertEqual(runtime.conversation.budget, runtime.config.tool_turn_budget)
 
     def test_runtime_rejects_bound_tools_when_provider_does_not_support_tool_calls(self):
@@ -74,19 +76,21 @@ class RuntimeInstanceRegistryTests(unittest.TestCase):
             runtime = registry.get("tomo-a")
 
         self.assertEqual(factory_calls, ["tomo-a"])
-        self.assertIs(runtime.conversation.tool_registry, tool_registry)
-        self.assertEqual(runtime.conversation.tool_registry.schemas(), tool_registry.schemas())
+        self.assertEqual(
+            [schema["function"]["name"] for schema in runtime.conversation.tool_registry.schemas()],
+            ["search_memories", "search_sessions", "lookup"],
+        )
 
-    def test_default_runtime_registry_is_empty_and_uses_ordinary_budget(self):
+    def test_default_runtime_registry_includes_owner_bound_personal_search_tools(self):
         with tempfile.TemporaryDirectory() as tmp:
             runtime = RuntimeInstanceRegistry(
                 data_dir=tmp,
-                provider_factory=lambda _tomo_id: StaticProvider("ok"),
+                provider_factory=lambda _tomo_id: self._tool_provider(),
                 telegram_client=FakeTelegramClient(),
             ).get("tomo-a")
 
-        self.assertEqual(runtime.conversation.tool_registry.schemas(), ())
-        self.assertEqual(runtime.conversation.budget, runtime.config.ordinary_turn_budget)
+        self.assertEqual([schema["function"]["name"] for schema in runtime.conversation.tool_registry.schemas()], ["search_memories", "search_sessions"])
+        self.assertEqual(runtime.conversation.budget, runtime.config.tool_turn_budget)
 
     def test_instance_registry_rejects_non_registry_factory_result(self):
         with tempfile.TemporaryDirectory() as tmp:

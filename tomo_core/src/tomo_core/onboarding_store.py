@@ -747,12 +747,60 @@ class TelegramOnboardingStore:
                 )
             """)
             self._ensure_delivery_events_schema(db)
+            db.execute("""
+                create table if not exists telegram_reaction_deliveries(
+                  generation_id text not null,
+                  revision integer not null,
+                  target_message_id text not null,
+                  emoji text not null,
+                  status text not null check(status in ('reserved','sent','failed','suppressed')),
+                  created_at real not null,
+                  updated_at real not null,
+                  primary key(generation_id, revision, target_message_id)
+                )
+            """)
             db.commit()
         except Exception:
             db.rollback()
             raise
         finally:
             db.close()
+
+    def reserve_reaction(self, generation_id: str, revision: int, target_message_id: str, emoji: str, *, now: float | None = None) -> bool:
+        if not isinstance(target_message_id, str) or not target_message_id or not isinstance(emoji, str) or not emoji:
+            raise ValueError("reaction target and emoji must be non-empty")
+        now = time.time() if now is None else now
+        db = self._connect()
+        try:
+            db.execute("begin immediate")
+            active = db.execute("select 1 from telegram_generations where generation_id = ? and revision = ? and status = 'active'", (generation_id, revision)).fetchone()
+            if active is None:
+                db.commit()
+                return False
+            result = db.execute("insert or ignore into telegram_reaction_deliveries(generation_id, revision, target_message_id, emoji, status, created_at, updated_at) values (?, ?, ?, ?, 'reserved', ?, ?)", (generation_id, revision, target_message_id, emoji, now, now))
+            db.commit()
+            return result.rowcount == 1
+        finally:
+            db.close()
+
+    def _mark_reaction(self, generation_id: str, revision: int, target_message_id: str, status: str, *, now: float | None = None) -> bool:
+        now = time.time() if now is None else now
+        db = self._connect()
+        try:
+            result = db.execute("update telegram_reaction_deliveries set status = ?, updated_at = ? where generation_id = ? and revision = ? and target_message_id = ? and status = 'reserved'", (status, now, generation_id, revision, target_message_id))
+            db.commit()
+            return result.rowcount == 1
+        finally:
+            db.close()
+
+    def mark_reaction_sent(self, generation_id: str, revision: int, target_message_id: str, *, now: float | None = None) -> bool:
+        return self._mark_reaction(generation_id, revision, target_message_id, "sent", now=now)
+
+    def mark_reaction_failed(self, generation_id: str, revision: int, target_message_id: str, *, now: float | None = None) -> bool:
+        return self._mark_reaction(generation_id, revision, target_message_id, "failed", now=now)
+
+    def mark_reaction_suppressed(self, generation_id: str, revision: int, target_message_id: str, *, now: float | None = None) -> bool:
+        return self._mark_reaction(generation_id, revision, target_message_id, "suppressed", now=now)
 
     def _ensure_delivery_events_schema(self, db: sqlite3.Connection) -> None:
         columns = {row["name"]: row for row in db.execute("pragma table_info(telegram_delivery_events)")}

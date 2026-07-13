@@ -7,10 +7,10 @@ from unittest.mock import Mock
 from tomo_core.instances import RuntimeInstanceRegistry
 from tomo_core.models import InboundEnvelope, OutboundBubble
 from tomo_core.onboarding_store import TelegramOnboardingStore
-from tomo_core.providers import StaticProvider
+from tomo_core.providers import ProviderStreamCompleted, ProviderTextDelta, StaticProvider
 from tomo_core.shared_gateway import InProcessTelegramRuntimeDispatch, SharedTelegramGateway
 from tomo_core.sandbox_dispatch import SandboxDispatchError
-from tomo_core.sandbox_protocol import SandboxCompletedEvent, SandboxFrameEvent
+from tomo_core.sandbox_protocol import SandboxCompletedEvent, SandboxFrameEvent, SandboxReactionEvent
 from tomo_core.telegram import FakeTelegramClient
 from tomo_core.telegram_router import RetryableTelegramUpdateError
 
@@ -122,6 +122,41 @@ class SharedGatewayTests(unittest.TestCase):
             session = instances.get(installation.tomo_id).sessions.load("telegram:actor:999")
             self.assertEqual(session.model_history()[-2]["content"], "hi")
 
+    def test_runtime_dispatch_returns_reaction_to_the_gateway_for_direct_delivery(self):
+        with self._store() as store:
+            self._installation(store, chat_id="123", actor_id="999")
+            client = FakeTelegramClient()
+
+            class ReactionProvider:
+                name = "reaction"
+                supports_images_in = False
+                supports_images_out = False
+                supports_tool_calls = False
+
+                def stream(self, messages, *, tools=(), actor_id=None):
+                    return iter((
+                        ProviderTextDelta(
+                            '{"type":"turn_plan","primary_move":"answer","supporting_moves":[],"move_sequence":["answer"],"response_goal":"reply","confidence":"high","reaction":"👍"}\n'
+                            '{"type":"frame","text":"hello"}\n'
+                        ),
+                        ProviderStreamCompleted("stop"),
+                    ))
+
+            instances = RuntimeInstanceRegistry(
+                store.data_dir,
+                lambda _: ReactionProvider(),
+                client,
+            )
+            gateway = SharedTelegramGateway(
+                client=client,
+                store=store,
+                dispatch=InProcessTelegramRuntimeDispatch(instances=instances),
+            )
+
+            gateway.process_update(private_update("hi", chat_id="123", from_id="999", message_id=2))
+
+            self.assertEqual(client.reactions, [{"actor_id": "123", "message_id": "2", "emoji": "👍"}])
+
     def test_in_process_dispatch_supports_generation_work(self):
         with self._store() as store:
             installation = self._installation(store, chat_id="123", actor_id="999")
@@ -216,6 +251,53 @@ class SharedGatewayTests(unittest.TestCase):
             self.assertEqual([message["reply_to_message_id"] for message in client.sent_messages], ["2", None])
             self.assertFalse(store.is_generation_active(work.generation_id, work.revision))
             self.assertFalse(store.reserve_delivery(work.generation_id, work.revision, 2, 0, 2, "late.", None))
+
+    def test_generation_work_delivers_one_reaction_before_frames_and_ignores_replay(self):
+        with self._store() as store:
+            installation = self._installation(store, chat_id="123", actor_id="999")
+            work = self._generation_work(store, installation.tomo_id)
+            client = FakeTelegramClient()
+
+            class ReactionDispatch(FakeRuntimeDispatch):
+                def iter_telegram_events(self, installation, work, is_active=None):
+                    yield SandboxReactionEvent(0, installation.tomo_id, installation.actor_id, installation.chat_id, "2", work.generation_id, work.revision, "👍")
+                    yield SandboxReactionEvent(1, installation.tomo_id, installation.actor_id, installation.chat_id, "2", work.generation_id, work.revision, "👍")
+                    yield SandboxFrameEvent(2, 0, 0, "first.")
+                    yield SandboxCompletedEvent(3, {"logical_text": "first."})
+
+            gateway = SharedTelegramGateway(client=client, store=store, dispatch=ReactionDispatch(), pace_seconds=0)
+            self.assertTrue(gateway.process_update(work))
+
+            self.assertEqual(client.reactions, [{"actor_id": "123", "message_id": "2", "emoji": "👍"}])
+            self.assertEqual(client.sent_messages[0]["reply_to_message_id"], "2")
+            db = store._connect()
+            try:
+                row = db.execute(
+                    "select status from telegram_reaction_deliveries where generation_id = ? and revision = ? and target_message_id = ?",
+                    (work.generation_id, work.revision, "2"),
+                ).fetchone()
+            finally:
+                db.close()
+            self.assertEqual(row["status"], "sent")
+
+    def test_generation_work_rejects_forged_reaction_bindings(self):
+        with self._store() as store:
+            installation = self._installation(store, chat_id="123", actor_id="999")
+            work = self._generation_work(store, installation.tomo_id)
+            client = FakeTelegramClient()
+
+            class ForgedReactionDispatch(FakeRuntimeDispatch):
+                def iter_telegram_events(self, installation, work, is_active=None):
+                    for field, value in (("owner", "other"), ("actor", "other"), ("chat", "other"), ("target", "1"), ("generation", "other"), ("revision", work.revision + 1)):
+                        values = [installation.tomo_id, installation.actor_id, installation.chat_id, "2", work.generation_id, work.revision]
+                        values[("owner", "actor", "chat", "target", "generation", "revision").index(field)] = value
+                        yield SandboxReactionEvent(0, *values, "👍")
+                    yield SandboxFrameEvent(1, 0, 0, "first.")
+                    yield SandboxCompletedEvent(2, {"logical_text": "first."})
+
+            self.assertTrue(SharedTelegramGateway(client=client, store=store, dispatch=ForgedReactionDispatch(), pace_seconds=0).process_update(work))
+            self.assertEqual(client.reactions, [])
+            self.assertEqual(client.sent_messages[0]["text"], "first.")
 
     def test_generation_work_sends_event_zero_before_event_one_is_generated(self):
         with self._store() as store:

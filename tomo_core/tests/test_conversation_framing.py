@@ -30,6 +30,33 @@ class SegmentFrameParserTests(unittest.TestCase):
         self.assertEqual(parser.feed('{"type":"frame","text":"Continued."}'), [])
         self.assertEqual(parser.finish(), [Frame(2, 0, "Continued.")])
 
+    def test_memory_controls_precede_frames_and_are_bounded(self):
+        parser = SegmentFrameParser(segment_index=0, first_segment=True, budget=budget())
+        records = parser.feed(
+            '{"type":"turn_plan","primary_move":"answer","supporting_moves":[],"response_goal":"answer","confidence":"low"}\n'
+            '{"type":"memory_control","action":"upsert","authority":"autonomous","user_intent_excerpt":null,"memory_id":null,"kind":"preference","subject_key":"self","topic":"food","value":"tea","statement":"The user likes tea","confidence":0.9,"salience":0.8,"surface_scope":"contextual","valid_from":null,"valid_until":null,"sources":[{"source_kind":"current_message","source_id":"m1","observed_at":"2026-07-13T00:00:00Z"}]}\n'
+            '{"type":"frame","text":"Noted."}\n'
+        )
+        self.assertEqual(records[1].statement, "The user likes tea")
+        self.assertEqual(records[2], Frame(0, 0, "Noted."))
+        with self.assertRaises(ConversationOutputError) as raised:
+            parser.feed('{"type":"memory_control","action":"set_owner_setting","setting":"capture_enabled","enabled":true,"user_intent_excerpt":"remember this"}\n')
+        self.assertEqual(raised.exception.code, "late_memory_control")
+
+    def test_plan_reaction_is_nullable_and_allowlisted(self):
+        parser = SegmentFrameParser(segment_index=0, first_segment=True, budget=budget())
+        records = parser.feed(
+            '{"type":"turn_plan","primary_move":"answer","supporting_moves":[],"response_goal":"answer","confidence":"low","reaction":"👏"}\n'
+        )
+        self.assertEqual(records[0].reaction.emoji, "👏")
+
+        for reaction in ("custom_emoji_id", ["👍"], "👍👍"):
+            with self.subTest(reaction=reaction):
+                parser = SegmentFrameParser(segment_index=0, first_segment=True, budget=budget())
+                with self.assertRaises(ConversationOutputError) as raised:
+                    parser.feed('{"type":"turn_plan","primary_move":"answer","supporting_moves":[],"response_goal":"answer","confidence":"low","reaction":' + repr(reaction).replace("'", '"') + '}\n')
+                self.assertEqual(raised.exception.code, "invalid_plan")
+
     def test_first_segment_requires_one_plan_before_frames_but_allows_zero_frames(self):
         parser = SegmentFrameParser(segment_index=0, first_segment=True, budget=budget())
         with self.assertRaises(ConversationOutputError) as raised:

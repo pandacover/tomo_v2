@@ -7,14 +7,15 @@ import re
 from dataclasses import asdict, dataclass
 from typing import Any, Iterable, Iterator, TypeAlias
 
-from .conversation import ConversationMove, FrameReady, MoveConfidence, MovePlan, SegmentFinish, TurnBudget, TurnRunCompleted, TurnRunStatus, TurnUsage
+from .conversation import ConversationMove, FrameReady, MoveConfidence, MovePlan, ReactionIntent, SegmentFinish, TurnBudget, TurnRunCompleted, TurnRunStatus, TurnUsage
 from .conversation.parsing import _validate_strict_frame_text, parse_utterance, parse_utterances
 from .models import InboundEnvelope, InboundMessage, InputBurst, MessageAttachment, OutboundBubble, ResponseContract, RuntimeConfig
-from .runtime import RuntimeCompleted, RuntimeFrameReady
+from .runtime import RuntimeCompleted, RuntimeFrameReady, RuntimeReactionReady
 
 INBOUND_PROTOCOL_VERSION = 2
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 LEGACY_EVENT_PROTOCOL_VERSION = 2
+LEGACY_V3_EVENT_PROTOCOL_VERSION = 3
 LEGACY_PROTOCOL_VERSION = 1
 EVENT_MARKER = "TOMO_SANDBOX_EVENT="
 RESULT_MARKER = "TOMO_SANDBOX_RESULT="
@@ -45,6 +46,18 @@ class SandboxCompletedEvent:
 
 
 @dataclass(frozen=True)
+class SandboxReactionEvent:
+    sequence: int
+    owner_id: str
+    actor_id: str
+    chat_id: str
+    target_message_id: str
+    generation_id: str
+    revision: int
+    emoji: str
+
+
+@dataclass(frozen=True)
 class SandboxTracebackFrame:
     basename: str
     function: str
@@ -59,7 +72,7 @@ class SandboxErrorEvent:
     traceback: tuple[SandboxTracebackFrame, ...] = ()
 
 
-SandboxEvent: TypeAlias = SandboxFrameEvent | SandboxCompletedEvent | SandboxErrorEvent
+SandboxEvent: TypeAlias = SandboxReactionEvent | SandboxFrameEvent | SandboxCompletedEvent | SandboxErrorEvent
 
 
 def encode_inbound(request_id: str, burst: InputBurst | InboundEnvelope) -> str:
@@ -73,20 +86,28 @@ def encode_inbound(request_id: str, burst: InputBurst | InboundEnvelope) -> str:
 
 
 def decode_inbound(payload: str) -> tuple[str, InputBurst]:
-    """Parse identical-shape v2 or v3 inbound data during rollout."""
-    message = _decode(payload, "inbound", {INBOUND_PROTOCOL_VERSION, PROTOCOL_VERSION})
+    """Parse identical-shape v2, v3, or v4 inbound data during rollout."""
+    message = _decode(payload, "inbound", {INBOUND_PROTOCOL_VERSION, LEGACY_V3_EVENT_PROTOCOL_VERSION, PROTOCOL_VERSION})
     if not isinstance(message.get("burst"), dict):
         raise ValueError("inbound burst must be an object")
     return message["request_id"], _burst_from_dict(message["burst"])
 
 
-def encode_event(request_id: str, generation_id: str, sequence: int, event: object) -> str:
-    """Serialize frame, completion, or safe error events as v3."""
+def encode_event(request_id: str, generation_id: str, sequence: int, event: object, *, expected_reaction_binding: tuple[str, str, str, str, str, int] | None = None) -> str:
+    """Serialize reaction, frame, completion, or safe error events as v4."""
     _validate_request_id(request_id)
     _validate_generation_id(generation_id)
     _nonnegative(sequence, "event sequence")
     payload: dict[str, Any] = {"version": PROTOCOL_VERSION, "request_id": request_id, "generation_id": generation_id, "sequence": sequence}
-    if isinstance(event, RuntimeFrameReady):
+    if isinstance(event, RuntimeReactionReady):
+        binding = (event.owner_id, event.actor_id, event.chat_id, event.target_message_id, event.generation_id, event.revision)
+        if event.generation_id != generation_id or (expected_reaction_binding is not None and binding != expected_reaction_binding):
+            raise ValueError("reaction generation does not match event generation")
+        payload.update({"type": "reaction", "owner_id": event.owner_id, "actor_id": event.actor_id, "chat_id": event.chat_id,
+                        "target_message_id": event.target_message_id, "reaction_generation_id": event.generation_id,
+                        "revision": event.revision, "emoji": ReactionIntent(event.emoji).emoji})
+        return _encode(payload)
+    elif isinstance(event, RuntimeFrameReady):
         inner = event.event
     elif isinstance(event, FrameReady):
         inner = event
@@ -116,8 +137,8 @@ def encode_event(request_id: str, generation_id: str, sequence: int, event: obje
     return _encode(payload)
 
 
-def iter_event_markers(chunks: Iterable[str], expected_request_id: str, expected_generation_id: str, contract: ResponseContract | None = None, budget: TurnBudget | None = None) -> Iterator[SandboxEvent]:
-    """Parse one strictly version-consistent v2 or v3 event stream."""
+def iter_event_markers(chunks: Iterable[str], expected_request_id: str, expected_generation_id: str, contract: ResponseContract | None = None, budget: TurnBudget | None = None, *, expected_reaction_binding: tuple[str, str, str, str, int] | None = None) -> Iterator[SandboxEvent]:
+    """Parse one strictly version-consistent v2, v3, or v4 event stream."""
     _validate_request_id(expected_request_id)
     _validate_generation_id(expected_generation_id)
     contract = contract or ResponseContract()
@@ -125,9 +146,10 @@ def iter_event_markers(chunks: Iterable[str], expected_request_id: str, expected
     buffer, expected_sequence, stream_version, terminal = "", 0, None, False
     seen: dict[int, str] = {}
     frames: list[SandboxFrameEvent] = []
+    reaction_seen = False
 
     def process(line: str) -> SandboxEvent | None:
-        nonlocal expected_sequence, stream_version, terminal
+        nonlocal expected_sequence, stream_version, terminal, reaction_seen
         position = line.find(EVENT_MARKER)
         if position < 0 or not _PTY_PREFIX_RE.fullmatch(line[:position]):
             return None
@@ -145,15 +167,19 @@ def iter_event_markers(chunks: Iterable[str], expected_request_id: str, expected
             raise ValueError("sandbox event after terminal")
         if sequence != expected_sequence:
             raise ValueError("sandbox event sequence gap")
-        event = _event_from_message(message, contract, budget)
-        if isinstance(event, SandboxFrameEvent):
-            if message["version"] == PROTOCOL_VERSION:
+        event = _event_from_message(message, contract, budget, expected_reaction_binding)
+        if isinstance(event, SandboxReactionEvent):
+            if message["version"] != PROTOCOL_VERSION or reaction_seen or frames:
+                raise ValueError("invalid sandbox reaction ordering")
+            reaction_seen = True
+        elif isinstance(event, SandboxFrameEvent):
+            if message["version"] >= LEGACY_V3_EVENT_PROTOCOL_VERSION:
                 _validate_stream_frame(event, frames, budget)
             elif len(frames) >= contract.max_utterances:
                 raise ValueError("sandbox event stream exceeds utterance contract")
             frames.append(event)
         elif isinstance(event, SandboxCompletedEvent):
-            if message["version"] == PROTOCOL_VERSION:
+            if message["version"] >= LEGACY_V3_EVENT_PROTOCOL_VERSION:
                 completed_frames = _v3_result_parts(event.result, budget)
                 if tuple((frame.segment_index, frame.frame_index, frame.text) for frame in frames) != completed_frames:
                     raise ValueError("completed frames do not match streamed frames")
@@ -195,19 +221,38 @@ def _plan_dict(plan: object) -> dict[str, Any]:
 def _decode_event(payload: str, request_id: str, generation_id: str) -> dict[str, Any]:
     message = _json_object(payload)
     version = message.get("version")
-    if version not in {LEGACY_EVENT_PROTOCOL_VERSION, PROTOCOL_VERSION}:
+    if version not in {LEGACY_EVENT_PROTOCOL_VERSION, LEGACY_V3_EVENT_PROTOCOL_VERSION, PROTOCOL_VERSION}:
         raise ValueError("unsupported protocol version")
     if message.get("request_id") != request_id or message.get("generation_id") != generation_id:
         raise ValueError("event IDs do not match inbound request")
     _nonnegative(message.get("sequence"), "event sequence")
-    allowed = {"utterance", "completed", "error"} if version == LEGACY_EVENT_PROTOCOL_VERSION else {"frame", "completed", "error"}
+    allowed = ({"utterance", "completed", "error"} if version == LEGACY_EVENT_PROTOCOL_VERSION
+               else {"frame", "completed", "error"} if version == LEGACY_V3_EVENT_PROTOCOL_VERSION
+               else {"reaction", "frame", "completed", "error"})
     if message.get("type") not in allowed:
         raise ValueError("unsupported sandbox event type")
     return message
 
 
-def _event_from_message(message: dict[str, Any], contract: ResponseContract, budget: TurnBudget) -> SandboxEvent:
+def _event_from_message(message: dict[str, Any], contract: ResponseContract, budget: TurnBudget, expected_reaction_binding: tuple[str, str, str, str, int] | None = None) -> SandboxEvent:
     event_type, sequence = message["type"], message["sequence"]
+    if event_type == "reaction":
+        if set(message) != {"version", "request_id", "generation_id", "sequence", "type", "owner_id", "actor_id", "chat_id", "target_message_id", "reaction_generation_id", "revision", "emoji"}:
+            raise ValueError("reaction event contains unsupported fields")
+        try:
+            owner_id, actor_id, chat_id, target_message_id = message.get("owner_id"), message.get("actor_id"), message.get("chat_id"), message.get("target_message_id")
+            reaction_generation_id, revision = message.get("reaction_generation_id"), message.get("revision")
+            if any(not isinstance(value, str) or not value for value in (owner_id, actor_id, chat_id, target_message_id, reaction_generation_id)):
+                raise ValueError
+            _nonnegative(revision, "reaction revision")
+            if reaction_generation_id != message["generation_id"]:
+                raise ValueError
+            binding = (owner_id, actor_id, chat_id, target_message_id, revision)
+            if expected_reaction_binding is not None and binding != expected_reaction_binding:
+                raise ValueError
+            return SandboxReactionEvent(sequence, owner_id, actor_id, chat_id, target_message_id, reaction_generation_id, revision, ReactionIntent(message.get("emoji")).emoji)
+        except ValueError as error:
+            raise ValueError("invalid reaction binding or emoji") from error
     if event_type == "frame":
         if set(message) != {"version", "request_id", "generation_id", "sequence", "type", "segment_index", "frame_index", "text"}:
             raise ValueError("frame event contains unsupported fields")

@@ -17,7 +17,7 @@ from tomo_core.conversation import (
     TurnUsage,
 )
 from tomo_core.models import InboundEnvelope, InboundMessage, InputBurst, OutboundBubble, ResponseContract
-from tomo_core.runtime import RuntimeCompleted, RuntimeFrameReady
+from tomo_core.runtime import RuntimeCompleted, RuntimeFrameReady, RuntimeReactionReady
 from tomo_core.sandbox_protocol import (
     EVENT_MARKER,
     INBOUND_PROTOCOL_VERSION,
@@ -26,6 +26,7 @@ from tomo_core.sandbox_protocol import (
     RESULT_MARKER,
     SandboxErrorEvent,
     SandboxFrameEvent,
+    SandboxReactionEvent,
     SandboxTracebackFrame,
     decode_inbound,
     encode_error,
@@ -38,7 +39,7 @@ from tomo_core.sandbox_protocol import (
 
 
 class SandboxProtocolTests(unittest.TestCase):
-    def test_v2_inbound_and_v3_frame_completion_round_trip(self):
+    def test_v2_inbound_and_v4_frame_completion_round_trip(self):
         burst = self._burst()
         inbound_payload = encode_inbound("request-7", burst)
         self.assertEqual(json.loads(inbound_payload)["version"], 2)
@@ -49,7 +50,7 @@ class SandboxProtocolTests(unittest.TestCase):
         frame, completed = self._events()
         frame_payload = encode_event("request-7", "gen-1", 0, frame)
         completed_payload = encode_event("request-7", "gen-1", 1, completed)
-        self.assertEqual(json.loads(frame_payload)["version"], 3)
+        self.assertEqual(json.loads(frame_payload)["version"], 4)
         self.assertEqual(json.loads(frame_payload)["type"], "frame")
         self.assertEqual(json.loads(completed_payload)["result"]["segments"][0]["tool_call_count"], 1)
         self.assertNotIn("call_id", completed_payload)
@@ -77,10 +78,49 @@ class SandboxProtocolTests(unittest.TestCase):
         parsed = list(iter_event_markers([EVENT_MARKER + json.dumps(event) + "\n" for event in events], "request-7", "gen-1"))
         self.assertEqual(parsed[0], SandboxFrameEvent(0, 0, 0, "hello back.", ConversationMove.ANSWER))
 
-    def test_v3_encoder_rejects_unsupported_objects(self):
+    def test_v4_encoder_rejects_unsupported_objects(self):
         for event in (object(), {"type": "frame"}):
             with self.subTest(event=event), self.assertRaises(TypeError):
                 encode_event("request-7", "gen-1", 0, event)
+
+    def test_v4_reaction_is_strict_nonterminal_and_precedes_frames(self):
+        frame, completed = self._events()
+        reaction = encode_event("request-7", "gen-1", 0, self._reaction())
+        frame_payload = encode_event("request-7", "gen-1", 1, frame)
+        completed_payload = encode_event("request-7", "gen-1", 2, completed)
+        events = list(iter_event_markers([
+            EVENT_MARKER + reaction + "\n",
+            EVENT_MARKER + frame_payload + "\n",
+            EVENT_MARKER + completed_payload + "\n",
+        ], "request-7", "gen-1"))
+        self.assertEqual(events[0], SandboxReactionEvent(0, "owner-1", "actor-1", "chat-1", "message-1", "gen-1", 1, "👍"))
+
+        payload = json.loads(reaction)
+        for malformed in (
+            dict(payload, emoji="not-an-emoji"),
+            dict(payload, extra="no"),
+            dict(payload, sequence=1),
+        ):
+            with self.subTest(malformed=malformed), self.assertRaises(ValueError):
+                list(iter_event_markers([EVENT_MARKER + json.dumps(malformed) + "\n"], "request-7", "gen-1"))
+
+    def test_v4_reaction_requires_exact_expected_binding(self):
+        reaction = json.loads(encode_event("request-7", "gen-1", 0, self._reaction()))
+        frame, completed_event = self._events()
+        frame_payload = encode_event("request-7", "gen-1", 1, frame)
+        completed = encode_event("request-7", "gen-1", 2, completed_event)
+        expected = ("owner-1", "actor-1", "chat-1", "message-1", 1)
+        events = list(iter_event_markers([EVENT_MARKER + json.dumps(reaction) + "\n", EVENT_MARKER + frame_payload + "\n", EVENT_MARKER + completed + "\n"], "request-7", "gen-1", expected_reaction_binding=expected))
+        self.assertEqual(events[0].target_message_id, "message-1")
+        for field, value in (("owner_id", "owner-2"), ("actor_id", "actor-2"), ("chat_id", "chat-2"), ("target_message_id", "message-2"), ("reaction_generation_id", "gen-2"), ("revision", 2)):
+            malformed = dict(reaction, **{field: value})
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                list(iter_event_markers([EVENT_MARKER + json.dumps(malformed) + "\n"], "request-7", "gen-1", expected_reaction_binding=expected))
+
+        with self.assertRaises(ValueError):
+            encode_event("request-7", "other-generation", 0, self._reaction())
+        with self.assertRaises(ValueError):
+            encode_event("request-7", "gen-1", 0, self._reaction(), expected_reaction_binding=("owner-2", "actor-1", "chat-1", "message-1", "gen-1", 1))
 
     def test_v2_events_retain_response_contract_validation(self):
         contract = ResponseContract(max_utterances=2, max_sentences_per_utterance=1)
@@ -147,7 +187,7 @@ class SandboxProtocolTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             list(iter_event_markers([EVENT_MARKER + json.dumps(unsafe)], "request-7", "gen-1"))
 
-    def test_v3_reuses_strict_frame_validation_and_rejects_unsafe_error_codes(self):
+    def test_v4_reuses_strict_frame_validation_and_rejects_unsafe_error_codes(self):
         frame, _ = self._events()
         payload = json.loads(encode_event("request-7", "gen-1", 0, frame))
         for text in ("- list item", "Primary move: answer.", "first line\nsecond line", "has an em — dash"):
@@ -157,7 +197,7 @@ class SandboxProtocolTests(unittest.TestCase):
             with self.subTest(code=code), self.assertRaises(ValueError):
                 encode_event("request-7", "gen-1", 0, SandboxErrorEvent(0, code))
 
-    def test_v3_rejects_more_than_three_reconciled_frames(self):
+    def test_v4_rejects_more_than_three_reconciled_frames(self):
         frame, completed = self._events()
         stream = [json.loads(encode_event("request-7", "gen-1", index, RuntimeFrameReady(FrameReady(index, Frame(0, index, f"Frame {index}.")), OutboundBubble(f"Frame {index}.")))) for index in range(3)]
         fourth = dict(stream[-1], sequence=3, frame_index=3, text="Fourth.")
@@ -165,7 +205,7 @@ class SandboxProtocolTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             list(iter_event_markers([EVENT_MARKER + json.dumps(message) + "\n" for message in [*stream, fourth]], "request-7", "gen-1"))
 
-    def test_v3_validates_segment_and_visible_budgets_before_yielding_frames(self):
+    def test_v4_validates_segment_and_visible_budgets_before_yielding_frames(self):
         frame, _ = self._events()
         payload = json.loads(encode_event("request-7", "gen-1", 0, frame))
         oversized = dict(payload, segment_index=99)
@@ -174,7 +214,7 @@ class SandboxProtocolTests(unittest.TestCase):
             next(events)
 
         at_segment_two = dict(payload, segment_index=2)
-        terminal = {"version": 3, "request_id": "request-7", "generation_id": "gen-1", "sequence": 1, "type": "error", "error": {"code": "runtime_failed"}}
+        terminal = {"version": PROTOCOL_VERSION, "request_id": "request-7", "generation_id": "gen-1", "sequence": 1, "type": "error", "error": {"code": "runtime_failed"}}
         parsed = list(iter_event_markers([EVENT_MARKER + json.dumps(at_segment_two) + "\n", EVENT_MARKER + json.dumps(terminal) + "\n"], "request-7", "gen-1"))
         self.assertEqual(parsed[0], SandboxFrameEvent(0, 2, 0, "hello back."))
 
@@ -191,7 +231,7 @@ class SandboxProtocolTests(unittest.TestCase):
         self.assertEqual(list(iter_event_markers([EVENT_MARKER + error], "request-7", "gen-1"))[0].code, "runtime_failed")
 
     def test_v1_result_helpers_remain(self):
-        self.assertEqual(PROTOCOL_VERSION, 3)
+        self.assertEqual(PROTOCOL_VERSION, 4)
         result = encode_result("request-7", [OutboundBubble("ok")])
         self.assertEqual(parse_result_marker(RESULT_MARKER + result, "request-7"), [OutboundBubble("ok")])
         with self.assertRaises(Exception):
@@ -205,6 +245,10 @@ class SandboxProtocolTests(unittest.TestCase):
         plan = MovePlan(ConversationMove.ANSWER, (), "answer", MoveConfidence.HIGH, (ConversationMove.ANSWER,))
         result = TurnRunResult(plan, (SegmentResult(0, (frame,), (ToolCall("call-1", "lookup", {}),), SegmentFinish.TOOL_BATCH), SegmentResult(1, (), (), SegmentFinish.FAILED)), (frame,), TurnUsage(2, 1, 1, 1), TurnRunStatus.COMPLETED_PARTIAL)
         return RuntimeFrameReady(FrameReady(0, frame), OutboundBubble("hello back.")), RuntimeCompleted(TurnRunCompleted(result))
+
+    @staticmethod
+    def _reaction():
+        return RuntimeReactionReady("owner-1", "actor-1", "chat-1", "message-1", "gen-1", 1, "👍")
 
 
 if __name__ == "__main__":

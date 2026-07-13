@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 
 from tomo_core.context import ContextFact, ContextHydrator, ContextSnapshot
 from tomo_core.conversation.models import ConversationRequest
@@ -6,6 +7,14 @@ from tomo_core.models import InboundEnvelope, InboundMessage, InputBurst
 
 
 class ContextHydratorTests(unittest.TestCase):
+    def test_glossary_defines_personal_data_vocabulary(self):
+        glossary = (Path(__file__).parents[1] / "CONTEXT.md").read_text(encoding="utf-8").lower()
+        for term in (
+            "personal data repository", "autonomous personal memory", "memory control",
+            "epistemic kind", "surface scope", "provisional memory", "session search", "reaction intent",
+        ):
+            self.assertIn(term, glossary)
+
     def test_hydrate_copies_current_history_and_visible_frames_without_the_new_burst(self):
         burst = InputBurst(
             burst_id="burst-1",

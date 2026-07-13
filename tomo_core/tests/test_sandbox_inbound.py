@@ -25,7 +25,7 @@ class SandboxInboundTests(unittest.TestCase):
             payload = '{"type":"turn_plan","primary_move":"answer","supporting_moves":[],"move_sequence":["answer"],"response_goal":"answer","confidence":"high"}\n{"type":"frame","text":"hello back."}\n'
             return iter((ProviderTextDelta(payload), ProviderStreamCompleted("stop")))
 
-    def test_run_once_emits_v3_frames_then_one_completion(self):
+    def test_run_once_emits_v4_frames_then_one_completion(self):
         frame, completed = self._runtime_events()
         runtime = Mock()
         runtime.handle_telegram_burst_iter.return_value = iter((frame, completed))
@@ -53,7 +53,7 @@ class SandboxInboundTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             list(iter_event_markers(stdout.getvalue().splitlines(keepends=True), "request-1", "gen-1"))
 
-    def test_invalid_input_emits_a_safe_v3_error(self):
+    def test_invalid_input_emits_a_safe_v4_error(self):
         stdout = io.StringIO()
         with self.assertRaises(SandboxInboundError):
             run_once(io.StringIO("not json"), stdout, config=RuntimeConfig(data_dir="/tmp/data"), provider=Mock(), secret_values=("secret",))

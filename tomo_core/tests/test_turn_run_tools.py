@@ -2,7 +2,7 @@ import unittest
 
 import json
 
-from tomo_core.conversation import ConversationEngine, ConversationRequest, FrameReady, SegmentFinish, TurnBudget, TurnRunCompleted, TurnRunStatus
+from tomo_core.conversation import ConversationEngine, ConversationRequest, FrameReady, MemoryControlReady, SegmentFinish, TurnBudget, TurnRunCompleted, TurnRunStatus
 from tomo_core.conversation.parsing import ConversationOutputError
 from tomo_core.models import InboundEnvelope
 from tomo_core.providers import ProviderStreamCompleted, ProviderTextDelta, ProviderToolCallReady
@@ -62,6 +62,24 @@ class TurnRunToolTests(unittest.TestCase):
         message = provider.calls[1][0][-1]
         self.assertEqual(set(message), {"role", "tool_call_id", "content"})
         self.assertEqual(json.loads(message["content"]), {"name": "lookup", "ok": True, "content": "found"})
+
+    def test_memory_control_after_tool_batch_receives_only_that_turns_observation_id(self):
+        control = json.dumps({
+            "type": "memory_control", "action": "add", "authority": "autonomous", "user_intent_excerpt": None,
+            "memory_id": None, "kind": "fact", "subject_key": "self", "topic": "lookup.result",
+            "value": "found", "statement": "Lookup found a result", "confidence": 0.8, "salience": 0.5,
+            "surface_scope": "contextual", "valid_from": None, "valid_until": None,
+            "sources": [{"source_kind": "tool_observation", "source_id": "lookup-1", "observed_at": "2026-01-01T00:00:00Z"}],
+        })
+        provider = ScriptedProvider([
+            [ProviderTextDelta(PLAN), ProviderToolCallReady("lookup-1", "lookup", "{}"), ProviderStreamCompleted("tool_calls")],
+            [ProviderTextDelta(control + '\n{"type":"frame","text":"I found it."}\n'), ProviderStreamCompleted("stop")],
+        ])
+
+        events = list(ConversationEngine(provider, tool_registry=registry(tool("lookup", lambda _: "found"))).respond_iter(self.request()))
+
+        ready = next(event for event in events if isinstance(event, MemoryControlReady))
+        self.assertEqual(ready.tool_observation_ids, ("lookup-1",))
 
     def test_malformed_continuation_after_tool_only_segment_does_not_repair(self):
         provider = ScriptedProvider([
