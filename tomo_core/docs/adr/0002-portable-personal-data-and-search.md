@@ -16,6 +16,13 @@ uses FTS5 with `bm25`; FTS tables are disposable indexes. A future adapter must
 pass the repository contract tests and round-trip canonical versioned JSONL
 before configuration switches to it.
 
+Hosted Daytona sandboxes use the same durable data directory only as a
+two-slot framed checkpoint prefix. Their active SQLite database is a local work
+copy, never a file on the mounted volume. Each committed repository mutation
+backs up the closed local database and fsyncs it into the alternating durable
+slot. Direct SQLite access to Daytona-mounted paths is forbidden because their
+filesystem cannot reliably commit SQLite writes.
+
 | Backend | Search implementation |
 |---|---|
 | SQLite | FTS5 and `bm25` |

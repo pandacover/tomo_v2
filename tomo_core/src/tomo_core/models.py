@@ -135,6 +135,7 @@ class RuntimeConfig:
     data_dir: str = ".tomo_core"
     soul_path: str = "SOUL.md"
     owner_id: str | None = "local"
+    local_work_dir: str | None = None
 
     def __post_init__(self) -> None:
         self.response_contract

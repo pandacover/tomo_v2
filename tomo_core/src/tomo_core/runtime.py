@@ -79,7 +79,9 @@ class PersonalAgentRuntime:
     ) -> None:
         self.config = config or RuntimeConfig()
         self.provider = provider
-        self.personal_data = personal_data_repository or SqlitePersonalDataRepository(Path(self.config.data_dir) / "tomo.sqlite3")
+        self.personal_data = personal_data_repository or SqlitePersonalDataRepository(
+            Path(self.config.data_dir) / "tomo.sqlite3", local_work_dir=self.config.local_work_dir
+        )
         if self.config.owner_id is None:
             raise ValueError("owner_id is required for persisted runtime state")
         self.owner_id = self.config.owner_id

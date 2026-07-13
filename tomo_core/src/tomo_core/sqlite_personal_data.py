@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
+import struct
+import tempfile
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime
+from functools import wraps
 from pathlib import Path
 
 from .models import utc_now_iso
@@ -17,6 +22,9 @@ from .personal_data import (MemoryContextQuery, MemoryGovernanceControl, MemoryG
 from .sessions import ConversationSession, StoredMessage
 
 _NS = uuid.UUID("c4bb268a-a6b1-4ee9-b3bf-9ef69f2696bc")
+_CHECKPOINT_MAGIC = b"TOMOCP01"
+_CHECKPOINT_VERSION = 1
+_CHECKPOINT_HEADER = struct.Struct("!8sBQQ32s")
 
 
 def _id(*parts: object) -> str:
@@ -91,10 +99,37 @@ def _schema_statements() -> tuple[str, ...]:
     return tuple(statements)
 
 
+def _checkpoint_after_write(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        result = method(self, *args, **kwargs)
+        if result is not False:
+            self._checkpoint()
+        return result
+    return wrapped
+
+
 class SqlitePersonalDataRepository:
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, local_work_dir: str | Path | None = None) -> None:
         self.path = str(path)
-        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        self._durable_path = Path(path)
+        self._local_work_dir = Path(local_work_dir) if local_work_dir is not None else None
+        if self._local_work_dir is None:
+            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        else:
+            self._local_work_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(self._local_work_dir, 0o700)
+            except OSError:
+                pass
+            name = hashlib.sha256(str(self._durable_path).encode("utf-8")).hexdigest()[:24]
+            self.path = str(self._local_work_dir / f"tomo-{name}.sqlite3")
+            self._lock_path = self._local_work_dir / f"tomo-{name}.lock"
+            with self._checkpoint_lock():
+                if not Path(self.path).is_file():
+                    payload = self._newest_checkpoint()
+                    if payload is not None:
+                        self._restore_local(payload)
         with self._connection() as con:
             try:
                 con.execute("BEGIN IMMEDIATE")
@@ -125,6 +160,163 @@ class SqlitePersonalDataRepository:
                 con.rollback()
                 if "fts5" in str(error).lower(): raise StorageCapabilityError("sqlite_fts5_unavailable") from None
                 raise self._safe(error)
+
+    def _checkpoint_slot(self, index):
+        return self._durable_path.with_name(f"{self._durable_path.name}.checkpoint.{index}")
+
+    def _checkpoint_payload(self, path):
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            return None
+        if len(raw) < _CHECKPOINT_HEADER.size:
+            return None
+        magic, version, generation, length, digest = _CHECKPOINT_HEADER.unpack(raw[:_CHECKPOINT_HEADER.size])
+        payload = raw[_CHECKPOINT_HEADER.size:]
+        if magic != _CHECKPOINT_MAGIC or version != _CHECKPOINT_VERSION or length != len(payload):
+            return None
+        if hashlib.sha256(payload).digest() != digest:
+            return None
+        return generation, payload
+
+    def _newest_checkpoint(self):
+        checkpoints = [self._checkpoint_payload(self._checkpoint_slot(index)) for index in (0, 1)]
+        valid = sorted((checkpoint for checkpoint in checkpoints if checkpoint is not None), reverse=True)
+        for _, payload in valid:
+            if self._snapshot_is_integral(payload):
+                return payload
+        return None
+
+    def _snapshot_is_integral(self, payload):
+        descriptor, temporary = tempfile.mkstemp(prefix=".validate-", dir=self._local_work_dir)
+        try:
+            with os.fdopen(descriptor, "wb") as file:
+                file.write(payload)
+            con = sqlite3.connect(temporary)
+            try:
+                return con.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            finally:
+                con.close()
+        except (OSError, sqlite3.Error):
+            return False
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+
+    def _restore_local(self, payload):
+        descriptor, temporary = tempfile.mkstemp(prefix=".restore-", dir=self._local_work_dir)
+        try:
+            os.chmod(temporary, 0o600)
+            with os.fdopen(descriptor, "wb") as file:
+                file.write(payload)
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temporary, self.path)
+        except BaseException:
+            Path(temporary).unlink(missing_ok=True)
+            raise
+
+    @contextmanager
+    def _checkpoint_lock(self):
+        if self._local_work_dir is None:
+            yield
+            return
+        with self._lock_path.open("a+b") as lock:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    lock.seek(0)
+                    lock.write(b"0")
+                    lock.flush()
+                    deadline = time.monotonic() + 5
+                    while True:
+                        try:
+                            lock.seek(0)
+                            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                            break
+                        except OSError:
+                            if time.monotonic() >= deadline:
+                                raise StorageBusyError("storage_busy") from None
+                            time.sleep(0.05)
+                    try:
+                        yield
+                    finally:
+                        lock.seek(0)
+                        msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    deadline = time.monotonic() + 5
+                    while True:
+                        try:
+                            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            break
+                        except BlockingIOError:
+                            if time.monotonic() >= deadline:
+                                raise StorageBusyError("storage_busy") from None
+                            time.sleep(0.05)
+                    try:
+                        yield
+                    finally:
+                        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            except StorageBusyError:
+                raise
+            except OSError:
+                raise StorageBusyError("storage_busy") from None
+
+    def _checkpoint(self, *, scrub=False):
+        if self._local_work_dir is None:
+            return
+        with self._checkpoint_lock():
+            temporary = None
+            try:
+                valid = [(index, self._checkpoint_payload(self._checkpoint_slot(index))) for index in (0, 1)]
+                valid = [(index, checkpoint) for index, checkpoint in valid if checkpoint is not None]
+                generation = max((checkpoint[0] for _, checkpoint in valid), default=0)
+                slots = (0, 1) if scrub else (1 - max(valid, key=lambda item: item[1][0])[0] if valid else 0,)
+                descriptor, temporary = tempfile.mkstemp(prefix=".checkpoint-", dir=self._local_work_dir)
+                os.chmod(temporary, 0o600)
+                os.close(descriptor)
+                target = sqlite3.connect(temporary)
+                source = sqlite3.connect(self.path)
+                try:
+                    source.backup(target)
+                finally:
+                    target.close()
+                    source.close()
+                check = sqlite3.connect(temporary)
+                try:
+                    if check.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                        raise StorageBusyError("storage_operation_failed")
+                finally:
+                    check.close()
+                payload = Path(temporary).read_bytes()
+                digest = hashlib.sha256(payload).digest()
+                for index in slots:
+                    generation += 1
+                    framed = _CHECKPOINT_HEADER.pack(_CHECKPOINT_MAGIC, _CHECKPOINT_VERSION, generation, len(payload), digest) + payload
+                    slot = self._checkpoint_slot(index)
+                    slot.parent.mkdir(parents=True, exist_ok=True)
+                    with slot.open("wb") as file:
+                        try:
+                            os.chmod(slot, 0o600)
+                        except OSError:
+                            pass
+                        file.write(framed)
+                        file.flush()
+                        os.fsync(file.fileno())
+            except sqlite3.Error as error:
+                raise self._safe(error) from None
+            except StorageBusyError:
+                raise
+            except OSError:
+                raise StorageBusyError("storage_operation_failed") from None
+            finally:
+                if temporary is not None:
+                    try:
+                        Path(temporary).unlink(missing_ok=True)
+                    except OSError:
+                        pass
 
     @staticmethod
     def _exists(con, name): return con.execute("SELECT 1 FROM sqlite_master WHERE name=?", (name,)).fetchone() is not None
@@ -158,6 +350,7 @@ class SqlitePersonalDataRepository:
                 if r["connector_message_id"] is not None: meta["message_id"]=r["connector_message_id"]
                 result.append(StoredMessage(r["role"],r["content"],r["timestamp"],meta))
             return result
+    @_checkpoint_after_write
     def save_session(self, owner_id, session, *, generation_id=None, revision=None):
         try:
             with self._connection() as con:
@@ -243,8 +436,9 @@ class SqlitePersonalDataRepository:
 
     def memory_settings(self, owner):
         with self._connection() as c:
-            c.execute("INSERT OR IGNORE INTO owner_memory_settings VALUES(?,?,?,?,?,?)",(owner,1,1,1,0,utc_now_iso())); r=c.execute("SELECT * FROM owner_memory_settings WHERE owner_id=?",(owner,)).fetchone()
-            return OwnerMemorySettings(owner,bool(r["capture_enabled"]),bool(r["retrieval_enabled"]),bool(r["reactions_enabled"]),r["governance_revision"])
+            r=c.execute("SELECT * FROM owner_memory_settings WHERE owner_id=?",(owner,)).fetchone()
+            return OwnerMemorySettings(owner, True, True, True, 0) if r is None else OwnerMemorySettings(owner,bool(r["capture_enabled"]),bool(r["retrieval_enabled"]),bool(r["reactions_enabled"]),r["governance_revision"])
+    @_checkpoint_after_write
     def update_memory_setting(self, owner, setting, enabled):
         if setting not in {"capture_enabled","retrieval_enabled","reactions_enabled"}: raise ValueError("unknown owner setting")
         with self._connection() as c:
@@ -253,6 +447,7 @@ class SqlitePersonalDataRepository:
     def _record(self,c,r):
         src=tuple(MemorySourceRef(x["source_kind"],x["source_id"],x["observed_at"],bool(x["source_available"])) for x in c.execute("SELECT * FROM memory_sources WHERE memory_id=?",(r["id"],)))
         return MemoryRecord(r["id"],r["owner_id"],r["kind"],r["subject_key"],r["topic"],json.loads(r["value_json"]),r["statement"],r["epistemic_kind"],r["status"],r["confidence"],r["salience"],r["surface_scope"],r["valid_from"],r["valid_until"],src)
+    @_checkpoint_after_write
     def stage_memory_controls(self, owner, session_key, generation_id, segment_index, governance_revision, controls, *, revision=None):
         try:
             with self._connection() as c:
@@ -359,12 +554,14 @@ class SqlitePersonalDataRepository:
                         c.execute("UPDATE memories SET status='disabled_by_user',updated_at=? WHERE owner_id=? AND id IN (%s)" % marks,(now,owner,*targets))
                         c.execute("INSERT OR IGNORE INTO owner_memory_settings VALUES(?,?,?,?,?,?)",(owner,1,1,1,0,now))
                         c.execute("UPDATE owner_memory_settings SET governance_revision=governance_revision+1,updated_at=? WHERE owner_id=?",(now,owner)); c.commit()
+                        self._checkpoint()
                         return MemoryGovernanceResult("applied",targets)
                     pending_id=str(uuid.uuid4())
                     # ISO timestamps sort chronologically, so expiry can be enforced in SQL.
                     from datetime import datetime, timedelta, timezone
                     expires=(datetime.now(timezone.utc)+timedelta(minutes=10)).isoformat()
                     c.execute("INSERT INTO pending_memory_actions VALUES(?,?,?,?,?,?,?)",(pending_id,owner,session_key,"delete",json.dumps(targets),expires,now)); c.commit()
+                    self._checkpoint()
                     return MemoryGovernanceResult("pending_confirmation",targets,pending_id)
             except sqlite3.OperationalError as e: raise self._safe(e) from None
         if isinstance(control,PendingMemoryActionControl):
@@ -373,12 +570,15 @@ class SqlitePersonalDataRepository:
                     c.execute("BEGIN IMMEDIATE"); now=utc_now_iso()
                     pending=c.execute("SELECT * FROM pending_memory_actions WHERE id=? AND owner_id=? AND session_key=?",(control.pending_action_id,owner,session_key)).fetchone()
                     if not pending:
-                        c.rollback(); return MemoryGovernanceResult("not_found")
+                        c.rollback()
+                        if control.action == "confirm_delete":
+                            self._checkpoint(scrub=True)
+                        return MemoryGovernanceResult("not_found")
                     if pending["expires_at"] <= now:
-                        c.execute("DELETE FROM pending_memory_actions WHERE id=?",(pending["id"],)); c.commit(); return MemoryGovernanceResult("rejected")
+                        c.execute("DELETE FROM pending_memory_actions WHERE id=?",(pending["id"],)); c.commit(); self._checkpoint(); return MemoryGovernanceResult("rejected")
                     targets=tuple(json.loads(pending["target_ids_json"]))
                     if control.action == "cancel_delete":
-                        c.execute("DELETE FROM pending_memory_actions WHERE id=?",(pending["id"],)); c.commit(); return MemoryGovernanceResult("cancelled",targets)
+                        c.execute("DELETE FROM pending_memory_actions WHERE id=?",(pending["id"],)); c.commit(); self._checkpoint(); return MemoryGovernanceResult("cancelled",targets)
                     rows=c.execute("SELECT fingerprint FROM memories WHERE owner_id=? AND id IN (%s)" % ",".join("?"*len(targets)),(owner,*targets)).fetchall()
                     fingerprints=tuple(r["fingerprint"] for r in rows)
                     c.execute("DELETE FROM memories WHERE owner_id=? AND id IN (%s)" % ",".join("?"*len(targets)),(owner,*targets))
@@ -386,6 +586,7 @@ class SqlitePersonalDataRepository:
                         c.execute("DELETE FROM memories WHERE owner_id=? AND status='provisional' AND fingerprint IN (%s)" % ",".join("?"*len(fingerprints)),(owner,*fingerprints))
                     c.execute("INSERT OR IGNORE INTO memory_deletion_tombstones VALUES(?,?,?,?)",(_id("delete",owner,pending["id"]),owner,now,pending["id"]))
                     c.execute("DELETE FROM pending_memory_actions WHERE id=?",(pending["id"],)); c.execute("INSERT OR IGNORE INTO owner_memory_settings VALUES(?,?,?,?,?,?)",(owner,1,1,1,0,now)); c.execute("UPDATE owner_memory_settings SET governance_revision=governance_revision+1,updated_at=? WHERE owner_id=?",(now,owner)); c.commit()
+                    self._checkpoint(scrub=True)
                     return MemoryGovernanceResult("applied",targets)
             except sqlite3.OperationalError as e: raise self._safe(e) from None
         return MemoryGovernanceResult("rejected")
@@ -398,10 +599,13 @@ class SqlitePersonalDataRepository:
                 else:c.execute(f"UPDATE memory_sources SET source_available=0 WHERE source_id IN ({references})",(session_id,session_id))
                 c.execute("DELETE FROM sessions WHERE id=?",(session_id,))
             c.commit()
+        self._checkpoint(scrub=True)
     def delete_owner(self,owner):
         with self._connection() as c:
             c.execute("BEGIN IMMEDIATE"); c.execute("DELETE FROM sessions WHERE owner_id=?",(owner,)); c.execute("DELETE FROM memories WHERE owner_id=?",(owner,)); c.execute("DELETE FROM owner_memory_settings WHERE owner_id=?",(owner,)); c.execute("DELETE FROM pending_memory_actions WHERE owner_id=?",(owner,)); c.execute("DELETE FROM memory_deletion_tombstones WHERE owner_id=?",(owner,)); c.commit()
+        self._checkpoint(scrub=True)
 
+    @_checkpoint_after_write
     def rebuild_index(self, owner_id=None):
         with self._connection() as c:
             c.execute("BEGIN IMMEDIATE")
@@ -419,6 +623,7 @@ class SqlitePersonalDataRepository:
         with self._connection() as c:
             return c.execute("PRAGMA integrity_check").fetchone()[0] == "ok" and not c.execute("PRAGMA foreign_key_check").fetchone()
 
+    @_checkpoint_after_write
     def prune_provisional_artifacts(self, older_than):
         with self._connection() as c:
             c.execute("BEGIN IMMEDIATE")
@@ -440,6 +645,7 @@ class SqlitePersonalDataRepository:
             if memory_ids:
                 marks=",".join("?"*len(memory_ids)); records += [{"table":"memory_sources","row":dict(r)} for r in c.execute(f"SELECT * FROM memory_sources WHERE memory_id IN ({marks})",memory_ids)]
             return records
+    @_checkpoint_after_write
     def import_owner_records(self, owner, records):
         # SQLite validates references transactionally; materialize only at this
         # adapter boundary while callers and alternate adapters stream records.
@@ -470,6 +676,7 @@ class SqlitePersonalDataRepository:
     def legacy_import_hash(self, path):
         with self._connection() as c:
             row=c.execute("SELECT source_sha256 FROM legacy_session_imports WHERE source_path=?",(path,)).fetchone(); return row[0] if row else None
+    @_checkpoint_after_write
     def import_legacy_session_file(self, owner, session, path, digest):
         # The marker and all imported rows commit together; files are never changed.
         try:

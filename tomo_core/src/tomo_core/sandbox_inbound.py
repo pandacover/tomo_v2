@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import os
 from typing import TextIO
 import traceback
@@ -48,6 +48,7 @@ class CollectingTelegramSink:
 def build_runtime(provider: ProviderAdapter, config: RuntimeConfig) -> PersonalAgentRuntime:
     if config.owner_id is None:
         raise SandboxInboundError("missing_owner_id")
+    config = replace(config, local_work_dir=config.local_work_dir or "/tmp/tomo-core-sqlite")
     return PersonalAgentRuntime(provider=provider, telegram=CollectingTelegramSink(), config=config)
 
 
