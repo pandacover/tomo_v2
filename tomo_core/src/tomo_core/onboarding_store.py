@@ -204,7 +204,14 @@ class TelegramOnboardingStore:
             turn = db.execute("select * from telegram_chat_turns where chat_id = ?", (chat_id,)).fetchone()
             if turn is None or turn["burst_id"] is None:
                 burst_id = f"{chat_id}:{update_id}"
-                revision = 1
+                persisted_revision = int(
+                    db.execute(
+                        "select coalesce(max(revision), 0) from telegram_generations where chat_id = ?",
+                        (chat_id,),
+                    ).fetchone()[0]
+                )
+                turn_revision = 0 if turn is None else int(turn["revision"])
+                revision = max(persisted_revision, turn_revision) + 1
                 db.execute(
                     """
                     insert into telegram_chat_turns(chat_id, burst_id, revision, quiet_until, active_generation_id, updated_at)
@@ -496,7 +503,7 @@ class TelegramOnboardingStore:
                 db.execute(
                     """
                     update telegram_chat_turns
-                    set burst_id = null, revision = 0, active_generation_id = null, quiet_until = ?, updated_at = ?
+                    set burst_id = null, active_generation_id = null, quiet_until = ?, updated_at = ?
                     where chat_id = ? and active_generation_id = ?
                     """,
                     (now, now, row["chat_id"], generation_id),
@@ -506,7 +513,7 @@ class TelegramOnboardingStore:
                 db.execute(
                     """
                     update telegram_chat_turns
-                    set active_generation_id = null, quiet_until = ?, updated_at = ?
+                    set revision = revision + 1, active_generation_id = null, quiet_until = ?, updated_at = ?
                     where chat_id = ? and active_generation_id = ?
                     """,
                     (retry_at, now, row["chat_id"], generation_id),
@@ -536,7 +543,7 @@ class TelegramOnboardingStore:
                 db.execute(
                     """
                     update telegram_chat_turns
-                    set active_generation_id = null, quiet_until = ?, updated_at = ?
+                    set revision = revision + 1, active_generation_id = null, quiet_until = ?, updated_at = ?
                     where chat_id = ? and active_generation_id = ?
                     """,
                     (now, now, row["chat_id"], row["generation_id"]),

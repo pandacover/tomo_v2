@@ -353,7 +353,7 @@ class TelegramOnboardingStoreTests(unittest.TestCase):
             replacement = store.claim_next_work(now=3)
 
             self.assertIsNotNone(replacement)
-            self.assertEqual(replacement.revision, first.revision)
+            self.assertEqual(replacement.revision, first.revision + 1)
             self.assertNotEqual(replacement.generation_id, first.generation_id)
             self.assertEqual([item.update_id for item in replacement.inputs], [1])
 
@@ -368,6 +368,19 @@ class TelegramOnboardingStoreTests(unittest.TestCase):
             second = store.claim_next_work(now=3)
 
             self.assertIn(first.generation_id, second.accepted_generation_ids)
+            self.assertEqual(second.revision, first.revision + 1)
+
+    def test_terminal_failure_preserves_monotonic_revision_for_the_next_burst(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TelegramOnboardingStore(tmp)
+            store.enqueue_update(1, "chat-a", "first", now=0, update_kind="message", message_id="m1", tomo_id="tomo-1")
+            first = store.claim_next_work(now=1)
+            self.assertTrue(store.fail_generation(first.generation_id, "invalid_result", now=2, max_attempts=1))
+
+            store.enqueue_update(2, "chat-a", "second", now=3, update_kind="message", message_id="m2", tomo_id="tomo-1")
+            second = store.claim_next_work(now=4)
+
+            self.assertEqual(second.revision, first.revision + 1)
 
     def test_recovery_atomically_requeues_active_generation(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -382,6 +395,7 @@ class TelegramOnboardingStoreTests(unittest.TestCase):
             self.assertEqual(interrupted[0].tomo_id, "tomo-1")
             self.assertIsNotNone(replacement)
             self.assertNotEqual(replacement.generation_id, first.generation_id)
+            self.assertEqual(replacement.revision, first.revision + 1)
 
     def test_recovery_converts_abandoned_reservation_to_unknown_context(self):
         with tempfile.TemporaryDirectory() as tmp:
