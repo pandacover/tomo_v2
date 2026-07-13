@@ -9,6 +9,7 @@ import traceback
 
 import httpx
 
+from .conversation.parsing import ConversationOutputError
 from .models import OutboundBubble, RuntimeConfig
 from .providers import ProviderAdapter
 from .runtime import PersonalAgentRuntime, RuntimeCompleted, RuntimeFrameReady, RuntimeReactionReady
@@ -90,6 +91,9 @@ def run_once(
             if isinstance(event, RuntimeCompleted):
                 return 0
         return 0
+    except ConversationOutputError as error:
+        code = _safe_diagnostic_name(error.code, _MAX_EXCEPTION_CLASS_CHARS, secret_values)
+        _raise_failure(stdout, code, error, secret_values, request_id, generation_id, sequence)
     except httpx.HTTPStatusError as error:
         code = "auth_expired" if error.response.status_code == 401 else "provider_failed"
         _raise_failure(stdout, code, error, secret_values, request_id, generation_id, sequence)

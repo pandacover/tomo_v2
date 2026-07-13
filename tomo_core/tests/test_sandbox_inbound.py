@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 import httpx
 
 from tomo_core.conversation import Frame, FrameReady, MoveConfidence, MovePlan, SegmentFinish, SegmentResult, TurnRunCompleted, TurnRunResult, TurnRunStatus, TurnUsage
+from tomo_core.conversation.parsing import ConversationOutputError
 from tomo_core.models import InboundEnvelope, InboundMessage, InputBurst, OutboundBubble, RuntimeConfig
 from tomo_core.runtime import RuntimeCompleted, RuntimeFrameReady
 from tomo_core.sandbox_inbound import CollectingTelegramSink, SandboxInboundError, build_runtime, run_once
@@ -75,6 +76,26 @@ class SandboxInboundTests(unittest.TestCase):
         self.assertTrue(event.traceback)
         self.assertTrue(all("/" not in frame.basename and "\\" not in frame.basename for frame in event.traceback))
         self.assertNotIn("authorization failed", stdout.getvalue())
+
+    def test_run_once_preserves_safe_conversation_output_code_without_exception_text(self):
+        token, stdout, runtime = "secret-access-token", io.StringIO(), Mock()
+        runtime.handle_telegram_burst_iter.side_effect = ConversationOutputError("invalid_json")
+        with patch("tomo_core.sandbox_inbound.build_runtime", return_value=runtime):
+            with self.assertRaises(SandboxInboundError) as raised:
+                run_once(
+                    io.StringIO(encode_inbound("request-1", self._burst())),
+                    stdout,
+                    config=RuntimeConfig(data_dir="/tmp/data"),
+                    provider=Mock(),
+                    secret_values=(token,),
+                )
+
+        self.assertEqual(raised.exception.code, "invalid_json")
+        event = list(iter_event_markers([stdout.getvalue()], "request-1", "gen-1"))[0]
+        self.assertEqual(event.code, "invalid_json")
+        self.assertEqual(event.exception_class, "ConversationOutputError")
+        self.assertNotIn("invalid conversation output", stdout.getvalue())
+        self.assertNotIn(token, stdout.getvalue())
 
     def test_run_once_bounds_and_sanitizes_long_unsafe_traceback_diagnostics(self):
         stdout, runtime = io.StringIO(), Mock()
