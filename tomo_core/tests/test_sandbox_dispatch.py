@@ -7,7 +7,7 @@ from tomo_core.models import InboundEnvelope
 from tomo_core.onboarding_store import InterruptedGeneration, TelegramGenerationInput, TelegramGenerationWork
 from tomo_core.sandbox_dispatch import SandboxDispatch, SandboxDispatchError
 from tomo_core.sandbox_registry import SandboxRegistry
-from tomo_core.sandbox_protocol import EVENT_MARKER, RESULT_MARKER, SandboxErrorEvent, SandboxTracebackFrame, encode_error, encode_event, encode_result
+from tomo_core.sandbox_protocol import EVENT_MARKER, RESULT_MARKER, SandboxCompletedEvent, SandboxErrorEvent, SandboxFrameEvent, SandboxTracebackFrame, encode_error, encode_event, encode_result
 from tomo_core.conversation.models import ConversationMove, Frame, FrameReady, MoveConfidence, MovePlan, SegmentFinish, SegmentResult, ToolCall, TurnBudget, TurnRunCompleted, TurnRunResult, TurnRunStatus, TurnUsage
 from tomo_core.runtime import RuntimeCompleted, RuntimeFrameReady
 from tomo_core.models import OutboundBubble
@@ -177,6 +177,25 @@ class SandboxDispatchTests(unittest.TestCase):
 
         self.assertEqual((events[0].segment_index, events[0].frame_index, events[0].legacy_move), (0, 0, None))
 
+    def test_iter_telegram_events_emits_safe_latency_phases_and_usage_counts(self):
+        work = self._work()
+        self.daytona.start_session_command.return_value = SessionCommandHandle("telegram-burst-one-r1", "cmd-1")
+        self.daytona.iter_session_logs.return_value = iter(v3_tool_turn_markers("telegram-generation-burst-one-r1", "burst:one/r1"))
+        self.daytona.session_command_exit_code.return_value = 0
+
+        with patch("tomo_core.sandbox_dispatch.latency_trace.emit") as emit:
+            list(self.dispatch.iter_telegram_events(self.installation, work))
+
+        phases = [call.args[1] for call in emit.call_args_list]
+        self.assertEqual(phases, ["dispatch_start", "sandbox_reconcile", "sandbox_lookup", "oauth_access", "pty_ready", "sandbox_first_frame", "sandbox_completed"])
+        self.assertTrue(all(call.args[0] == work.burst_id for call in emit.call_args_list))
+        completed = emit.call_args_list[-1]
+        self.assertEqual(completed.kwargs["model_segments"], 5)
+        self.assertEqual(completed.kwargs["tool_rounds"], 4)
+        self.assertEqual(completed.kwargs["tool_calls"], 4)
+        self.assertEqual(completed.kwargs["visible_segments"], 1)
+        self.assertNotIn("complete.", repr(emit.call_args_list))
+
     def test_iter_telegram_events_uses_the_configured_tool_budget(self):
         work = self._work()
         self.daytona.start_session_command.return_value = SessionCommandHandle("telegram-burst-one-r1", "cmd-1")
@@ -195,7 +214,9 @@ class SandboxDispatchTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "invalid_result")
 
     def test_iter_telegram_events_does_not_start_when_inactive(self):
-        self.assertEqual(list(self.dispatch.iter_telegram_events(self.installation, self._work(), is_active=lambda: False)), [])
+        with patch("tomo_core.sandbox_dispatch.latency_trace.emit") as emit:
+            self.assertEqual(list(self.dispatch.iter_telegram_events(self.installation, self._work(), is_active=lambda: False)), [])
+        emit.assert_not_called()
         self.daytona.start_session_command.assert_not_called()
 
     def test_iter_telegram_events_stops_after_a_frame_becomes_stale(self):

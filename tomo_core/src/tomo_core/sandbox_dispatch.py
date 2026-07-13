@@ -6,6 +6,7 @@ import os
 import json
 import logging
 import re
+import time
 import traceback
 from collections import defaultdict
 from threading import Lock
@@ -16,7 +17,8 @@ from .daytona_supervisor import DaytonaSupervisor
 from .conversation import TurnBudget
 from .models import InboundEnvelope, InboundMessage, InputBurst, MessageAttachment, OutboundBubble, RuntimeConfig
 from .onboarding_store import InterruptedGeneration, TelegramGenerationInput, TelegramGenerationWork, TelegramInstallation
-from .sandbox_protocol import SandboxErrorEvent, SandboxEvent, SandboxProtocolError, encode_inbound, iter_event_markers, parse_result_marker
+from .sandbox_protocol import SandboxCompletedEvent, SandboxErrorEvent, SandboxEvent, SandboxFrameEvent, SandboxProtocolError, encode_inbound, iter_event_markers, parse_result_marker
+from . import latency_trace
 
 
 _COMMAND = "/opt/tomo/.venv/bin/tomo-core sandbox-inbound"
@@ -93,21 +95,31 @@ class SandboxDispatch:
         is_active = is_active or (lambda: True)
         if not is_active():
             return
+        dispatch_started_at = time.monotonic()
+        latency_trace.emit(work.burst_id, "dispatch_start", elapsed_ms=0)
+        reconcile_started_at = time.monotonic()
         record = self.supervisor.reconcile(installation.tomo_id)
+        latency_trace.emit(work.burst_id, "sandbox_reconcile", elapsed_ms=max(0, int((time.monotonic() - reconcile_started_at) * 1000)))
         if not record.sandbox_id:
             raise SandboxDispatchError("sandbox_not_ready")
+        lookup_started_at = time.monotonic()
         sandbox = self.client.get(record.sandbox_id)
+        latency_trace.emit(work.burst_id, "sandbox_lookup", elapsed_ms=max(0, int((time.monotonic() - lookup_started_at) * 1000)))
         request_id = _request_id(work.generation_id)
         session_id = work.session_id
         burst = burst_from_work(installation, work)
         yielded = 0
+        any_frame = False
         force_refresh = False
         for attempt in range(2):
             command: SessionCommandHandle | None = None
             try:
                 if not is_active():
                     return
+                oauth_started_at = time.monotonic()
                 token = self.auth_broker.access_token(force_refresh=force_refresh)
+                latency_trace.emit(work.burst_id, "oauth_access", elapsed_ms=max(0, int((time.monotonic() - oauth_started_at) * 1000)), attempt=attempt + 1)
+                pty_started_at = time.monotonic()
                 command = self.client.start_session_command(
                     sandbox,
                     session_id,
@@ -123,6 +135,7 @@ class SandboxDispatch:
                     },
                     timeout=_EXEC_TIMEOUT_SECONDS,
                 )
+                latency_trace.emit(work.burst_id, "pty_ready", elapsed_ms=max(0, int((time.monotonic() - pty_started_at) * 1000)), attempt=attempt + 1)
                 for event in iter_event_markers(
                     self.client.iter_session_logs(sandbox, command),
                     expected_request_id=request_id,
@@ -146,6 +159,13 @@ class SandboxDispatch:
                     yielded += 1
                     if not is_active():
                         return
+                    if isinstance(event, SandboxFrameEvent) and not any_frame:
+                        latency_trace.emit(work.burst_id, "sandbox_first_frame", elapsed_ms=max(0, int((time.monotonic() - dispatch_started_at) * 1000)))
+                        any_frame = True
+                    if isinstance(event, SandboxCompletedEvent):
+                        usage = event.result.get("usage")
+                        counts = {name: usage[name] for name in ("model_segments", "tool_rounds", "tool_calls", "contract_repairs", "visible_segments") if isinstance(usage, dict) and isinstance(usage.get(name), int)}
+                        latency_trace.emit(work.burst_id, "sandbox_completed", elapsed_ms=max(0, int((time.monotonic() - dispatch_started_at) * 1000)), **counts)
                     yield event
                 else:
                     exit_code = self.client.session_command_exit_code(sandbox, command)

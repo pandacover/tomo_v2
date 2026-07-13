@@ -2,7 +2,7 @@ import tempfile
 import time
 import unittest
 from contextlib import contextmanager
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from tomo_core.instances import RuntimeInstanceRegistry
 from tomo_core.models import InboundEnvelope, OutboundBubble
@@ -252,6 +252,49 @@ class SharedGatewayTests(unittest.TestCase):
             self.assertFalse(store.is_generation_active(work.generation_id, work.revision))
             self.assertFalse(store.reserve_delivery(work.generation_id, work.revision, 2, 0, 2, "late.", None))
 
+    def test_generation_work_emits_first_delivery_without_message_content(self):
+        with self._store() as store:
+            installation = self._installation(store, chat_id="123", actor_id="999")
+            work = self._generation_work(store, installation.tomo_id)
+            with patch("tomo_core.shared_gateway.latency_trace.emit") as emit, patch("tomo_core.shared_gateway.time.time", return_value=3.0):
+                SharedTelegramGateway(client=FakeTelegramClient(), store=store, dispatch=FakeRuntimeDispatch(), pace_seconds=0).process_update(work)
+
+            phases = [call.args[1] for call in emit.call_args_list]
+            self.assertEqual(phases, ["telegram_origin_to_worker_start", "telegram_queue_wait", "telegram_first_delivery", "telegram_first_delivery"])
+            self.assertEqual(emit.call_args_list[2].args[0], work.burst_id)
+            self.assertNotIn("first.", repr(emit.call_args_list))
+
+    def test_later_bubble_failure_is_not_labeled_first_delivery(self):
+        with self._store() as store:
+            installation = self._installation(store, chat_id="123", actor_id="999")
+            work = self._generation_work(store, installation.tomo_id)
+            client = FakeTelegramClient()
+            send_message = client.send_message
+
+            def fail_second(*args, **kwargs):
+                if client.sent_messages:
+                    raise RuntimeError("later send failed")
+                return send_message(*args, **kwargs)
+
+            client.send_message = fail_second
+            with patch("tomo_core.shared_gateway.latency_trace.emit") as emit:
+                SharedTelegramGateway(client=client, store=store, dispatch=FakeRuntimeDispatch(), pace_seconds=0).process_update(work)
+
+            self.assertFalse(any(call.kwargs.get("outcome") == "error" for call in emit.call_args_list))
+
+    def test_only_first_bubble_failure_is_labeled_first_delivery_attempt(self):
+        with self._store() as store:
+            installation = self._installation(store, chat_id="123", actor_id="999")
+            work = self._generation_work(store, installation.tomo_id)
+            client = FakeTelegramClient()
+            client.send_message = Mock(side_effect=RuntimeError("send failed"))
+
+            with patch("tomo_core.shared_gateway.latency_trace.emit") as emit:
+                SharedTelegramGateway(client=client, store=store, dispatch=FakeRuntimeDispatch(), pace_seconds=0).process_update(work)
+
+            first_delivery_errors = [call for call in emit.call_args_list if call.args[1] == "telegram_first_delivery" and call.kwargs.get("outcome") == "error"]
+            self.assertEqual(len(first_delivery_errors), 1)
+
     def test_generation_work_delivers_one_reaction_before_frames_and_ignores_replay(self):
         with self._store() as store:
             installation = self._installation(store, chat_id="123", actor_id="999")
@@ -388,9 +431,12 @@ class SharedGatewayTests(unittest.TestCase):
             client = FakeTelegramClient()
             gateway = SharedTelegramGateway(client=client, store=store, dispatch=FakeRuntimeDispatch(), pace_seconds=0)
 
-            gateway.process_update(work)
+            with patch("tomo_core.shared_gateway.latency_trace.emit") as emit:
+                gateway.process_update(work)
 
             self.assertEqual([message["text"] for message in client.sent_messages], ["first.", "second."])
+            first_delivery_outcomes = [call.kwargs.get("outcome") for call in emit.call_args_list if call.args[1] == "telegram_first_delivery"]
+            self.assertEqual(first_delivery_outcomes, ["send_complete", "origin_to_delivery"])
             self.assertEqual(store.delivery_status(work.generation_id, 0), "unknown")
             self.assertTrue(store.is_generation_active(work.generation_id, work.revision))
             store.mark_delivery_sent = original_mark_sent

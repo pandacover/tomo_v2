@@ -71,6 +71,8 @@ class TelegramGenerationWork:
     inputs: tuple[TelegramGenerationInput, ...]
     visible_assistant_utterances: tuple[str, ...] = ()
     accepted_generation_ids: tuple[str, ...] = ()
+    eligible_at: float | None = None
+    claimed_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -332,7 +334,19 @@ class TelegramOnboardingStore:
             )
             db.execute("update telegram_chat_turns set active_generation_id = ?, updated_at = ? where chat_id = ?", (generation_id, now, turn["chat_id"]))
             db.commit()
-            return TelegramGenerationWork(generation_id, burst_id, turn["chat_id"], tomo_id, revision, session_id, tuple(inputs), visible, accepted)
+            return TelegramGenerationWork(
+                generation_id,
+                burst_id,
+                turn["chat_id"],
+                tomo_id,
+                revision,
+                session_id,
+                tuple(inputs),
+                visible,
+                accepted,
+                eligible_at=float(turn["quiet_until"]),
+                claimed_at=float(now),
+            )
         finally:
             db.close()
 

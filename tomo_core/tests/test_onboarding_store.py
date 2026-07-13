@@ -282,6 +282,8 @@ class TelegramOnboardingStoreTests(unittest.TestCase):
             work = store.claim_next_work(now=11.2)
             self.assertEqual(work.chat_id, "chat-a")
             self.assertEqual(work.revision, 2)
+            self.assertAlmostEqual(work.eligible_at, 11.1)
+            self.assertAlmostEqual(work.claimed_at, 11.2)
             self.assertEqual([item.update_id for item in work.inputs], [101, 102])
             self.assertEqual([item.ordinal for item in work.inputs], [1, 2])
             self.assertTrue(store.reserve_delivery(work.generation_id, work.revision, 0, 0, 0, "hi", "m2", legacy_move="answer", now=11.3))

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
 from .daytona_supervisor import SandboxSupervisorError
+from . import latency_trace
 from .instances import RuntimeInstanceRegistry
 from .models import InboundEnvelope, OutboundBubble
 from .onboarding_store import TelegramGenerationWork, TelegramInstallation, TelegramOnboardingStore
@@ -174,6 +175,11 @@ class SharedTelegramGateway:
         return True
 
     def _process_generation_work(self, work: TelegramGenerationWork) -> bool:
+        telegram_sent_at = work.inputs[-1].telegram_sent_at
+        if isinstance(telegram_sent_at, (int, float)):
+            latency_trace.emit(work.burst_id, "telegram_origin_to_worker_start", elapsed_ms=max(0, int((time.time() - telegram_sent_at) * 1000)))
+        if isinstance(work.eligible_at, (int, float)) and isinstance(work.claimed_at, (int, float)):
+            latency_trace.emit(work.burst_id, "telegram_queue_wait", elapsed_ms=max(0, int((work.claimed_at - work.eligible_at) * 1000)))
         installation = self.store.installation_for_chat(work.chat_id)
         if installation is None:
             raise RetryableTelegramUpdateError("installation_missing")
@@ -182,6 +188,8 @@ class SharedTelegramGateway:
         self.client.send_typing(installation.chat_id)
         last_send_at: float | None = None
         first_frame_delivered = False
+        first_send_attempted = False
+        first_send_accepted = False
         delivery_uncertain = False
         try:
             is_active = lambda: self.store.is_generation_active(work.generation_id, work.revision)
@@ -227,6 +235,9 @@ class SharedTelegramGateway:
                     if not self.store.is_generation_active(work.generation_id, work.revision):
                         self.store.mark_delivery_suppressed(work.generation_id, event.sequence)
                         continue
+                    is_first_delivery_attempt = not first_send_attempted
+                    first_send_attempted = True
+                    send_started_at = time.monotonic()
                     try:
                         receipt = self.client.send_message(
                             installation.chat_id,
@@ -236,12 +247,25 @@ class SharedTelegramGateway:
                     except Exception:
                         self.store.mark_delivery_unknown(work.generation_id, event.sequence)
                         delivery_uncertain = True
+                        if is_first_delivery_attempt:
+                            latency_trace.emit(work.burst_id, "telegram_first_delivery", outcome="error", elapsed_ms=max(0, int((time.monotonic() - send_started_at) * 1000)))
                         continue
+                    send_completed_at = time.monotonic()
+                    if not first_send_accepted:
+                        latency_trace.emit(
+                            work.burst_id,
+                            "telegram_first_delivery",
+                            outcome="send_complete",
+                            elapsed_ms=max(0, int((send_completed_at - send_started_at) * 1000)),
+                        )
+                        if isinstance(telegram_sent_at, (int, float)):
+                            latency_trace.emit(work.burst_id, "telegram_first_delivery", outcome="origin_to_delivery", elapsed_ms=max(0, int((time.time() - telegram_sent_at) * 1000)))
+                        first_send_accepted = True
                     if not self.store.mark_delivery_sent(work.generation_id, event.sequence, receipt.message_id):
                         self.store.mark_delivery_unknown(work.generation_id, event.sequence)
                         delivery_uncertain = True
                         continue
-                    last_send_at = time.monotonic()
+                    last_send_at = send_completed_at
                     first_frame_delivered = True
                 elif isinstance(event, SandboxCompletedEvent):
                     if not delivery_uncertain:
