@@ -5,6 +5,7 @@ from collections.abc import Mapping, Sequence
 
 from ..context import ContextSnapshot
 from ..models import InboundEnvelope, InputBurst
+from ..skills import render_capability_skill_index
 from .models import ConversationMove, ConversationRequest, MovePlan, TurnBudget
 from .moves import render_move_procedures
 
@@ -118,15 +119,16 @@ def _first_segment_system(soul: str, budget: TurnBudget, tool_schemas: tuple[dic
         f"generate exactly one internal turn_plan JSONL record before any frame record; after that plan and before frames, emit zero to five memory_control records. then zero to {_frame_count_limit(budget.max_frames_per_segment)} frame JSONL records.\n"
         '{"type":"turn_plan","primary_move":"answer","supporting_moves":[],"move_sequence":["answer"],"response_goal":"...","confidence":"low","reaction":null}\n'
         '{"type":"frame","text":"..."}\n'
-        "memory_control records are optional and internal. use them only when information may be useful in future conversations; preserve uncertainty with confidence and sources rather than suppressing it. never emit credentials or authentication secrets.\n"
+        "memory_control records are optional and internal. follow the indexed memory skill when emitting them.\n"
         "the turn_plan fields are primary_move, supporting_moves, response_goal, confidence, and reaction. reaction is null by default or exactly one supported emoji. use it very sparsely; use null for commands, auth, errors, routine acknowledgements, ambiguity, corrections, opt-outs, serious, sensitive, or distressing content. never mention reactions to the user. moves are turn-level purposes, never frame or bubble sections; MovePlan does not determine frame count.\n"
         f"ordinary completion uses {frame_count} frames. when making native tool calls, emit zero or one useful pre-tool frame.\n"
         f"target one to two sentences per frame and no more than {frame_count} frames this segment. hard runtime limits: "
         f"at most {budget.max_frames_per_segment} frames per segment, {budget.max_sentences_per_frame} sentences per frame, and {budget.max_chars_per_frame} characters per frame.\n"
         "never use markdown, internal labels, em dashes, or en dashes in frame text. never claim an action happened without a supplied observation.\n"
         f"{tool_guidance}\n"
-        "memory and session context hydration is silent unless the user explicitly requests it. do not offer mutation, booking, purchase, send, delete, or other side-effect capabilities unless an exposed bound tool and confirmation path exist.\n"
+        "do not offer mutation, booking, purchase, send, delete, or other side-effect capabilities unless an exposed bound tool and confirmation path exist.\n"
         f"allowed native tool schemas: {json.dumps(tool_schemas, ensure_ascii=False, separators=(',', ':'))}\n\n"
+        f"{render_capability_skill_index()}\n\n"
         f"<TOMO_SOUL>\n{soul}\n</TOMO_SOUL>\n\n"
         f"move planning vocabulary:\n{render_move_procedures(tuple(ConversationMove))}"
     )
@@ -144,16 +146,17 @@ def _later_segment_system(soul: str, budget: TurnBudget, plan: MovePlan, tool_sc
         "you are tomo. follow the supplied SOUL completely.\n"
         "produce JSON Lines only. emit one JSON object per physical line, with no code fences, backticks, or prose outside records. do not emit a turn_plan record; reuse the fixed turn plan. emit zero to five optional internal memory_control records before any frame record.\n"
         '{"type":"frame","text":"..."}\n'
-        "remember information autonomously only when future usefulness justifies it. qualify uncertain observations with confidence and sources rather than omitting them. never emit credentials or authentication secrets.\n"
+        "memory_control records are optional and internal. follow the indexed memory skill when emitting them.\n"
         f"fixed turn plan: primary_move={plan.primary.value}; supporting_moves={supporting}; confidence={plan.confidence.value}.\n"
         f"{completion_guidance}\n"
         "original request and conversation history remain valid context for final frames. claims about tool outcomes or actions must be grounded in supplied tool observations.\n"
         "target one to two sentences per frame. hard runtime limits: "
         f"at most {budget.max_frames_per_segment} frames per segment, {budget.max_sentences_per_frame} sentences per frame, and {budget.max_chars_per_frame} characters per frame.\n"
         "never use markdown, internal labels, em dashes, or en dashes in frame text. never claim an action happened without a supplied observation.\n"
-        "tool announcements are optional social output, never execution telemetry. memory and session context hydration is silent unless the user explicitly requests it.\n"
+        "tool announcements are optional social output, never execution telemetry.\n"
         "do not offer mutation, booking, purchase, send, delete, or other side-effect capabilities unless an exposed bound tool and confirmation path exist.\n"
         f"allowed native tool schemas: {json.dumps(tool_schemas, ensure_ascii=False, separators=(',', ':'))}\n\n"
+        f"{render_capability_skill_index()}\n\n"
         f"<TOMO_SOUL>\n{soul}\n</TOMO_SOUL>"
     )
 

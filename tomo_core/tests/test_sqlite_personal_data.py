@@ -2,19 +2,51 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tomo_core.personal_data import MemorySearchQuery, MemorySourceRef, MemoryWriteControl, SessionSearchQuery
+from tomo_core.personal_data import MemoryContextQuery, MemorySearchQuery, MemorySourceRef, MemoryWriteControl, SessionSearchQuery
 from tomo_core.sessions import ConversationSession, StoredMessage
 from tomo_core.sqlite_personal_data import SqlitePersonalDataRepository
 
 
 class SqlitePersonalDataTests(unittest.TestCase):
     @staticmethod
-    def _control(action="upsert", value="tea", *, statement=None, memory_id=None, sources=None):
+    def _control(action="upsert", value="tea", *, statement=None, memory_id=None, sources=None, surface_scope="always"):
         return MemoryWriteControl(
             action, "autonomous", None, memory_id, "fact", "self", "drink", {"value": value},
-            statement or f"Owner likes {value}", 0.9, 0.8, "always", None, None,
+            statement or f"Owner likes {value}", 0.9, 0.8, surface_scope, None, None,
             sources or (MemorySourceRef("current_message", "message-1", "2026-01-01T00:00:00Z"),),
         )
+
+    def test_archived_contextual_memory_requires_explicit_search(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repository = SqlitePersonalDataRepository(Path(tmp) / "tomo.sqlite3")
+            session = ConversationSession("telegram:actor:one")
+            for generation in ("add", "archive"):
+                session.append(StoredMessage("assistant", generation, metadata={"generation_id": generation}))
+            repository.save_session("owner-a", session)
+
+            repository.stage_memory_controls(
+                "owner-a",
+                session.session_key,
+                "add",
+                0,
+                0,
+                (self._control("add", "tea", surface_scope="contextual"),),
+            )
+            repository.accept_generations("owner-a", session.session_key, ("add",))
+            active = repository.memory_context(MemoryContextQuery("owner-a", "tea"))[0]
+
+            repository.stage_memory_controls(
+                "owner-a",
+                session.session_key,
+                "archive",
+                0,
+                0,
+                (self._control("archive", "tea", memory_id=active.id, surface_scope="contextual"),),
+            )
+            repository.accept_generations("owner-a", session.session_key, ("archive",))
+
+            self.assertEqual(repository.memory_context(MemoryContextQuery("owner-a", "tea")), ())
+            self.assertEqual(repository.search_memories(MemorySearchQuery("owner-a", "tea"))[0].memory.status, "archived")
 
     def test_write_actions_have_distinct_accepted_lifecycle(self):
         with tempfile.TemporaryDirectory() as tmp:

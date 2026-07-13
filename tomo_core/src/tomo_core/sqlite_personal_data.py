@@ -559,7 +559,7 @@ class SqlitePersonalDataRepository:
         with self._connection() as c:
             rows=list(c.execute("SELECT * FROM memories WHERE owner_id=? AND status='active' AND surface_scope='always' ORDER BY salience DESC,confidence DESC,updated_at DESC LIMIT ?",(q.owner_id,max(0,min(q.always_limit,16)))))
             if q.text.strip():
-                try: rows += [h.memory for h in self.search_memories(MemorySearchQuery(q.owner_id,q.text,max(0,min(q.contextual_limit,8)))) if h.memory.surface_scope=="contextual"]
+                try: rows += [h.memory for h in self.search_memories(MemorySearchQuery(q.owner_id,q.text,max(0,min(q.contextual_limit,8)))) if h.memory.status=="active" and h.memory.surface_scope=="contextual"]
                 except StorageSearchError: pass
             result=[]; used=0
             for x in rows:
