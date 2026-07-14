@@ -55,7 +55,7 @@ class TelegramBotApiClient:
         return self.request("getUpdates", payload, timeout=float(timeout) + 5.0).get("result", [])
 
     def send_typing(self, actor_id: str) -> None:
-        self.request("sendChatAction", {"chat_id": actor_id, "action": "typing"})
+        self.request("sendChatAction", {"chat_id": actor_id, "action": "typing"}, timeout=2.0)
 
     def send_message(
         self,

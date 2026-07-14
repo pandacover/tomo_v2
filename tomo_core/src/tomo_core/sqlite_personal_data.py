@@ -408,6 +408,13 @@ class SqlitePersonalDataRepository:
                 if r["connector_message_id"] is not None: meta["message_id"]=r["connector_message_id"]
                 result.append(StoredMessage(r["role"],r["content"],r["timestamp"],meta))
             return result
+    def current_session_revision(self, owner_id, session_key):
+        with self._connection() as con:
+            row = con.execute(
+                "SELECT current_revision FROM sessions WHERE owner_id=? AND session_key=?",
+                (owner_id, session_key),
+            ).fetchone()
+            return None if row is None or row["current_revision"] is None else int(row["current_revision"])
     @_checkpoint_after_write
     def save_session(self, owner_id, session, *, generation_id=None, revision=None):
         try:

@@ -12,8 +12,8 @@ import httpx
 from .conversation.parsing import ConversationOutputError
 from .models import OutboundBubble, RuntimeConfig
 from .providers import ProviderAdapter
-from .runtime import PersonalAgentRuntime, RuntimeCompleted, RuntimeFrameReady, RuntimeReactionReady
-from .sandbox_protocol import EVENT_MARKER, SandboxErrorEvent, SandboxTracebackFrame, decode_inbound, encode_event
+from .runtime import PersonalAgentRuntime, RuntimeCompleted, RuntimeFrameReady, RuntimeReactionReady, StaleSessionRevisionError
+from .sandbox_protocol import EVENT_MARKER, SandboxErrorEvent, SandboxStaleEvent, SandboxTracebackFrame, decode_inbound, encode_event
 
 
 _MAX_FAILURE_EVENT_CHARS = 900
@@ -90,6 +90,10 @@ def run_once(
             sequence += 1
             if isinstance(event, RuntimeCompleted):
                 return 0
+        _write_payload(stdout, encode_event(request_id, generation_id, sequence, SandboxErrorEvent(sequence, "runtime_missing_terminal")))
+        return 1
+    except StaleSessionRevisionError as error:
+        _write_payload(stdout, encode_event(request_id, generation_id, sequence, SandboxStaleEvent(sequence, error.current_revision)))
         return 0
     except ConversationOutputError as error:
         code = _safe_diagnostic_name(error.code, _MAX_EXCEPTION_CLASS_CHARS, secret_values)

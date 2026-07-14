@@ -8,6 +8,14 @@ from tomo_core.sqlite_personal_data import SqlitePersonalDataRepository
 
 
 class SqlitePersonalDataTests(unittest.TestCase):
+    def test_current_session_revision_is_read_only_and_owner_scoped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repository = SqlitePersonalDataRepository(Path(tmp) / "tomo.sqlite3")
+            self.assertIsNone(repository.current_session_revision("owner-a", "telegram:actor:user-1"))
+            session = ConversationSession("telegram:actor:user-1")
+            self.assertTrue(repository.save_session("owner-a", session, generation_id="generation-1", revision=1))
+            self.assertEqual(repository.current_session_revision("owner-a", session.session_key), 1)
+            self.assertIsNone(repository.current_session_revision("owner-b", session.session_key))
     @staticmethod
     def _control(action="upsert", value="tea", *, statement=None, memory_id=None, sources=None, surface_scope="always"):
         return MemoryWriteControl(

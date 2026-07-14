@@ -24,9 +24,11 @@ from tomo_core.sandbox_protocol import (
     LEGACY_EVENT_PROTOCOL_VERSION,
     PROTOCOL_VERSION,
     RESULT_MARKER,
+    SandboxCompletedEvent,
     SandboxErrorEvent,
     SandboxFrameEvent,
     SandboxReactionEvent,
+    SandboxStaleEvent,
     SandboxTracebackFrame,
     decode_inbound,
     encode_error,
@@ -39,7 +41,7 @@ from tomo_core.sandbox_protocol import (
 
 
 class SandboxProtocolTests(unittest.TestCase):
-    def test_v2_inbound_and_v4_frame_completion_round_trip(self):
+    def test_v2_inbound_and_v5_frame_completion_round_trip(self):
         burst = self._burst()
         inbound_payload = encode_inbound("request-7", burst)
         self.assertEqual(json.loads(inbound_payload)["version"], 2)
@@ -50,7 +52,7 @@ class SandboxProtocolTests(unittest.TestCase):
         frame, completed = self._events()
         frame_payload = encode_event("request-7", "gen-1", 0, frame)
         completed_payload = encode_event("request-7", "gen-1", 1, completed)
-        self.assertEqual(json.loads(frame_payload)["version"], 4)
+        self.assertEqual(json.loads(frame_payload)["version"], 5)
         self.assertEqual(json.loads(frame_payload)["type"], "frame")
         self.assertEqual(json.loads(completed_payload)["result"]["segments"][0]["tool_call_count"], 1)
         self.assertNotIn("call_id", completed_payload)
@@ -77,6 +79,14 @@ class SandboxProtocolTests(unittest.TestCase):
         ]
         parsed = list(iter_event_markers([EVENT_MARKER + json.dumps(event) + "\n" for event in events], "request-7", "gen-1"))
         self.assertEqual(parsed[0], SandboxFrameEvent(0, 0, 0, "hello back.", ConversationMove.ANSWER))
+        frame, completed = self._events()
+        legacy_v4 = [json.loads(encode_event("request-7", "gen-1", 0, frame)), json.loads(encode_event("request-7", "gen-1", 1, completed))]
+        for event in legacy_v4:
+            event["version"] = 4
+        self.assertEqual(
+            [type(event) for event in iter_event_markers([EVENT_MARKER + json.dumps(event) + "\n" for event in legacy_v4], "request-7", "gen-1")],
+            [SandboxFrameEvent, SandboxCompletedEvent],
+        )
 
     def test_v4_encoder_rejects_unsupported_objects(self):
         for event in (object(), {"type": "frame"}):
@@ -230,8 +240,38 @@ class SandboxProtocolTests(unittest.TestCase):
         error = encode_event("request-7", "gen-1", 0, SandboxErrorEvent(0, "runtime_failed"))
         self.assertEqual(list(iter_event_markers([EVENT_MARKER + error], "request-7", "gen-1"))[0].code, "runtime_failed")
 
+    def test_v5_stale_event_is_strict_and_terminal_while_legacy_events_remain_readable(self):
+        self.assertEqual(PROTOCOL_VERSION, 5)
+        stale = encode_event("request-7", "gen-1", 0, SandboxStaleEvent(0, 12))
+        self.assertEqual(json.loads(stale), {
+            "version": 5, "request_id": "request-7", "generation_id": "gen-1",
+            "sequence": 0, "type": "stale", "current_revision": 12,
+        })
+        self.assertEqual(
+            list(iter_event_markers([EVENT_MARKER + stale + "\n"], "request-7", "gen-1")),
+            [SandboxStaleEvent(0, 12)],
+        )
+        for malformed in (
+            {"version": 5, "request_id": "request-7", "generation_id": "gen-1", "sequence": 0, "type": "stale", "current_revision": -1},
+            {"version": 5, "request_id": "request-7", "generation_id": "gen-1", "sequence": 0, "type": "stale", "current_revision": True},
+            {"version": 5, "request_id": "request-7", "generation_id": "gen-1", "sequence": 0, "type": "stale", "current_revision": 12, "extra": "no"},
+            {"version": 4, "request_id": "request-7", "generation_id": "gen-1", "sequence": 0, "type": "stale", "current_revision": 12},
+        ):
+            with self.subTest(malformed=malformed), self.assertRaises(ValueError):
+                list(iter_event_markers([EVENT_MARKER + json.dumps(malformed) + "\n"], "request-7", "gen-1"))
+        completed = encode_event("request-7", "gen-1", 1, self._events()[1])
+        with self.assertRaises(ValueError):
+            list(iter_event_markers([EVENT_MARKER + stale + "\n", EVENT_MARKER + completed + "\n"], "request-7", "gen-1"))
+        frame = json.loads(encode_event("request-7", "gen-1", 0, self._events()[0]))
+        stale_after_frame = dict(json.loads(stale), sequence=1)
+        reaction = json.loads(encode_event("request-7", "gen-1", 0, self._reaction()))
+        stale_after_reaction = dict(json.loads(stale), sequence=1)
+        stale_nonzero = dict(json.loads(stale), sequence=1)
+        for messages in ([frame, stale_after_frame], [reaction, stale_after_reaction], [stale_nonzero]):
+            with self.subTest(messages=messages), self.assertRaises(ValueError):
+                list(iter_event_markers([EVENT_MARKER + json.dumps(message) + "\n" for message in messages], "request-7", "gen-1"))
+
     def test_v1_result_helpers_remain(self):
-        self.assertEqual(PROTOCOL_VERSION, 4)
         result = encode_result("request-7", [OutboundBubble("ok")])
         self.assertEqual(parse_result_marker(RESULT_MARKER + result, "request-7"), [OutboundBubble("ok")])
         with self.assertRaises(Exception):

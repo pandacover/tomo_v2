@@ -9,9 +9,9 @@ import httpx
 from tomo_core.conversation import Frame, FrameReady, MoveConfidence, MovePlan, SegmentFinish, SegmentResult, TurnRunCompleted, TurnRunResult, TurnRunStatus, TurnUsage
 from tomo_core.conversation.parsing import ConversationOutputError
 from tomo_core.models import InboundEnvelope, InboundMessage, InputBurst, OutboundBubble, RuntimeConfig
-from tomo_core.runtime import RuntimeCompleted, RuntimeFrameReady
+from tomo_core.runtime import RuntimeCompleted, RuntimeFrameReady, StaleSessionRevisionError
 from tomo_core.sandbox_inbound import CollectingTelegramSink, SandboxInboundError, build_runtime, run_once
-from tomo_core.sandbox_protocol import EVENT_MARKER, SandboxFrameEvent, encode_inbound, iter_event_markers
+from tomo_core.sandbox_protocol import EVENT_MARKER, SandboxErrorEvent, SandboxFrameEvent, SandboxStaleEvent, encode_inbound, iter_event_markers
 from tomo_core.providers import ProviderStreamCompleted, ProviderTextDelta
 
 
@@ -43,16 +43,27 @@ class SandboxInboundTests(unittest.TestCase):
         self.assertEqual(events[-1].result["status"], "completed")
         self.assertEqual(stdout.getvalue().count(EVENT_MARKER), 2)
 
-    def test_cancellation_after_frames_does_not_synthesize_completion(self):
+    def test_iterator_exhaustion_after_frames_emits_one_terminal_error(self):
         frame, _ = self._runtime_events()
         runtime = Mock()
         runtime.handle_telegram_burst_iter.return_value = iter((frame,))
         stdout = io.StringIO()
         with patch("tomo_core.sandbox_inbound.build_runtime", return_value=runtime):
+            self.assertEqual(run_once(io.StringIO(encode_inbound("request-1", self._burst())), stdout, config=RuntimeConfig(data_dir="/tmp/data"), provider=Mock()), 1)
+        events = list(iter_event_markers(stdout.getvalue().splitlines(keepends=True), "request-1", "gen-1"))
+        self.assertEqual([type(event) for event in events], [SandboxFrameEvent, SandboxErrorEvent])
+        self.assertEqual(events[-1].code, "runtime_missing_terminal")
+
+    def test_stale_runtime_revision_emits_one_terminal_stale_event(self):
+        runtime = Mock()
+        runtime.handle_telegram_burst_iter.side_effect = StaleSessionRevisionError(12)
+        stdout = io.StringIO()
+        with patch("tomo_core.sandbox_inbound.build_runtime", return_value=runtime):
             self.assertEqual(run_once(io.StringIO(encode_inbound("request-1", self._burst())), stdout, config=RuntimeConfig(data_dir="/tmp/data"), provider=Mock()), 0)
-        self.assertEqual(stdout.getvalue().count(EVENT_MARKER), 1)
-        with self.assertRaises(ValueError):
-            list(iter_event_markers(stdout.getvalue().splitlines(keepends=True), "request-1", "gen-1"))
+        self.assertEqual(
+            list(iter_event_markers(stdout.getvalue().splitlines(keepends=True), "request-1", "gen-1")),
+            [SandboxStaleEvent(0, 12)],
+        )
 
     def test_invalid_input_emits_a_safe_v4_error(self):
         stdout = io.StringIO()

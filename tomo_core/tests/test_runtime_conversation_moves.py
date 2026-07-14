@@ -7,7 +7,7 @@ from tomo_core.models import MessageAttachment
 from tomo_core.conversation import FrameReady
 from tomo_core.grok_auth import GrokAuthStore
 from tomo_core.providers import GrokAuthProvider, ProviderStreamCompleted, ProviderTextDelta
-from tomo_core.runtime import RuntimeCompleted, RuntimeFrameReady, RuntimeReactionReady, _safe_memory_control
+from tomo_core.runtime import RuntimeCompleted, RuntimeFrameReady, RuntimeReactionReady, StaleSessionRevisionError, _safe_memory_control
 from tomo_core.personal_data import MemorySourceRef, MemoryWriteControl
 from tomo_core.sessions import ConversationSession, JsonSessionStore, StoredMessage
 from tomo_core.sqlite_personal_data import SqlitePersonalDataRepository
@@ -155,6 +155,24 @@ class RuntimeConversationMoveTests(unittest.TestCase):
             iterator = runtime.handle_telegram_burst_iter(burst)
             with self.assertRaisesRegex(Exception, "storage_busy"):
                 next(iterator)
+
+    def test_initial_stale_revision_raises_before_provider_or_later_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            soul_path = Path(tmp) / "SOUL.md"
+            soul_path.write_text("SOUL", encoding="utf-8")
+            repository = SqlitePersonalDataRepository(Path(tmp) / "tomo.sqlite3")
+            session = ConversationSession("telegram:actor:user-1")
+            self.assertTrue(repository.save_session("local", session, generation_id="new", revision=2))
+            provider = ScriptedProvider([stream("should not run.")])
+            runtime = PersonalAgentRuntime(provider, TelegramDeliverySink(FakeTelegramClient()), RuntimeConfig(data_dir=tmp, soul_path=str(soul_path)), personal_data_repository=repository)
+            burst = InputBurst("burst-1", "old", 1, (InboundMessage(1, 41, InboundEnvelope("telegram", "user-1", "msg-1", "go")),))
+
+            with self.assertRaises(StaleSessionRevisionError) as raised:
+                list(runtime.handle_telegram_burst_iter(burst))
+
+            self.assertEqual(raised.exception.current_revision, 2)
+            self.assertEqual(provider.calls, [])
+            self.assertEqual(repository.current_session_revision("local", "telegram:actor:user-1"), 2)
 
     def test_rejected_memory_control_records_only_a_content_free_reason_code(self):
         with tempfile.TemporaryDirectory() as tmp:

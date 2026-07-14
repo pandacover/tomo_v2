@@ -43,7 +43,8 @@ class TurnRunStatus(str, Enum):
     FAILED = "failed"
 
 
-REACTION_EMOJI_ALLOWLIST = frozenset({"👍", "❤️", "😂", "🔥", "🥰", "👏", "🤔", "👀", "🙏", "🫡"})
+REACTION_EMOJI_OPTIONS = ("👍", "❤️", "😂", "🔥", "🥰", "👏", "🤔", "👀", "🙏", "🫡")
+REACTION_EMOJI_ALLOWLIST = frozenset(REACTION_EMOJI_OPTIONS)
 
 
 @dataclass(frozen=True)

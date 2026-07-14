@@ -5,7 +5,7 @@ import unittest
 
 from tomo_core.onboarding_store import TelegramOnboardingStore
 from tomo_core.onboarding_store import TelegramGenerationWork
-from tomo_core.telegram_router import CompactTelegramUpdate, RetryableTelegramUpdateError, TelegramUpdateRouter, compact_private_update
+from tomo_core.telegram_router import CompactTelegramUpdate, RetryableTelegramUpdateError, StaleRevisionTelegramUpdateError, TelegramUpdateRouter, compact_private_update
 
 
 def private_update(update_id, chat_id="123", text="hello"):
@@ -25,10 +25,17 @@ class FakeTelegramClient:
     def __init__(self, updates):
         self.updates = updates
         self.offsets = []
+        self.typing_actor_ids = []
+        self.typing_error = None
 
     def get_updates(self, offset=None, timeout=30):
         self.offsets.append(offset)
         return self.updates
+
+    def send_typing(self, actor_id):
+        self.typing_actor_ids.append(actor_id)
+        if self.typing_error:
+            raise self.typing_error
 
 
 def install_chat(store, chat_id="123"):
@@ -74,6 +81,29 @@ class TelegramUpdateRouterTests(unittest.TestCase):
             self.assertEqual(router.poll_once(7), 8)
             self.assertEqual(store.claim_next_work(now=time.time() + 1).inputs[0].update_id, 7)
             self.assertIsNone(store.claim_next_work(now=time.time() + 1))
+
+    def test_durable_installed_message_enqueue_triggers_one_best_effort_typing_pulse(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TelegramOnboardingStore(tmp)
+            install_chat(store)
+            client = FakeTelegramClient([private_update(7)])
+            router = TelegramUpdateRouter(client=client, store=store, process_update=lambda _: None)
+
+            self.assertEqual(router.poll_once(), 8)
+            self.assertEqual(router.poll_once(7), 8)
+
+            self.assertEqual(client.typing_actor_ids, ["123"])
+
+    def test_typing_failure_after_durable_enqueue_does_not_block_offset_advancement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TelegramOnboardingStore(tmp)
+            install_chat(store)
+            client = FakeTelegramClient([private_update(7)])
+            client.typing_error = RuntimeError("typing unavailable")
+            router = TelegramUpdateRouter(client=client, store=store, process_update=lambda _: None)
+
+            self.assertEqual(router.poll_once(), 8)
+            self.assertIsNotNone(store.claim_next_work(now=time.time() + 1))
 
     def test_compact_private_update_classifies_control_and_message_updates(self):
         normal = compact_private_update(private_update(7, text="hello"))
@@ -264,6 +294,23 @@ class TelegramUpdateRouterTests(unittest.TestCase):
             self.assertFalse(router.process_next(now=1))
             self.assertTrue(router.process_next(now=2))
             self.assertFalse(router.process_next(now=100))
+
+    def test_stale_generation_retry_rebases_above_the_sandbox_revision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TelegramOnboardingStore(tmp)
+            store.enqueue_update(1, "123", '{"update_id":1}', now=0, update_kind="message", message_id="1")
+            calls = 0
+
+            def process(_):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise StaleRevisionTelegramUpdateError(12)
+
+            router = TelegramUpdateRouter(client=FakeTelegramClient([]), store=store, process_update=process)
+            self.assertTrue(router.process_next(now=1))
+            self.assertTrue(router.process_next(now=2))
+            self.assertEqual(calls, 2)
 
     def test_stop_joins_idle_workers_within_the_shutdown_timeout(self):
         with tempfile.TemporaryDirectory() as tmp:

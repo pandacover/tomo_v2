@@ -10,9 +10,9 @@ from tomo_core.onboarding_store import TelegramOnboardingStore
 from tomo_core.providers import ProviderStreamCompleted, ProviderTextDelta, StaticProvider
 from tomo_core.shared_gateway import InProcessTelegramRuntimeDispatch, SharedTelegramGateway
 from tomo_core.sandbox_dispatch import SandboxDispatchError
-from tomo_core.sandbox_protocol import SandboxCompletedEvent, SandboxFrameEvent, SandboxReactionEvent
+from tomo_core.sandbox_protocol import SandboxCompletedEvent, SandboxFrameEvent, SandboxReactionEvent, SandboxStaleEvent
 from tomo_core.telegram import FakeTelegramClient
-from tomo_core.telegram_router import RetryableTelegramUpdateError
+from tomo_core.telegram_router import RetryableTelegramUpdateError, StaleRevisionTelegramUpdateError, TelegramUpdateRouter
 
 
 def private_update(text, chat_id="123", from_id="123", message_id=1):
@@ -53,7 +53,35 @@ class FakeRuntimeDispatch:
         yield SandboxCompletedEvent(2, {"logical_text": "first. second."})
 
 
+class RecordingTypingLease:
+    instances = []
+
+    def __init__(self, send_typing, actor_id, *, is_active):
+        self.send_typing = send_typing
+        self.actor_id = actor_id
+        self.is_active = is_active
+        self.calls = []
+        self.closed = False
+        type(self).instances.append(self)
+
+    def start(self):
+        self.calls.append("start")
+
+    def pause_for_first_delivery(self):
+        self.calls.append("pause")
+
+    def resume_after_failed_delivery(self):
+        self.calls.append("resume")
+
+    def close(self):
+        self.calls.append("close")
+        self.closed = True
+
+
 class SharedGatewayTests(unittest.TestCase):
+    def setUp(self):
+        RecordingTypingLease.instances = []
+
     def test_start_binds_sends_setup_ensures_worker_then_connected(self):
         with self._store() as store:
             link = store.create_install_link("user-1", "tmnvm_bot")
@@ -215,6 +243,22 @@ class SharedGatewayTests(unittest.TestCase):
 
             self.assertTrue(store.is_generation_active(work.generation_id, work.revision))
 
+    def test_stale_sandbox_revision_raises_a_typed_retry_without_delivery(self):
+        with self._store() as store:
+            installation = self._installation(store, chat_id="123", actor_id="999")
+            work = self._generation_work(store, installation.tomo_id)
+            dispatch = FakeRuntimeDispatch()
+            dispatch.iter_telegram_events = Mock(return_value=iter((SandboxStaleEvent(0, 12),)))
+            client = FakeTelegramClient()
+            gateway = SharedTelegramGateway(client=client, store=store, dispatch=dispatch, pace_seconds=0)
+
+            with self.assertRaises(StaleRevisionTelegramUpdateError) as raised:
+                gateway.process_update(work)
+
+            self.assertEqual(raised.exception.current_revision, 12)
+            self.assertEqual(client.sent_messages, [])
+            self.assertTrue(store.is_generation_active(work.generation_id, work.revision))
+
     def test_missing_or_rebound_installation_raises_safe_retryable_generation_failure(self):
         with self._store() as store:
             installation = self._installation(store, chat_id="123", actor_id="999")
@@ -252,6 +296,54 @@ class SharedGatewayTests(unittest.TestCase):
             self.assertFalse(store.is_generation_active(work.generation_id, work.revision))
             self.assertFalse(store.reserve_delivery(work.generation_id, work.revision, 2, 0, 2, "late.", None))
 
+    def test_generation_typing_lease_stops_after_first_successful_bubble_and_never_restarts(self):
+        with self._store() as store:
+            installation = self._installation(store, chat_id="123", actor_id="999")
+            work = self._generation_work(store, installation.tomo_id)
+            gateway = SharedTelegramGateway(
+                client=FakeTelegramClient(),
+                store=store,
+                dispatch=FakeRuntimeDispatch(),
+                pace_seconds=0,
+                typing_lease_factory=RecordingTypingLease,
+            )
+
+            gateway.process_update(work)
+
+            lease = RecordingTypingLease.instances[0]
+            self.assertEqual(lease.actor_id, "123")
+            self.assertEqual(lease.calls, ["start", "pause", "close", "close"])
+
+    def test_generation_typing_lease_resumes_after_failed_first_bubble_while_active(self):
+        with self._store() as store:
+            installation = self._installation(store, chat_id="123", actor_id="999")
+            work = self._generation_work(store, installation.tomo_id)
+            client = FakeTelegramClient()
+            original_send = client.send_message
+            attempts = 0
+
+            def fail_first(*args, **kwargs):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise RuntimeError("send failed")
+                return original_send(*args, **kwargs)
+
+            client.send_message = fail_first
+            gateway = SharedTelegramGateway(
+                client=client,
+                store=store,
+                dispatch=FakeRuntimeDispatch(),
+                pace_seconds=0,
+                typing_lease_factory=RecordingTypingLease,
+            )
+
+            with self.assertRaises(RetryableTelegramUpdateError) as raised:
+                gateway.process_update(work)
+
+            self.assertEqual(raised.exception.error_code, "delivery_uncertain")
+            self.assertEqual(RecordingTypingLease.instances[0].calls, ["start", "pause", "resume", "pause", "close", "close"])
+
     def test_generation_work_emits_first_delivery_without_message_content(self):
         with self._store() as store:
             installation = self._installation(store, chat_id="123", actor_id="999")
@@ -278,7 +370,8 @@ class SharedGatewayTests(unittest.TestCase):
 
             client.send_message = fail_second
             with patch("tomo_core.shared_gateway.latency_trace.emit") as emit:
-                SharedTelegramGateway(client=client, store=store, dispatch=FakeRuntimeDispatch(), pace_seconds=0).process_update(work)
+                with self.assertRaises(RetryableTelegramUpdateError):
+                    SharedTelegramGateway(client=client, store=store, dispatch=FakeRuntimeDispatch(), pace_seconds=0).process_update(work)
 
             self.assertFalse(any(call.kwargs.get("outcome") == "error" for call in emit.call_args_list))
 
@@ -290,7 +383,8 @@ class SharedGatewayTests(unittest.TestCase):
             client.send_message = Mock(side_effect=RuntimeError("send failed"))
 
             with patch("tomo_core.shared_gateway.latency_trace.emit") as emit:
-                SharedTelegramGateway(client=client, store=store, dispatch=FakeRuntimeDispatch(), pace_seconds=0).process_update(work)
+                with self.assertRaises(RetryableTelegramUpdateError):
+                    SharedTelegramGateway(client=client, store=store, dispatch=FakeRuntimeDispatch(), pace_seconds=0).process_update(work)
 
             first_delivery_errors = [call for call in emit.call_args_list if call.args[1] == "telegram_first_delivery" and call.kwargs.get("outcome") == "error"]
             self.assertEqual(len(first_delivery_errors), 1)
@@ -432,13 +526,36 @@ class SharedGatewayTests(unittest.TestCase):
             gateway = SharedTelegramGateway(client=client, store=store, dispatch=FakeRuntimeDispatch(), pace_seconds=0)
 
             with patch("tomo_core.shared_gateway.latency_trace.emit") as emit:
-                gateway.process_update(work)
+                with self.assertRaises(RetryableTelegramUpdateError) as raised:
+                    gateway.process_update(work)
 
+            self.assertEqual(raised.exception.error_code, "delivery_uncertain")
             self.assertEqual([message["text"] for message in client.sent_messages], ["first.", "second."])
             first_delivery_outcomes = [call.kwargs.get("outcome") for call in emit.call_args_list if call.args[1] == "telegram_first_delivery"]
             self.assertEqual(first_delivery_outcomes, ["send_complete", "origin_to_delivery"])
             self.assertEqual(store.delivery_status(work.generation_id, 0), "unknown")
             self.assertTrue(store.is_generation_active(work.generation_id, work.revision))
+            store.mark_delivery_sent = original_mark_sent
+
+    def test_router_retries_generation_when_delivery_acknowledgement_is_uncertain(self):
+        with self._store() as store:
+            installation = self._installation(store, chat_id="123", actor_id="999")
+            store.enqueue_update(1, "123", '{"update_id":1}', now=1.0, update_kind="message", message_id="1", tomo_id=installation.tomo_id)
+            store.enqueue_update(2, "123", '{"update_id":2}', now=1.1, update_kind="message", message_id="2", tomo_id=installation.tomo_id)
+            original_mark_sent = store.mark_delivery_sent
+            store.mark_delivery_sent = lambda *_args, **_kwargs: False
+            gateway = SharedTelegramGateway(client=FakeTelegramClient(), store=store, dispatch=FakeRuntimeDispatch(), pace_seconds=0)
+            router = TelegramUpdateRouter(client=FakeTelegramClient([]), store=store, process_update=gateway.process_update)
+
+            self.assertTrue(router.process_next(now=2))
+
+            db = store._connect()
+            try:
+                row = db.execute("select status, error_code from telegram_generations order by created_at").fetchone()
+            finally:
+                db.close()
+            self.assertEqual((row["status"], row["error_code"]), ("failed", "delivery_uncertain"))
+            self.assertIsNotNone(store.claim_next_work(now=3))
             store.mark_delivery_sent = original_mark_sent
 
     def test_in_process_dispatch_passes_active_predicate_to_runtime(self):

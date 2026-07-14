@@ -21,6 +21,14 @@ class ConversationParsingTests(unittest.TestCase):
             with self.subTest(payload=payload), self.assertRaises(ValueError):
                 _parse_strict_move_plan_payload(payload)
 
+    def test_reaction_intent_is_optional_and_nonfatal(self):
+        for value, expected in (("👍", "👍"), (None, None), ("🪿", None), ("not-an-emoji", None), ({"emoji": "👍"}, None)):
+            with self.subTest(value=value):
+                plan = _parse_strict_move_plan_payload({
+                    "primary_move": "answer", "supporting_moves": [], "response_goal": "answer", "confidence": "high", "reaction": value,
+                })
+                self.assertEqual(plan.reaction.emoji if plan.reaction else None, expected)
+
     def test_memory_write_control_requires_exact_bounded_schema(self):
         payload = {
             "action": "upsert", "authority": "autonomous", "user_intent_excerpt": None, "memory_id": None,

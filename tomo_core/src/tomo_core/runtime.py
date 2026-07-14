@@ -49,6 +49,12 @@ class RuntimeReactionReady:
         ReactionIntent(self.emoji)
 
 
+class StaleSessionRevisionError(RuntimeError):
+    def __init__(self, current_revision: int) -> None:
+        self.current_revision = current_revision
+        super().__init__("stale_session_revision")
+
+
 RuntimeEvent: TypeAlias = RuntimeReactionReady | RuntimeFrameReady | RuntimeCompleted
 
 
@@ -139,12 +145,14 @@ class PersonalAgentRuntime:
         is_active = is_active or (lambda: True)
         self.telegram.start_typing(burst.latest.actor_id)
         session = self.personal_data.load_session(self.owner_id, burst.latest.session_key)
-        self.personal_data.accept_generations(self.owner_id, burst.latest.session_key, burst.accepted_generation_ids)
         session.accept_generations(burst.accepted_generation_ids)
         for message in burst.messages:
             session.append_inbound_once(message, burst.burst_id)
         if not self.personal_data.save_session(self.owner_id, session, generation_id=burst.generation_id, revision=burst.revision):
-            return
+            current_revision = self.personal_data.current_session_revision(self.owner_id, burst.latest.session_key)
+            if current_revision is None:
+                raise RuntimeError("stale_session_revision_unavailable")
+            raise StaleSessionRevisionError(current_revision)
         if not is_active():
             return
 

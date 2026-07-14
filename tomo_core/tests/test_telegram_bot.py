@@ -122,6 +122,14 @@ class TelegramBotTests(unittest.TestCase):
         payload = post.call_args.kwargs["json"]
         self.assertEqual(payload["reply_parameters"], {"message_id": 7})
 
+    def test_bot_api_typing_uses_a_short_best_effort_timeout(self):
+        client = TelegramBotApiClient("token")
+
+        with patch.object(client, "request") as request:
+            client.send_typing("chat")
+
+        request.assert_called_once_with("sendChatAction", {"chat_id": "chat", "action": "typing"}, timeout=2.0)
+
     def test_bot_api_reaction_uses_one_non_big_emoji_payload(self):
         client = TelegramBotApiClient("token")
         with patch.object(client, "request") as request:

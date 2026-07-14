@@ -486,7 +486,10 @@ class TelegramOnboardingStore:
         *,
         now: float | None = None,
         max_attempts: int | None = None,
+        minimum_next_revision: int | None = None,
     ) -> bool:
+        if isinstance(minimum_next_revision, bool) or (minimum_next_revision is not None and (not isinstance(minimum_next_revision, int) or minimum_next_revision < 0)):
+            raise ValueError("minimum_next_revision must be a non-negative integer")
         now = time.time() if now is None else now
         db = self._connect()
         try:
@@ -527,10 +530,10 @@ class TelegramOnboardingStore:
                 db.execute(
                     """
                     update telegram_chat_turns
-                    set revision = revision + 1, active_generation_id = null, quiet_until = ?, updated_at = ?
+                    set revision = max(revision + 1, ?), active_generation_id = null, quiet_until = ?, updated_at = ?
                     where chat_id = ? and active_generation_id = ?
                     """,
-                    (retry_at, now, row["chat_id"], generation_id),
+                    (minimum_next_revision or 0, retry_at, now, row["chat_id"], generation_id),
                 )
             db.commit()
             return result.rowcount == 1

@@ -31,6 +31,15 @@ class ConversationOutputError(ValueError):
         super().__init__(f"invalid conversation output: {code}")
 
 
+def _parse_optional_reaction(value: object) -> ReactionIntent | None:
+    if value is None:
+        return None
+    try:
+        return ReactionIntent(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _parse_strict_move_plan_payload(payload: object) -> MovePlan:
     if not isinstance(payload, dict) or set(payload) - _ALLOWED_MOVE_PLAN_KEYS or not _REQUIRED_MOVE_PLAN_KEYS <= set(payload):
         raise ValueError("invalid move plan keys")
@@ -46,7 +55,7 @@ def _parse_strict_move_plan_payload(payload: object) -> MovePlan:
         response_goal=response_goal,
         confidence=MoveConfidence(payload["confidence"]),
         sequence=tuple(ConversationMove(item) for item in payload.get("move_sequence", (payload["primary_move"], *supporting))),
-        reaction=None if payload.get("reaction") is None else ReactionIntent(payload["reaction"]),
+        reaction=_parse_optional_reaction(payload.get("reaction")),
     )
 
 

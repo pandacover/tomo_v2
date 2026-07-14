@@ -10,11 +10,13 @@ from . import latency_trace
 from .instances import RuntimeInstanceRegistry
 from .models import InboundEnvelope, OutboundBubble
 from .onboarding_store import TelegramGenerationWork, TelegramInstallation, TelegramOnboardingStore
+from .conversation.models import REACTION_EMOJI_ALLOWLIST
 from .runtime import RuntimeCompleted, RuntimeFrameReady, RuntimeReactionReady
 from .sandbox_dispatch import TelegramRuntimeDispatchError, burst_from_work
-from .sandbox_protocol import SandboxCompletedEvent, SandboxErrorEvent, SandboxFrameEvent, SandboxReactionEvent, encode_event
+from .sandbox_protocol import SandboxCompletedEvent, SandboxErrorEvent, SandboxFrameEvent, SandboxReactionEvent, SandboxStaleEvent, encode_event
 from .telegram import TelegramClient, TelegramDeliverySink, TelegramSendReceipt
-from .telegram_router import RetryableTelegramUpdateError
+from .telegram_router import RetryableTelegramUpdateError, StaleRevisionTelegramUpdateError
+from .typing_status import TypingLease
 
 
 class TelegramRuntimeDispatch(Protocol):
@@ -98,6 +100,7 @@ class SharedTelegramGateway:
     dispatch: TelegramRuntimeDispatch | None = None
     pace_seconds: float = 1.5
     sleeper: Callable[[float], None] = time.sleep
+    typing_lease_factory: Callable[..., TypingLease] = TypingLease
 
     def __post_init__(self) -> None:
         if self.dispatch is None:
@@ -159,6 +162,8 @@ class SharedTelegramGateway:
             raise RetryableTelegramUpdateError(error.code) from error
         if isinstance(delivery, DirectTelegramDelivery):
             for _, target_message_id, emoji in delivery.reactions:
+                if emoji not in REACTION_EMOJI_ALLOWLIST:
+                    continue
                 try:
                     TelegramDeliverySink(self.client).react_to_message(installation.chat_id, target_message_id, emoji)
                 except Exception:
@@ -185,14 +190,15 @@ class SharedTelegramGateway:
             raise RetryableTelegramUpdateError("installation_missing")
         if installation.tomo_id != work.tomo_id:
             raise RetryableTelegramUpdateError("installation_rebound")
-        self.client.send_typing(installation.chat_id)
         last_send_at: float | None = None
         first_frame_delivered = False
         first_send_attempted = False
         first_send_accepted = False
         delivery_uncertain = False
+        is_active = lambda: self.store.is_generation_active(work.generation_id, work.revision)
+        lease = self.typing_lease_factory(self.client.send_typing, installation.chat_id, is_active=is_active)
+        lease.start()
         try:
-            is_active = lambda: self.store.is_generation_active(work.generation_id, work.revision)
             for event in self.dispatch.iter_telegram_events(installation, work, is_active=is_active):
                 if isinstance(event, SandboxReactionEvent):
                     target = work.inputs[-1].message_id
@@ -206,6 +212,9 @@ class SharedTelegramGateway:
                         continue
                     if not self.store.is_generation_active(work.generation_id, work.revision):
                         self.store.mark_reaction_suppressed(work.generation_id, work.revision, target)
+                        continue
+                    if event.emoji not in REACTION_EMOJI_ALLOWLIST:
+                        self.store.mark_reaction_failed(work.generation_id, work.revision, target)
                         continue
                     try:
                         self.client.set_message_reaction(installation.chat_id, target, event.emoji)
@@ -237,6 +246,11 @@ class SharedTelegramGateway:
                         continue
                     is_first_delivery_attempt = not first_send_attempted
                     first_send_attempted = True
+                    if not first_send_accepted:
+                        lease.pause_for_first_delivery()
+                    if not is_active():
+                        self.store.mark_delivery_suppressed(work.generation_id, event.sequence)
+                        continue
                     send_started_at = time.monotonic()
                     try:
                         receipt = self.client.send_message(
@@ -249,6 +263,8 @@ class SharedTelegramGateway:
                         delivery_uncertain = True
                         if is_first_delivery_attempt:
                             latency_trace.emit(work.burst_id, "telegram_first_delivery", outcome="error", elapsed_ms=max(0, int((time.monotonic() - send_started_at) * 1000)))
+                        if not first_send_accepted and is_active():
+                            lease.resume_after_failed_delivery()
                         continue
                     send_completed_at = time.monotonic()
                     if not first_send_accepted:
@@ -261,6 +277,7 @@ class SharedTelegramGateway:
                         if isinstance(telegram_sent_at, (int, float)):
                             latency_trace.emit(work.burst_id, "telegram_first_delivery", outcome="origin_to_delivery", elapsed_ms=max(0, int((time.time() - telegram_sent_at) * 1000)))
                         first_send_accepted = True
+                        lease.close()
                     if not self.store.mark_delivery_sent(work.generation_id, event.sequence, receipt.message_id):
                         self.store.mark_delivery_unknown(work.generation_id, event.sequence)
                         delivery_uncertain = True
@@ -268,13 +285,18 @@ class SharedTelegramGateway:
                     last_send_at = send_completed_at
                     first_frame_delivered = True
                 elif isinstance(event, SandboxCompletedEvent):
-                    if not delivery_uncertain:
-                        self.store.complete_generation(work.generation_id, work.revision)
+                    if delivery_uncertain:
+                        raise RetryableTelegramUpdateError("delivery_uncertain")
+                    self.store.complete_generation(work.generation_id, work.revision)
                     return True
                 elif isinstance(event, SandboxErrorEvent):
                     raise RetryableTelegramUpdateError(event.code)
+                elif isinstance(event, SandboxStaleEvent):
+                    raise StaleRevisionTelegramUpdateError(event.current_revision)
         except (TelegramRuntimeDispatchError, SandboxSupervisorError) as error:
             raise RetryableTelegramUpdateError(error.code) from error
+        finally:
+            lease.close()
         return True
 
     def _handle_start(self, text: str, chat_id: str, actor_id: str, message_id: str) -> bool:

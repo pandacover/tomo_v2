@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 from ..context import ContextSnapshot
 from ..models import InboundEnvelope, InputBurst
 from ..skills import render_capability_skill_index
-from .models import ConversationMove, ConversationRequest, MovePlan, TurnBudget
+from .models import ConversationMove, ConversationRequest, MovePlan, REACTION_EMOJI_OPTIONS, TurnBudget
 from .moves import render_move_procedures
 
 
@@ -108,6 +108,7 @@ def build_first_segment_repair_messages(
 
 def _first_segment_system(soul: str, budget: TurnBudget, tool_schemas: tuple[dict[str, object], ...]) -> str:
     frame_count = _frame_count_phrase(budget.max_frames_per_segment)
+    reaction_options = json.dumps(REACTION_EMOJI_OPTIONS, ensure_ascii=False, separators=(",", ":"))
     tool_guidance = (
         "batch independent related native tool calls in one assistant response. tool announcements are optional social output, never execution telemetry; do not add redundant completion messages."
         if tool_schemas
@@ -120,7 +121,7 @@ def _first_segment_system(soul: str, budget: TurnBudget, tool_schemas: tuple[dic
         '{"type":"turn_plan","primary_move":"answer","supporting_moves":[],"move_sequence":["answer"],"response_goal":"...","confidence":"low","reaction":null}\n'
         '{"type":"frame","text":"..."}\n'
         "memory_control records are optional and internal. follow the indexed memory skill when emitting them.\n"
-        "the turn_plan fields are primary_move, supporting_moves, response_goal, confidence, and reaction. reaction is null by default or exactly one supported emoji. use it very sparsely; use null for commands, auth, errors, routine acknowledgements, ambiguity, corrections, opt-outs, serious, sensitive, or distressing content. never mention reactions to the user. moves are turn-level purposes, never frame or bubble sections; MovePlan does not determine frame count.\n"
+        f"the turn_plan fields are primary_move, supporting_moves, response_goal, confidence, and reaction. reaction must be exactly one of {reaction_options} or null. use it very sparsely; use null for commands, auth, errors, routine acknowledgements, ambiguity, corrections, opt-outs, serious, sensitive, or distressing content. never mention reactions to the user. moves are turn-level purposes, never frame or bubble sections; MovePlan does not determine frame count.\n"
         f"ordinary completion uses {frame_count} frames. when making native tool calls, emit zero or one useful pre-tool frame.\n"
         f"target one to two sentences per frame and no more than {frame_count} frames this segment. hard runtime limits: "
         f"at most {budget.max_frames_per_segment} frames per segment, {budget.max_sentences_per_frame} sentences per frame, and {budget.max_chars_per_frame} characters per frame.\n"

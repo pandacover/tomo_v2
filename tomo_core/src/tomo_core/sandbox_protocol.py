@@ -13,9 +13,10 @@ from .models import InboundEnvelope, InboundMessage, InputBurst, MessageAttachme
 from .runtime import RuntimeCompleted, RuntimeFrameReady, RuntimeReactionReady
 
 INBOUND_PROTOCOL_VERSION = 2
-PROTOCOL_VERSION = 4
+PROTOCOL_VERSION = 5
 LEGACY_EVENT_PROTOCOL_VERSION = 2
 LEGACY_V3_EVENT_PROTOCOL_VERSION = 3
+LEGACY_V4_EVENT_PROTOCOL_VERSION = 4
 LEGACY_PROTOCOL_VERSION = 1
 EVENT_MARKER = "TOMO_SANDBOX_EVENT="
 RESULT_MARKER = "TOMO_SANDBOX_RESULT="
@@ -72,7 +73,13 @@ class SandboxErrorEvent:
     traceback: tuple[SandboxTracebackFrame, ...] = ()
 
 
-SandboxEvent: TypeAlias = SandboxReactionEvent | SandboxFrameEvent | SandboxCompletedEvent | SandboxErrorEvent
+@dataclass(frozen=True)
+class SandboxStaleEvent:
+    sequence: int
+    current_revision: int
+
+
+SandboxEvent: TypeAlias = SandboxReactionEvent | SandboxFrameEvent | SandboxCompletedEvent | SandboxErrorEvent | SandboxStaleEvent
 
 
 def encode_inbound(request_id: str, burst: InputBurst | InboundEnvelope) -> str:
@@ -86,15 +93,15 @@ def encode_inbound(request_id: str, burst: InputBurst | InboundEnvelope) -> str:
 
 
 def decode_inbound(payload: str) -> tuple[str, InputBurst]:
-    """Parse identical-shape v2, v3, or v4 inbound data during rollout."""
-    message = _decode(payload, "inbound", {INBOUND_PROTOCOL_VERSION, LEGACY_V3_EVENT_PROTOCOL_VERSION, PROTOCOL_VERSION})
+    """Parse identical-shape v2 through v5 inbound data during rollout."""
+    message = _decode(payload, "inbound", {INBOUND_PROTOCOL_VERSION, LEGACY_V3_EVENT_PROTOCOL_VERSION, LEGACY_V4_EVENT_PROTOCOL_VERSION, PROTOCOL_VERSION})
     if not isinstance(message.get("burst"), dict):
         raise ValueError("inbound burst must be an object")
     return message["request_id"], _burst_from_dict(message["burst"])
 
 
 def encode_event(request_id: str, generation_id: str, sequence: int, event: object, *, expected_reaction_binding: tuple[str, str, str, str, str, int] | None = None) -> str:
-    """Serialize reaction, frame, completion, or safe error events as v4."""
+    """Serialize reaction, frame, completion, stale, or safe error events as v5."""
     _validate_request_id(request_id)
     _validate_generation_id(generation_id)
     _nonnegative(sequence, "event sequence")
@@ -132,13 +139,16 @@ def encode_event(request_id: str, generation_id: str, sequence: int, event: obje
         if event.traceback:
             error["traceback"] = [asdict(frame) for frame in event.traceback]
         payload.update({"type": "error", "error": error})
+    elif isinstance(event, SandboxStaleEvent):
+        _nonnegative(event.current_revision, "stale current_revision")
+        payload.update({"type": "stale", "current_revision": event.current_revision})
     else:
         raise TypeError("unsupported sandbox event")
     return _encode(payload)
 
 
 def iter_event_markers(chunks: Iterable[str], expected_request_id: str, expected_generation_id: str, contract: ResponseContract | None = None, budget: TurnBudget | None = None, *, expected_reaction_binding: tuple[str, str, str, str, int] | None = None) -> Iterator[SandboxEvent]:
-    """Parse one strictly version-consistent v2, v3, or v4 event stream."""
+    """Parse one strictly version-consistent v2 through v5 event stream."""
     _validate_request_id(expected_request_id)
     _validate_generation_id(expected_generation_id)
     contract = contract or ResponseContract()
@@ -168,8 +178,10 @@ def iter_event_markers(chunks: Iterable[str], expected_request_id: str, expected
         if sequence != expected_sequence:
             raise ValueError("sandbox event sequence gap")
         event = _event_from_message(message, contract, budget, expected_reaction_binding)
+        if isinstance(event, SandboxStaleEvent) and message["version"] == PROTOCOL_VERSION and sequence != 0:
+            raise ValueError("v5 stale event must be sequence zero")
         if isinstance(event, SandboxReactionEvent):
-            if message["version"] != PROTOCOL_VERSION or reaction_seen or frames:
+            if message["version"] < LEGACY_V4_EVENT_PROTOCOL_VERSION or reaction_seen or frames:
                 raise ValueError("invalid sandbox reaction ordering")
             reaction_seen = True
         elif isinstance(event, SandboxFrameEvent):
@@ -189,6 +201,8 @@ def iter_event_markers(chunks: Iterable[str], expected_request_id: str, expected
                     raise ValueError("completed v2 result does not match streamed utterances")
             terminal = True
         elif isinstance(event, SandboxErrorEvent):
+            terminal = True
+        elif isinstance(event, SandboxStaleEvent):
             terminal = True
         seen[sequence] = canonical
         expected_sequence += 1
@@ -221,14 +235,15 @@ def _plan_dict(plan: object) -> dict[str, Any]:
 def _decode_event(payload: str, request_id: str, generation_id: str) -> dict[str, Any]:
     message = _json_object(payload)
     version = message.get("version")
-    if version not in {LEGACY_EVENT_PROTOCOL_VERSION, LEGACY_V3_EVENT_PROTOCOL_VERSION, PROTOCOL_VERSION}:
+    if version not in {LEGACY_EVENT_PROTOCOL_VERSION, LEGACY_V3_EVENT_PROTOCOL_VERSION, LEGACY_V4_EVENT_PROTOCOL_VERSION, PROTOCOL_VERSION}:
         raise ValueError("unsupported protocol version")
     if message.get("request_id") != request_id or message.get("generation_id") != generation_id:
         raise ValueError("event IDs do not match inbound request")
     _nonnegative(message.get("sequence"), "event sequence")
     allowed = ({"utterance", "completed", "error"} if version == LEGACY_EVENT_PROTOCOL_VERSION
                else {"frame", "completed", "error"} if version == LEGACY_V3_EVENT_PROTOCOL_VERSION
-               else {"reaction", "frame", "completed", "error"})
+               else {"reaction", "frame", "completed", "error"} if version == LEGACY_V4_EVENT_PROTOCOL_VERSION
+               else {"reaction", "frame", "completed", "error", "stale"})
     if message.get("type") not in allowed:
         raise ValueError("unsupported sandbox event type")
     return message
@@ -280,6 +295,11 @@ def _event_from_message(message: dict[str, Any], contract: ResponseContract, bud
         if set(message) != {"version", "request_id", "generation_id", "sequence", "type", "result"} or not isinstance(message.get("result"), dict):
             raise ValueError("completed event requires only a result")
         return SandboxCompletedEvent(sequence, message["result"])
+    if event_type == "stale":
+        if set(message) != {"version", "request_id", "generation_id", "sequence", "type", "current_revision"}:
+            raise ValueError("stale event contains unsupported fields")
+        _nonnegative(message.get("current_revision"), "stale current_revision")
+        return SandboxStaleEvent(sequence, message["current_revision"])
     if set(message) != {"version", "request_id", "generation_id", "sequence", "type", "error"}:
         raise ValueError("error event contains unsupported fields")
     error = message["error"]

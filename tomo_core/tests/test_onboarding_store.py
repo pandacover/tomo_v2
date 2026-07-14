@@ -359,6 +359,19 @@ class TelegramOnboardingStoreTests(unittest.TestCase):
             self.assertNotEqual(replacement.generation_id, first.generation_id)
             self.assertEqual([item.update_id for item in replacement.inputs], [1])
 
+    def test_stale_failure_rebases_to_the_sandbox_revision_floor_without_lowering_newer_revisions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TelegramOnboardingStore(tmp)
+            store.enqueue_update(1, "chat-a", "first", now=0, update_kind="message", message_id="m1", tomo_id="tomo-1")
+            first = store.claim_next_work(now=1)
+            self.assertTrue(store.fail_generation(first.generation_id, "stale_session_revision", now=2, minimum_next_revision=13))
+            self.assertEqual(store.claim_next_work(now=3).revision, 13)
+
+            store.enqueue_update(2, "chat-a", "second", now=4, update_kind="message", message_id="m2", tomo_id="tomo-1")
+            second = store.claim_next_work(now=5)
+            self.assertTrue(store.fail_generation(second.generation_id, "stale_session_revision", now=6, minimum_next_revision=13))
+            self.assertEqual(store.claim_next_work(now=7).revision, 15)
+
     def test_completed_generation_is_accepted_by_the_next_burst(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = TelegramOnboardingStore(tmp)

@@ -53,9 +53,8 @@ class SegmentFrameParserTests(unittest.TestCase):
         for reaction in ("custom_emoji_id", ["👍"], "👍👍"):
             with self.subTest(reaction=reaction):
                 parser = SegmentFrameParser(segment_index=0, first_segment=True, budget=budget())
-                with self.assertRaises(ConversationOutputError) as raised:
-                    parser.feed('{"type":"turn_plan","primary_move":"answer","supporting_moves":[],"response_goal":"answer","confidence":"low","reaction":' + repr(reaction).replace("'", '"') + '}\n')
-                self.assertEqual(raised.exception.code, "invalid_plan")
+                records = parser.feed('{"type":"turn_plan","primary_move":"answer","supporting_moves":[],"response_goal":"answer","confidence":"low","reaction":' + repr(reaction).replace("'", '"') + '}\n')
+                self.assertIsNone(records[0].reaction)
 
     def test_first_segment_requires_one_plan_before_frames_but_allows_zero_frames(self):
         parser = SegmentFrameParser(segment_index=0, first_segment=True, budget=budget())

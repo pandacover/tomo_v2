@@ -18,6 +18,12 @@ class RetryableTelegramUpdateError(RuntimeError):
         self.error_code = error_code
 
 
+class StaleRevisionTelegramUpdateError(RetryableTelegramUpdateError):
+    def __init__(self, current_revision: int) -> None:
+        super().__init__("stale_session_revision")
+        self.current_revision = current_revision
+
+
 @dataclass(frozen=True)
 class CompactTelegramUpdate:
     update_id: int
@@ -132,6 +138,11 @@ class TelegramUpdateRouter:
                     telegram_sent_at=compact.telegram_sent_at,
                     tomo_id=tomo_id,
                 )
+                if kind == "message" and result.enqueued:
+                    try:
+                        self.client.send_typing(compact.chat_id)
+                    except Exception:
+                        pass
                 if result.superseded_generation_id and result.superseded_session_id:
                     self._schedule_cancellation(
                         InterruptedGeneration(
@@ -152,6 +163,16 @@ class TelegramUpdateRouter:
         if work is not None:
             try:
                 self.process_update(work)
+            except StaleRevisionTelegramUpdateError as exc:
+                self.store.fail_generation(
+                    work.generation_id,
+                    exc.error_code,
+                    now=now,
+                    max_attempts=self.max_attempts,
+                    minimum_next_revision=exc.current_revision + 1,
+                )
+                if self.on_error:
+                    self.on_error(exc)
             except RetryableTelegramUpdateError as exc:
                 self.store.fail_generation(work.generation_id, exc.error_code, now=now, max_attempts=self.max_attempts)
                 if self.on_error:
