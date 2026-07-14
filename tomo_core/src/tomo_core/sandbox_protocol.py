@@ -30,6 +30,41 @@ _EXCEPTION_CLASS_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}\Z")
 _TRACEBACK_BASENAME_RE = re.compile(r"[A-Za-z0-9_.-]{1,255}\Z")
 _TRACEBACK_FUNCTION_RE = re.compile(r"(?:[A-Za-z_][A-Za-z0-9_]{0,127}|<[A-Za-z_][A-Za-z0-9_]{0,127}>)\Z")
 _SAFE_ERROR_CODE_RE = re.compile(r"[a-z][a-z0-9_]{0,127}\Z")
+_SANDBOX_LATENCY_PHASES = frozenset({
+    "sandbox_runtime_entry",
+    "sandbox_context_hydration",
+    "sandbox_provider_attempt",
+    "sandbox_provider_attempt_start",
+    "sandbox_provider_first_text_delta",
+    "sandbox_provider_move_plan_validated",
+    "sandbox_provider_first_frame_validated",
+    "sandbox_provider_stream_completed",
+    "sandbox_tool_batch",
+    "sandbox_checkpoint_inbound",
+    "sandbox_checkpoint_frame",
+    "sandbox_checkpoint_complete",
+    "sandbox_runtime_build",
+    "sandbox_session_load",
+    "sandbox_memory_hydration",
+    "sandbox_prompt_prepare",
+})
+_SANDBOX_LATENCY_COUNTS = frozenset({
+    "attempt",
+    "segment",
+    "repair",
+    "model_segments",
+    "tool_rounds",
+    "tool_calls",
+    "contract_repairs",
+    "visible_segments",
+    "suspended_ms",
+    "active_ms",
+    "input_tokens",
+    "output_tokens",
+    "reasoning_tokens",
+    "output_chars_through_first_frame",
+    "first_frame_chars",
+})
 
 
 @dataclass(frozen=True)
@@ -244,9 +279,9 @@ def parse_latency_marker(payload: str) -> SandboxLatency:
     if not fields or any("=" not in field for field in fields):
         raise ValueError("invalid sandbox latency marker")
     values = dict(field.split("=", 1) for field in fields)
-    if len(values) != len(fields) or set(values) - {"phase", "outcome", "elapsed_ms", "attempt", "segment", "repair", "model_segments", "tool_rounds", "tool_calls", "contract_repairs", "visible_segments"}:
+    if len(values) != len(fields) or set(values) - {"phase", "outcome", "elapsed_ms", *_SANDBOX_LATENCY_COUNTS}:
         raise ValueError("invalid sandbox latency fields")
-    if values.get("phase") not in {"sandbox_runtime_entry", "sandbox_context_hydration", "sandbox_provider_attempt", "sandbox_tool_batch", "sandbox_checkpoint_inbound", "sandbox_checkpoint_frame", "sandbox_checkpoint_complete", "sandbox_runtime_build", "sandbox_session_load", "sandbox_memory_hydration", "sandbox_prompt_prepare"} or values.get("outcome") not in {"ok", "error"}:
+    if values.get("phase") not in _SANDBOX_LATENCY_PHASES or values.get("outcome") not in {"ok", "error"}:
         raise ValueError("invalid sandbox latency name")
     if "elapsed_ms" not in values:
         raise ValueError("sandbox latency requires elapsed_ms")

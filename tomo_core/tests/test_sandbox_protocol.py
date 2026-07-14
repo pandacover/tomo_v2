@@ -295,6 +295,7 @@ class SandboxProtocolTests(unittest.TestCase):
             "phase=sandbox_provider_attempt outcome=ok elapsed_ms=1 text=secret",
             "phase=sandbox_provider_attempt outcome=ok elapsed_ms=1 attempt=true",
             "phase=dispatch_start outcome=ok elapsed_ms=1",
+            "phase=sandbox_reconcile outcome=ok elapsed_ms=1",
         ):
             with self.subTest(payload=payload), self.assertRaises(ValueError):
                 parse_latency_marker(payload)
@@ -306,6 +307,53 @@ class SandboxProtocolTests(unittest.TestCase):
             ], "request-7", "gen-1")],
             [SandboxFrameEvent, SandboxCompletedEvent],
         )
+        self.assertEqual(
+            [type(event) for event in iter_event_markers([
+                SANDBOX_LATENCY_MARKER + "phase=sandbox_reconcile outcome=ok elapsed_ms=1\n",
+                EVENT_MARKER + encode_event("request-7", "gen-1", 0, frame) + "\n",
+                EVENT_MARKER + encode_event("request-7", "gen-1", 1, completed) + "\n",
+            ], "request-7", "gen-1")],
+            [SandboxFrameEvent, SandboxCompletedEvent],
+        )
+
+    def test_latency_markers_forward_new_provider_stages_and_counts(self):
+        stages = (
+            "sandbox_provider_attempt_start",
+            "sandbox_provider_first_text_delta",
+            "sandbox_provider_move_plan_validated",
+            "sandbox_provider_first_frame_validated",
+            "sandbox_provider_stream_completed",
+        )
+        counts = {
+            "suspended_ms": 1,
+            "active_ms": 2,
+            "input_tokens": 3,
+            "output_tokens": 4,
+            "reasoning_tokens": 5,
+            "output_chars_through_first_frame": 6,
+            "first_frame_chars": 7,
+        }
+        markers = [
+            SANDBOX_LATENCY_MARKER + f"phase={phase} outcome=ok elapsed_ms={index}\n"
+            for index, phase in enumerate(stages, 1)
+        ]
+        markers.append(SANDBOX_LATENCY_MARKER + "phase=sandbox_provider_attempt outcome=ok elapsed_ms=8 " + " ".join(f"{name}={value}" for name, value in counts.items()) + "\n")
+        received = []
+        frame, completed = self._events()
+        list(iter_event_markers([
+            *markers,
+            EVENT_MARKER + encode_event("request-7", "gen-1", 0, frame) + "\n",
+            EVENT_MARKER + encode_event("request-7", "gen-1", 1, completed) + "\n",
+        ], "request-7", "gen-1", on_latency=lambda *item: received.append(item)))
+        self.assertEqual([item[0] for item in received], [*stages, "sandbox_provider_attempt"])
+        self.assertEqual(received[-1], ("sandbox_provider_attempt", "ok", 8, counts))
+        for payload in (
+            "phase=sandbox_provider_attempt_unknown outcome=ok elapsed_ms=1",
+            "phase=sandbox_provider_attempt outcome=ok elapsed_ms=1 unknown_count=1",
+            "phase=sandbox_provider_attempt outcome=ok elapsed_ms=1 text=secret",
+        ):
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                parse_latency_marker(payload)
 
     def _burst(self):
         return InputBurst("burst-1", "gen-1", 1, (InboundMessage(1, 41, InboundEnvelope("telegram", "user-1", "message-1", "hello")),))
