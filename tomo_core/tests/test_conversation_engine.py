@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from tomo_core.conversation import ConversationEngine, ConversationRequest, FrameReady, SegmentFinish, TurnBudget, TurnRunCompleted, TurnRunStarted, TurnRunStatus
+from tomo_core.conversation import ConversationEngine, ConversationRequest, FrameReady, ReactionWindowReady, SegmentFinish, TurnBudget, TurnRunCompleted, TurnRunStarted, TurnRunStatus
 from tomo_core.conversation.parsing import ConversationOutputError
 from tomo_core.models import InboundEnvelope, ResponseContract
 from tomo_core.providers import ProviderSetupRequired, ProviderStreamCompleted, ProviderTextDelta, ProviderToolCallReady
@@ -116,6 +116,79 @@ class ConversationEngineTests(unittest.TestCase):
         self.assertNotIn("call-private", repr(emit.call_args_list))
         self.assertNotIn("private result", repr(emit.call_args_list))
 
+    def test_provider_stages_are_once_chunk_accurate_and_measure_consumer_suspension(self):
+        clock = [0.0]
+        first_frame = '{"type":"frame","text":"private frame"}\n'
+        second_frame = '{"type":"frame","text":"later private frame"}\n'
+        payload = PLAN + first_frame + second_frame
+        provider = ScriptedProvider([
+            [ProviderTextDelta(payload), ProviderStreamCompleted("stop", 12, 7, 3)],
+        ])
+        from tomo_core.conversation.framing import SegmentFrameParser
+
+        original_finish = SegmentFrameParser.finish
+
+        def finish_after_validation(parser):
+            records = original_finish(parser)
+            clock[0] += 0.250
+            return records
+
+        with patch("tomo_core.conversation.engine.latency_trace.emit_sandbox") as emit:
+            with patch.object(SegmentFrameParser, "finish", finish_after_validation):
+                iterator = ConversationEngine(provider, monotonic_clock=lambda: clock[0]).respond_iter(self.request())
+                self.assertIsInstance(next(iterator), TurnRunStarted)
+                clock[0] += 0.250
+                self.assertIsInstance(next(iterator), FrameReady)
+                clock[0] += 0.500
+                self.assertIsInstance(next(iterator), FrameReady)
+                self.assertIsInstance(next(iterator), TurnRunCompleted)
+
+        provider_calls = [call for call in emit.call_args_list if call.kwargs.get("attempt") == 1]
+        self.assertEqual(
+            [(call.args[0], call.kwargs["elapsed_ms"]) for call in provider_calls],
+            [
+                ("sandbox_provider_attempt_start", 0),
+                ("sandbox_provider_first_text_delta", 0),
+                ("sandbox_provider_move_plan_validated", 0),
+                ("sandbox_provider_first_frame_validated", 250),
+                ("sandbox_provider_stream_completed", 750),
+                ("sandbox_provider_attempt", 1000),
+            ],
+        )
+        self.assertNotEqual(provider_calls[-2].kwargs["elapsed_ms"], provider_calls[-1].kwargs["elapsed_ms"])
+        self.assertEqual(provider_calls[-1].kwargs["suspended_ms"], 750)
+        self.assertEqual(provider_calls[-1].kwargs["active_ms"], 250)
+        self.assertEqual(provider_calls[-1].kwargs["input_tokens"], 12)
+        self.assertEqual(provider_calls[-1].kwargs["output_tokens"], 7)
+        self.assertEqual(provider_calls[-1].kwargs["reasoning_tokens"], 3)
+        expected_first_frame_output = len(PLAN + first_frame)
+        for call in (provider_calls[3], provider_calls[4], provider_calls[5]):
+            self.assertEqual(call.kwargs["output_chars_through_first_frame"], expected_first_frame_output)
+            self.assertEqual(call.kwargs["first_frame_chars"], len("private frame"))
+        self.assertNotEqual(provider_calls[-1].kwargs["output_chars_through_first_frame"], len(payload))
+        self.assertEqual(
+            provider_calls[-1].kwargs["elapsed_ms"],
+            provider_calls[-1].kwargs["active_ms"] + provider_calls[-1].kwargs["suspended_ms"],
+        )
+        self.assertNotIn("private frame", repr(emit.call_args_list))
+
+    def test_consumer_close_finishes_provider_attempt_with_suspension_time(self):
+        clock = [0.0]
+        provider = ScriptedProvider([[ProviderTextDelta(PLAN)]])
+        with patch("tomo_core.conversation.engine.latency_trace.emit_sandbox") as emit:
+            iterator = ConversationEngine(provider, monotonic_clock=lambda: clock[0]).respond_iter(self.request())
+            self.assertIsInstance(next(iterator), TurnRunStarted)
+            clock[0] = 1.0
+            iterator.close()
+
+        attempt = [call for call in emit.call_args_list if call.args[0] == "sandbox_provider_attempt"]
+        self.assertEqual(len(attempt), 1)
+        self.assertEqual(attempt[0].kwargs["outcome"], "error")
+        self.assertEqual(attempt[0].kwargs["elapsed_ms"], 1000)
+        self.assertEqual(attempt[0].kwargs["suspended_ms"], 1000)
+        self.assertEqual(attempt[0].kwargs["active_ms"], 0)
+        self.assertTrue(provider.iterators[0].closed)
+
     def test_latency_times_one_aggregate_tool_batch(self):
         from tomo_core.tools import BoundTool, ToolRegistry, ToolSpec
 
@@ -133,6 +206,40 @@ class ConversationEngineTests(unittest.TestCase):
         self.assertEqual(tool_calls[0].kwargs["segment"], 0)
         self.assertNotIn("call-private", repr(emit.call_args_list))
         self.assertNotIn("private result", repr(emit.call_args_list))
+
+    def test_frameless_tool_reaction_window_measures_both_consumer_suspensions(self):
+        from tomo_core.tool_execution import ToolExecutor
+        from tomo_core.tools import BoundTool, ToolRegistry, ToolSpec
+
+        clock = [0.0]
+        reaction_plan = PLAN.rstrip("\n")[:-1] + ',"reaction":"👍"}\n'
+        provider = ScriptedProvider([
+            [ProviderTextDelta(reaction_plan), ProviderToolCallReady("call-1", "search", "{}"), ProviderStreamCompleted("tool_calls")],
+            [ProviderTextDelta('{"type":"frame","text":"Done."}\n'), ProviderStreamCompleted("stop")],
+        ])
+        registry = ToolRegistry((BoundTool(ToolSpec("search", "search", {"type": "object", "properties": {}}), lambda _: "result"),))
+
+        class AdvancingExecutor(ToolExecutor):
+            def execute_batch(self, *args, **kwargs):
+                clock[0] += 10
+                return super().execute_batch(*args, **kwargs)
+
+        with patch("tomo_core.conversation.engine.latency_trace.emit_sandbox") as emit:
+            iterator = ConversationEngine(provider, tool_registry=registry, tool_executor=AdvancingExecutor(registry), monotonic_clock=lambda: clock[0]).respond_iter(self.request())
+            self.assertIsInstance(next(iterator), TurnRunStarted)
+            clock[0] += 0.250
+            self.assertIsInstance(next(iterator), ReactionWindowReady)
+            clock[0] += 0.500
+            self.assertIsInstance(next(iterator), FrameReady)
+            self.assertIsInstance(next(iterator), TurnRunCompleted)
+
+        attempts = [call for call in emit.call_args_list if call.args[0] == "sandbox_provider_attempt"]
+        first_attempt = attempts[0]
+        self.assertEqual(first_attempt.kwargs["elapsed_ms"], 750)
+        self.assertEqual(first_attempt.kwargs["suspended_ms"], 750)
+        self.assertEqual(first_attempt.kwargs["elapsed_ms"], first_attempt.kwargs["active_ms"] + first_attempt.kwargs["suspended_ms"])
+        self.assertEqual([call.kwargs["elapsed_ms"] for call in emit.call_args_list if call.args[0] == "sandbox_tool_batch"], [10000])
+        self.assertNotIn("result", repr(emit.call_args_list))
 
     def test_tool_executor_failure_keeps_provider_ok_and_marks_tool_error(self):
         from tomo_core.tool_execution import ToolExecutor

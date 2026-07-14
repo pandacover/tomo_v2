@@ -32,11 +32,12 @@ class ProviderStreamCompleted:
     finish_reason: str
     input_tokens: int | None = None
     output_tokens: int | None = None
+    reasoning_tokens: int | None = None
 
     def __post_init__(self) -> None:
         if not self.finish_reason.strip():
             raise ValueError("finish reason is required")
-        for count in (self.input_tokens, self.output_tokens):
+        for count in (self.input_tokens, self.output_tokens, self.reasoning_tokens):
             if count is not None and (isinstance(count, bool) or not isinstance(count, int) or count < 0):
                 raise ValueError("usage counts must be nonnegative integers")
 
@@ -97,12 +98,13 @@ def _stream_openai_compatible(
     finish_reason: str | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
+    reasoning_tokens: int | None = None
     saw_done = False
     decoder = codecs.getincrementaldecoder("utf-8")()
     buffer = ""
 
     def parse_usage(payload: dict[str, object]) -> None:
-        nonlocal input_tokens, output_tokens
+        nonlocal input_tokens, output_tokens, reasoning_tokens
         usage = payload.get("usage")
         if usage is None:
             return
@@ -110,7 +112,11 @@ def _stream_openai_compatible(
             raise ValueError("invalid stream usage")
         prompt = usage.get("prompt_tokens")
         completion = usage.get("completion_tokens")
-        for value in (prompt, completion):
+        details = usage.get("completion_tokens_details")
+        if details is not None and not isinstance(details, dict):
+            raise ValueError("invalid stream usage")
+        reasoning = details.get("reasoning_tokens") if isinstance(details, dict) else None
+        for value in (prompt, completion, reasoning):
             if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
                 raise ValueError("invalid stream usage")
         if prompt is not None:
@@ -121,6 +127,10 @@ def _stream_openai_compatible(
             if output_tokens is not None and output_tokens != completion:
                 raise ValueError("conflicting stream usage")
             output_tokens = completion
+        if reasoning is not None:
+            if reasoning_tokens is not None and reasoning_tokens != reasoning:
+                raise ValueError("conflicting stream usage")
+            reasoning_tokens = reasoning
 
     def consume_data(data: str) -> Iterator[ProviderTextDelta]:
         nonlocal finish_reason, saw_done
@@ -242,7 +252,7 @@ def _stream_openai_compatible(
             if not parts.call_id or not parts.name or not parts.received_arguments:
                 raise ValueError("incomplete stream tool call")
             yield ProviderToolCallReady(parts.call_id, parts.name, parts.arguments)
-    yield ProviderStreamCompleted(finish_reason, input_tokens, output_tokens)
+    yield ProviderStreamCompleted(finish_reason, input_tokens, output_tokens, reasoning_tokens)
 
 
 class _OpenAICompatibleProvider:

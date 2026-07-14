@@ -72,3 +72,28 @@ class LatencyTraceTests(unittest.TestCase):
         self.assertEqual(output.getvalue(), "TOMO_SANDBOX_LATENCY_V1=phase=sandbox_provider_attempt outcome=ok elapsed_ms=7 attempt=2 segment=1 repair=1\n")
         self.assertNotIn("TOMO_LATENCY_TRACE_KEY", output.getvalue())
         self.assertNotIn("test-latency", output.getvalue())
+
+    def test_provider_stage_counts_are_fixed_and_nonnegative(self):
+        output = io.StringIO()
+        with patch.dict("os.environ", {"TOMO_LATENCY_TRACE": "1"}, clear=True):
+            token = latency_trace.bind_sandbox_sink(output.write)
+            latency_trace.emit_sandbox(
+                "sandbox_provider_stream_completed",
+                elapsed_ms=9,
+                attempt=2,
+                segment=1,
+                repair=0,
+                input_tokens=12,
+                output_tokens=7,
+                reasoning_tokens=3,
+                output_chars_through_first_frame=19,
+                first_frame_chars=12,
+            )
+            latency_trace.emit_sandbox("sandbox_provider_stream_completed", elapsed_ms=1, attempt=1, unknown=1)
+            latency_trace.emit_sandbox("sandbox_provider_stream_completed", elapsed_ms=1, attempt=1, input_tokens=-1)
+            latency_trace.reset_sandbox_sink(token)
+
+        self.assertEqual(
+            output.getvalue(),
+            "TOMO_SANDBOX_LATENCY_V1=phase=sandbox_provider_stream_completed outcome=ok elapsed_ms=9 attempt=2 segment=1 repair=0 input_tokens=12 output_tokens=7 reasoning_tokens=3 output_chars_through_first_frame=19 first_frame_chars=12\n",
+        )

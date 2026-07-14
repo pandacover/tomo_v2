@@ -140,13 +140,56 @@ class ConversationEngine:
                 attempt_started_at = self.monotonic_clock()
                 provider_attempt_emitted = False
                 provider_attempts += 1
+                suspended_seconds = 0.0
+                emitted_stages: set[str] = set()
+                output_chars_through_first_frame = 0
+                first_frame_chars: int | None = None
 
                 def emit_provider_attempt(outcome: str) -> None:
                     nonlocal provider_attempt_emitted
-                    if provider_attempt_emitted or not is_active():
+                    if provider_attempt_emitted:
                         return
-                    latency_trace.emit_sandbox("sandbox_provider_attempt", outcome=outcome, elapsed_ms=max(0, int((self.monotonic_clock() - attempt_started_at) * 1000)), attempt=provider_attempts, segment=index, repair=repairs)
+                    wall_ms = max(0, int((self.monotonic_clock() - attempt_started_at) * 1000))
+                    suspended_ms = min(wall_ms, max(0, int(suspended_seconds * 1000)))
+                    counts = provider_counts()
+                    counts.update(suspended_ms=suspended_ms, active_ms=max(0, wall_ms - suspended_ms))
+                    latency_trace.emit_sandbox("sandbox_provider_attempt", outcome=outcome, elapsed_ms=wall_ms, **counts)
                     provider_attempt_emitted = True
+
+                def provider_counts(*, include_completion: bool = True) -> dict[str, int]:
+                    counts = {"attempt": provider_attempts, "segment": index, "repair": repairs}
+                    if include_completion:
+                        if first_frame_chars is not None:
+                            counts["output_chars_through_first_frame"] = output_chars_through_first_frame
+                            counts["first_frame_chars"] = first_frame_chars
+                        if terminal is not None:
+                            if terminal.input_tokens is not None:
+                                counts["input_tokens"] = terminal.input_tokens
+                            if terminal.output_tokens is not None:
+                                counts["output_tokens"] = terminal.output_tokens
+                            if terminal.reasoning_tokens is not None:
+                                counts["reasoning_tokens"] = terminal.reasoning_tokens
+                    return counts
+
+                def emit_provider_stage(phase: str, *, include_completion: bool = False) -> None:
+                    if phase in emitted_stages:
+                        return
+                    latency_trace.emit_sandbox(
+                        phase,
+                        elapsed_ms=max(0, int((self.monotonic_clock() - attempt_started_at) * 1000)),
+                        **provider_counts(include_completion=include_completion),
+                    )
+                    emitted_stages.add(phase)
+
+                def yield_provider_event(event: TurnRunEvent) -> Iterator[TurnRunEvent]:
+                    nonlocal suspended_seconds
+                    suspended_at = self.monotonic_clock()
+                    try:
+                        yield event
+                    finally:
+                        suspended_seconds += max(0.0, self.monotonic_clock() - suspended_at)
+
+                emit_provider_stage("sandbox_provider_attempt_start")
 
                 try:
                     stream = self.provider.stream(messages, tools=schemas, actor_id=request.burst.latest.actor_id)
@@ -186,6 +229,7 @@ class ConversationEngine:
                 except Exception:
                     failure = ConversationOutputError("provider_stream_failure")
                     stream = None
+                stream_exhausted = False
                 try:
                     for event in stream or ():
                         if not is_active():
@@ -197,8 +241,12 @@ class ConversationEngine:
                             if terminal is not None:
                                 raise ConversationOutputError("event_after_completion")
                             if isinstance(event, ProviderTextDelta):
+                                if event.text:
+                                    emit_provider_stage("sandbox_provider_first_text_delta")
                                 raw.append(event.text)
                                 for chunk in event.text.splitlines(keepends=True):
+                                    if first_frame_chars is None:
+                                        output_chars_through_first_frame += len(chunk)
                                     for record in parser.feed(chunk):
                                         if isinstance(record, MovePlan):
                                             if expired():
@@ -207,16 +255,17 @@ class ConversationEngine:
                                             if plan is not None and record != plan:
                                                 raise ConversationOutputError("conflicting_plan")
                                             plan = record
+                                            emit_provider_stage("sandbox_provider_move_plan_validated")
                                             if not is_active():
                                                 return
-                                            yield TurnRunStarted(plan)
+                                            yield from yield_provider_event(TurnRunStarted(plan))
                                         elif not isinstance(record, Frame):
                                             if sum(len(segment.memory_controls) for segment in segments) + len(segment_memory_controls) >= 8:
                                                 raise ConversationOutputError("memory_control_turn_limit")
                                             segment_memory_controls.append(record)
                                             if not is_active():
                                                 return
-                                            yield MemoryControlReady(index, record, tuple(sorted(tool_observation_ids)))
+                                            yield from yield_provider_event(MemoryControlReady(index, record, tuple(sorted(tool_observation_ids))))
                                         else:
                                             if len(frames) >= 3:
                                                 raise ConversationOutputError("frame_limit")
@@ -227,14 +276,17 @@ class ConversationEngine:
                                                 break
                                             segment_frames.append(record)
                                             frames.append(record)
+                                            if first_frame_chars is None:
+                                                first_frame_chars = len(record.text)
+                                            emit_provider_stage("sandbox_provider_first_frame_validated", include_completion=True)
                                             if index == 0 and plan is not None and plan.reaction is not None and not reaction_window_emitted:
                                                 reaction_window_emitted = True
                                                 if not is_active():
                                                     return
-                                                yield ReactionWindowReady()
+                                                yield from yield_provider_event(ReactionWindowReady())
                                             if not is_active():
                                                 return
-                                            yield FrameReady(len(frames) - 1, record)
+                                            yield from yield_provider_event(FrameReady(len(frames) - 1, record))
                             elif isinstance(event, ProviderToolCallReady):
                                 native_calls.append(event)
                             elif isinstance(event, ProviderStreamCompleted):
@@ -243,11 +295,13 @@ class ConversationEngine:
                                     input_tokens = (input_tokens or 0) + event.input_tokens
                                 if event.output_tokens is not None:
                                     output_tokens = (output_tokens or 0) + event.output_tokens
+                                emit_provider_stage("sandbox_provider_stream_completed", include_completion=True)
                             else:
                                 raise ConversationOutputError("invalid_provider_event")
                         except ConversationOutputError as error:
                             failure = error
                             break
+                    stream_exhausted = True
                 except Exception:
                     if failure is None:
                         failure = ConversationOutputError("provider_stream_failure")
@@ -255,6 +309,8 @@ class ConversationEngine:
                     close = getattr(stream, "close", None)
                     if callable(close):
                         close()
+                    if not stream_exhausted:
+                        emit_provider_attempt("error")
                 if not is_active():
                     return
                 if failure is None and terminal is None:
@@ -270,16 +326,17 @@ class ConversationEngine:
                                 if plan is not None and record != plan:
                                     raise ConversationOutputError("conflicting_plan")
                                 plan = record
+                                emit_provider_stage("sandbox_provider_move_plan_validated")
                                 if not is_active():
                                     return
-                                yield TurnRunStarted(plan)
+                                yield from yield_provider_event(TurnRunStarted(plan))
                             elif not isinstance(record, Frame):
                                 if sum(len(segment.memory_controls) for segment in segments) + len(segment_memory_controls) >= 8:
                                     raise ConversationOutputError("memory_control_turn_limit")
                                 segment_memory_controls.append(record)
                                 if not is_active():
                                     return
-                                yield MemoryControlReady(index, record, tuple(sorted(tool_observation_ids)))
+                                yield from yield_provider_event(MemoryControlReady(index, record, tuple(sorted(tool_observation_ids))))
                             else:
                                 if len(frames) >= 3:
                                     raise ConversationOutputError("frame_limit")
@@ -287,14 +344,17 @@ class ConversationEngine:
                                     raise ConversationOutputError("visible_segment_limit")
                                 segment_frames.append(record)
                                 frames.append(record)
+                                if first_frame_chars is None:
+                                    first_frame_chars = len(record.text)
+                                emit_provider_stage("sandbox_provider_first_frame_validated", include_completion=True)
                                 if index == 0 and plan is not None and plan.reaction is not None and not reaction_window_emitted:
                                     reaction_window_emitted = True
                                     if not is_active():
                                         return
-                                    yield ReactionWindowReady()
+                                    yield from yield_provider_event(ReactionWindowReady())
                                 if not is_active():
                                     return
-                                yield FrameReady(len(frames) - 1, record)
+                                yield from yield_provider_event(FrameReady(len(frames) - 1, record))
                     except ConversationOutputError as error:
                         failure = error
                 tool_finish = terminal is not None and terminal.finish_reason == "tool_calls"
@@ -307,7 +367,7 @@ class ConversationEngine:
                 if failure is None and tool_finish:
                     if index == 0 and plan is not None and plan.reaction is not None and not reaction_window_emitted:
                         reaction_window_emitted = True
-                        yield ReactionWindowReady()
+                        yield from yield_provider_event(ReactionWindowReady())
                     if not is_active():
                         return
                     if expired():

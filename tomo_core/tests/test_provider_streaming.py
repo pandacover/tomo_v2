@@ -88,7 +88,7 @@ class ProviderStreamingTests(unittest.TestCase):
                             "finish_reason": "tool_calls",
                         }
                     ],
-                    "usage": {"prompt_tokens": 12, "completion_tokens": 7},
+                    "usage": {"prompt_tokens": 12, "completion_tokens": 7, "completion_tokens_details": {"reasoning_tokens": 4}},
                 }
             ),
             "[DONE]",
@@ -102,7 +102,7 @@ class ProviderStreamingTests(unittest.TestCase):
             [
                 ProviderToolCallReady("call_1", "search", '{"q":"japan"}'),
                 ProviderToolCallReady("call_2", "weather", '{"city":"tokyo"}'),
-                ProviderStreamCompleted("tool_calls", input_tokens=12, output_tokens=7),
+                ProviderStreamCompleted("tool_calls", input_tokens=12, output_tokens=7, reasoning_tokens=4),
             ],
         )
 
@@ -145,6 +145,19 @@ class ProviderStreamingTests(unittest.TestCase):
             with self.subTest(chunks=chunks), patch("tomo_core.providers.httpx.stream", return_value=FakeStreamResponse(chunks)):
                 with self.assertRaises(ValueError):
                     list(XaiApiProvider(api_key="test-key").stream([{"role": "user", "content": "hi"}]))
+
+    def test_stream_rejects_invalid_or_conflicting_reasoning_usage(self):
+        invalid = json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}], "usage": {"completion_tokens_details": {"reasoning_tokens": -1}}})
+        first = json.dumps({"choices": [{"delta": {}, "finish_reason": None}], "usage": {"completion_tokens_details": {"reasoning_tokens": 2}}})
+        conflicting = json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}], "usage": {"completion_tokens_details": {"reasoning_tokens": 3}}})
+        for chunks in (sse_chunks(invalid, "[DONE]"), sse_chunks(first, conflicting, "[DONE]")):
+            with self.subTest(chunks=chunks), patch("tomo_core.providers.httpx.stream", return_value=FakeStreamResponse(chunks)):
+                with self.assertRaises(ValueError):
+                    list(XaiApiProvider(api_key="test-key").stream([{"role": "user", "content": "hi"}]))
+
+    def test_completed_rejects_invalid_reasoning_tokens(self):
+        with self.assertRaises(ValueError):
+            ProviderStreamCompleted("stop", reasoning_tokens=True)
 
     def test_stream_rejects_duplicate_tool_call_id_across_indices_before_ready_event(self):
         duplicate_ids = json.dumps(
