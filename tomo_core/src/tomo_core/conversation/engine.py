@@ -10,6 +10,7 @@ from ..models import ResponseContract
 from ..providers import ProviderAdapter, ProviderSetupRequired, ProviderStreamCompleted, ProviderTextDelta, ProviderToolCallReady
 from ..tool_execution import ToolBatchCancelled, ToolBatchValidationError, ToolExecutor
 from ..tools import ToolRegistry
+from .. import latency_trace
 from .framing import SegmentFrameParser
 from .models import ConversationRequest, Frame, FrameReady, MemoryControlReady, MovePlan, ReactionWindowReady, SegmentFinish, SegmentResult, TurnBudget, TurnRunCompleted, TurnRunEvent, TurnRunResult, TurnRunStarted, TurnRunStatus, TurnUsage
 from .parsing import ConversationOutputError
@@ -64,7 +65,11 @@ class ConversationEngine:
     def _respond_iter(self, request: ConversationRequest, is_active: Callable[[], bool]) -> Iterator[TurnRunEvent]:
         if not is_active():
             return
+        hydration_started_at = self.monotonic_clock()
         context = self.context_hydrator.hydrate(request)
+        if is_active():
+            # Hydration ends before prompt construction; it excludes provider work.
+            latency_trace.emit_sandbox("sandbox_context_hydration", elapsed_ms=max(0, int((self.monotonic_clock() - hydration_started_at) * 1000)))
         if not is_active():
             return
         started_at = self.monotonic_clock()
@@ -74,6 +79,7 @@ class ConversationEngine:
         prior_messages: list[dict[str, object]] = []
         tool_observation_ids: set[str] = set()
         repairs = 0
+        provider_attempts = 0
         input_tokens: int | None = None
         output_tokens: int | None = None
         reaction_window_emitted = False
@@ -131,9 +137,21 @@ class ConversationEngine:
                 segment_memory_controls = []
                 terminal: ProviderStreamCompleted | None = None
                 failure: ConversationOutputError | None = None
+                attempt_started_at = self.monotonic_clock()
+                provider_attempt_emitted = False
+                provider_attempts += 1
+
+                def emit_provider_attempt(outcome: str) -> None:
+                    nonlocal provider_attempt_emitted
+                    if provider_attempt_emitted or not is_active():
+                        return
+                    latency_trace.emit_sandbox("sandbox_provider_attempt", outcome=outcome, elapsed_ms=max(0, int((self.monotonic_clock() - attempt_started_at) * 1000)), attempt=provider_attempts, segment=index, repair=repairs)
+                    provider_attempt_emitted = True
+
                 try:
                     stream = self.provider.stream(messages, tools=schemas, actor_id=request.burst.latest.actor_id)
                 except ProviderSetupRequired as error:
+                    emit_provider_attempt("error")
                     if not segments:
                         raise
                     if not is_active():
@@ -301,15 +319,26 @@ class ConversationEngine:
                     if any(call.call_id in prior_call_ids for call in native_calls):
                         failure = ConversationOutputError("duplicate_tool_call_id")
                     else:
+                        emit_provider_attempt("ok")
                         try:
+                            tool_started_at = self.monotonic_clock()
                             batch = self.tool_executor.execute_batch(native_calls, self.budget.max_tool_calls - sum(len(s.tool_calls) for s in segments), is_active)
                         except ToolBatchCancelled:
+                            if is_active():
+                                latency_trace.emit_sandbox("sandbox_tool_batch", outcome="error", elapsed_ms=max(0, int((self.monotonic_clock() - tool_started_at) * 1000)), segment=index, repair=repairs)
                             return
                         except ToolBatchValidationError as error:
+                            if is_active():
+                                latency_trace.emit_sandbox("sandbox_tool_batch", outcome="error", elapsed_ms=max(0, int((self.monotonic_clock() - tool_started_at) * 1000)), segment=index, repair=repairs)
                             failure = ConversationOutputError(error.code)
                         except Exception:
+                            if is_active():
+                                latency_trace.emit_sandbox("sandbox_tool_batch", outcome="error", elapsed_ms=max(0, int((self.monotonic_clock() - tool_started_at) * 1000)), segment=index, repair=repairs)
                             failure = ConversationOutputError("tool_executor_failure")
                         else:
+                            if is_active():
+                                # A batch is all tools in one model segment, never individual tools.
+                                latency_trace.emit_sandbox("sandbox_tool_batch", elapsed_ms=max(0, int((self.monotonic_clock() - tool_started_at) * 1000)), segment=index, repair=repairs)
                             segments.append(SegmentResult(index, tuple(segment_frames), batch.tool_calls, SegmentFinish.TOOL_BATCH, tuple(segment_memory_controls)))
                             prior_messages.append(_assistant_continuation("".join(raw) or None, batch.tool_calls))
                             prior_messages.extend(_tool_continuation(observation) for observation in batch.observations)
@@ -323,6 +352,10 @@ class ConversationEngine:
                                 raise ConversationOutputError("elapsed_budget_exhausted")
                             index += 1
                             break
+                if failure is None and (plan is None or not segment_frames):
+                    failure = ConversationOutputError("missing_frame")
+                # Finalize after parsing and contract validation, before any tool work.
+                emit_provider_attempt("error" if failure is not None else "ok")
                 if failure is not None:
                     if segment_frames:
                         segments.append(SegmentResult(index, tuple(segment_frames), (), SegmentFinish.PARTIAL, tuple(segment_memory_controls)))
@@ -341,13 +374,6 @@ class ConversationEngine:
                     if segments or repairs >= self.budget.max_contract_repairs:
                         raise ConversationOutputError(failure.code)
                     repair_code = failure.code
-                    repairs += 1
-                    replacement = True
-                    continue
-                if plan is None or not segment_frames:
-                    if segments or repairs >= self.budget.max_contract_repairs:
-                        raise ConversationOutputError("missing_frame")
-                    repair_code = "missing_frame"
                     repairs += 1
                     replacement = True
                     continue

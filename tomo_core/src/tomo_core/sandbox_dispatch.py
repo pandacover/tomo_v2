@@ -132,16 +132,28 @@ class SandboxDispatch:
                         "TOMO_CORE_SOUL": "/opt/tomo/SOUL.md",
                         "TOMO_XAI_MODEL": os.getenv("TOMO_XAI_MODEL", self.xai_model),
                         "TOMO_XAI_REASONING_EFFORT": os.getenv("TOMO_XAI_REASONING_EFFORT", self.xai_reasoning_effort),
+                        **_latency_env(),
                     },
                     timeout=_EXEC_TIMEOUT_SECONDS,
                 )
                 latency_trace.emit(work.burst_id, "pty_ready", elapsed_ms=max(0, int((time.monotonic() - pty_started_at) * 1000)), attempt=attempt + 1)
+                runtime_entry_started_at = time.monotonic()
+
+                def forward_latency(phase: str, outcome: str, elapsed_ms: int, counts: dict[str, int]) -> None:
+                    if not is_active():
+                        return
+                    # This host-owned interval is PTY ready through runtime entry.
+                    if phase == "sandbox_runtime_entry":
+                        elapsed_ms = max(0, int((time.monotonic() - runtime_entry_started_at) * 1000))
+                    latency_trace.emit(work.burst_id, phase, outcome=outcome, elapsed_ms=elapsed_ms, **counts)
+
                 for event in iter_event_markers(
                     self.client.iter_session_logs(sandbox, command),
                     expected_request_id=request_id,
                     expected_generation_id=work.generation_id,
                     budget=self.budget,
                     expected_reaction_binding=(installation.tomo_id, installation.actor_id, installation.chat_id, str(work.inputs[-1].message_id), work.revision),
+                    on_latency=forward_latency,
                 ):
                     if not is_active():
                         return
@@ -222,7 +234,8 @@ class SandboxDispatch:
                     "TOMO_SUPERGROK_ACCESS_TOKEN": token,
                     "TOMO_CORE_SOUL": "/opt/tomo/SOUL.md",
                     "TOMO_XAI_MODEL": os.getenv("TOMO_XAI_MODEL", self.xai_model),
-                    "TOMO_XAI_REASONING_EFFORT": os.getenv("TOMO_XAI_REASONING_EFFORT", self.xai_reasoning_effort),
+                "TOMO_XAI_REASONING_EFFORT": os.getenv("TOMO_XAI_REASONING_EFFORT", self.xai_reasoning_effort),
+                **_latency_env(),
                 },
                 timeout=_EXEC_TIMEOUT_SECONDS,
             )
@@ -262,6 +275,14 @@ def _session_id(generation_id: str) -> str:
 def _safe_id(value: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", value.strip()).strip("-")
     return safe or "generation"
+
+
+def _latency_env() -> dict[str, str]:
+    """Forward opt-in tracing configuration without ever placing it in output."""
+    if os.getenv("TOMO_LATENCY_TRACE") != "1":
+        return {}
+    key = os.getenv("TOMO_LATENCY_TRACE_KEY")
+    return {"TOMO_LATENCY_TRACE": "1"} if isinstance(key, str) and len(key) >= 32 else {}
 
 
 def burst_from_work(installation: TelegramInstallation, work: TelegramGenerationWork) -> InputBurst:

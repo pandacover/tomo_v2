@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from tomo_core import InboundEnvelope, InboundMessage, InputBurst, PersonalAgentRuntime, RuntimeConfig
 from tomo_core.models import MessageAttachment
@@ -38,6 +39,25 @@ def stream(*frames, finish_reason="stop", input_tokens=11, output_tokens=7):
 
 
 class RuntimeConversationMoveTests(unittest.TestCase):
+    def test_latency_marker_is_suppressed_when_inactive_after_session_load(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            soul_path = Path(tmp) / "SOUL.md"
+            soul_path.write_text("SOUL", encoding="utf-8")
+            provider = ScriptedProvider([stream("answer")])
+            runtime = PersonalAgentRuntime(provider, TelegramDeliverySink(FakeTelegramClient()), RuntimeConfig(data_dir=tmp, soul_path=str(soul_path)))
+            burst = InputBurst("burst-1", "gen-1", 1, (InboundMessage(1, 41, InboundEnvelope("telegram", "user-1", "msg-1", "go")),))
+            active = [True]
+            original_load = runtime.personal_data.load_session
+
+            def load_and_cancel(*args, **kwargs):
+                session = original_load(*args, **kwargs)
+                active[0] = False
+                return session
+
+            with patch("tomo_core.runtime.latency_trace.emit_sandbox") as emit, patch.object(runtime.personal_data, "load_session", side_effect=load_and_cancel):
+                self.assertEqual(list(runtime.handle_telegram_burst_iter(burst, is_active=lambda: active[0])), [])
+            self.assertNotIn("sandbox_session_load", [call.args[0] for call in emit.call_args_list])
+
     def test_reaction_follows_leading_setting_control_and_precedes_frame(self):
         with tempfile.TemporaryDirectory() as tmp:
             soul_path = Path(tmp) / "SOUL.md"

@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import os
 import sys
+from contextvars import ContextVar
 
 
 _PHASES = frozenset({
@@ -19,9 +20,22 @@ _PHASES = frozenset({
     "pty_ready",
     "sandbox_first_frame",
     "sandbox_completed",
+    "sandbox_runtime_entry",
+    "sandbox_context_hydration",
+    "sandbox_provider_attempt",
+    "sandbox_tool_batch",
+    "sandbox_checkpoint_inbound",
+    "sandbox_checkpoint_frame",
+    "sandbox_checkpoint_complete",
+    "sandbox_runtime_build",
+    "sandbox_session_load",
+    "sandbox_memory_hydration",
+    "sandbox_prompt_prepare",
 })
 _OUTCOMES = frozenset({"ok", "error", "send_complete", "origin_to_delivery"})
-_COUNTS = ("attempt", "model_segments", "tool_rounds", "tool_calls", "contract_repairs", "visible_segments")
+_COUNTS = ("attempt", "segment", "repair", "model_segments", "tool_rounds", "tool_calls", "contract_repairs", "visible_segments")
+SANDBOX_LATENCY_MARKER = "TOMO_SANDBOX_LATENCY_V1="
+_sandbox_sink: ContextVar[object | None] = ContextVar("sandbox_latency_sink", default=None)
 
 
 def emit(source_id: str, phase: str, *, outcome: str = "ok", elapsed_ms: int = 0, **counts: int) -> None:
@@ -42,6 +56,34 @@ def emit(source_id: str, phase: str, *, outcome: str = "ok", elapsed_ms: int = 0
         fields.append(f"trace={trace}")
         sys.stderr.write("[DEBUG-latency-v1] " + " ".join(fields) + "\n")
         sys.stderr.flush()
+    except Exception:
+        return
+
+
+def bind_sandbox_sink(sink: object):
+    """Install a request-scoped marker sink for sandbox-only telemetry."""
+    return _sandbox_sink.set(sink)
+
+
+def reset_sandbox_sink(token: object) -> None:
+    _sandbox_sink.reset(token)
+
+
+def emit_sandbox(phase: str, *, outcome: str = "ok", elapsed_ms: int = 0, **counts: int) -> None:
+    """Forward fixed-schema sandbox timings; the host adds HMAC correlation."""
+    if os.getenv("TOMO_LATENCY_TRACE") != "1":
+        return
+    try:
+        sink = _sandbox_sink.get()
+        if sink is None:
+            return
+        if phase not in _PHASES or outcome not in _OUTCOMES or not _nonnegative_int(elapsed_ms):
+            return
+        if any(name not in _COUNTS or not _nonnegative_int(value) for name, value in counts.items()):
+            return
+        fields = [f"phase={phase}", f"outcome={outcome}", f"elapsed_ms={elapsed_ms}"]
+        fields.extend(f"{name}={counts[name]}" for name in _COUNTS if name in counts)
+        sink(SANDBOX_LATENCY_MARKER + " ".join(fields) + "\n")
     except Exception:
         return
 

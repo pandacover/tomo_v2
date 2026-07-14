@@ -219,6 +219,24 @@ class SandboxDispatchTests(unittest.TestCase):
         emit.assert_not_called()
         self.daytona.start_session_command.assert_not_called()
 
+    def test_iter_telegram_events_forwards_only_validated_latency_without_sensitive_values(self):
+        work = self._work()
+        self.daytona.start_session_command.return_value = SessionCommandHandle("telegram-burst-one-r1", "cmd-1")
+        self.daytona.iter_session_logs.return_value = iter([
+            "TOMO_SANDBOX_LATENCY_V1=phase=sandbox_provider_attempt outcome=ok elapsed_ms=7 attempt=2 segment=1 repair=1\n",
+            *v3_markers("telegram-generation-burst-one-r1", "burst:one/r1", "hello."),
+        ])
+        self.daytona.session_command_exit_code.return_value = 0
+        with patch.dict("os.environ", {"TOMO_LATENCY_TRACE": "1", "TOMO_LATENCY_TRACE_KEY": "test-latency-trace-key-at-least-32-bytes"}, clear=False), patch("tomo_core.sandbox_dispatch.latency_trace.emit") as emit:
+            list(self.dispatch.iter_telegram_events(self.installation, work))
+        forwarded = [call for call in emit.call_args_list if call.args[1] == "sandbox_provider_attempt"]
+        self.assertEqual(len(forwarded), 1)
+        self.assertEqual(forwarded[0].kwargs, {"outcome": "ok", "elapsed_ms": 7, "attempt": 2, "segment": 1, "repair": 1})
+        env = self.daytona.start_session_command.call_args.kwargs["env"]
+        self.assertEqual(env["TOMO_LATENCY_TRACE"], "1")
+        self.assertNotIn("TOMO_LATENCY_TRACE_KEY", env)
+        self.assertNotIn("hello", repr(forwarded))
+
     def test_iter_telegram_events_stops_after_a_frame_becomes_stale(self):
         work = self._work()
         self.daytona.start_session_command.return_value = SessionCommandHandle("telegram-burst-one-r1", "cmd-1")

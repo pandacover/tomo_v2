@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 import os
+import time
 from typing import TextIO
 import traceback
 
@@ -14,6 +15,7 @@ from .models import OutboundBubble, RuntimeConfig
 from .providers import ProviderAdapter
 from .runtime import PersonalAgentRuntime, RuntimeCompleted, RuntimeFrameReady, RuntimeReactionReady, StaleSessionRevisionError
 from .sandbox_protocol import EVENT_MARKER, SandboxErrorEvent, SandboxStaleEvent, SandboxTracebackFrame, decode_inbound, encode_event
+from . import latency_trace
 
 
 _MAX_FAILURE_EVENT_CHARS = 900
@@ -72,7 +74,12 @@ def run_once(
         _raise_failure(stdout, "invalid_request", error, secret_values, request_id, generation_id)
 
     try:
+        sink_token = latency_trace.bind_sandbox_sink(stdout.write)
+        # The host measures PTY-ready through receipt of this entry marker.
+        latency_trace.emit_sandbox("sandbox_runtime_entry", elapsed_ms=0)
+        build_started_at = time.monotonic()
         runtime = build_runtime(provider, config)
+        latency_trace.emit_sandbox("sandbox_runtime_build", elapsed_ms=max(0, int((time.monotonic() - build_started_at) * 1000)))
         for event in runtime.handle_telegram_burst_iter(burst):
             if not isinstance(event, (RuntimeReactionReady, RuntimeFrameReady, RuntimeCompleted)):
                 raise TypeError("runtime emitted an unsupported sandbox event")
@@ -103,6 +110,9 @@ def run_once(
         _raise_failure(stdout, code, error, secret_values, request_id, generation_id, sequence)
     except Exception as error:
         _raise_failure(stdout, "runtime_failed", error, secret_values, request_id, generation_id, sequence)
+    finally:
+        if "sink_token" in locals():
+            latency_trace.reset_sandbox_sink(sink_token)
 
 
 def emit_failure(stdout: TextIO, code: str, request_id: str = "unknown") -> None:

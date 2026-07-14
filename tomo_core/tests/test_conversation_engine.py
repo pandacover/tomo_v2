@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from tomo_core.conversation import ConversationEngine, ConversationRequest, FrameReady, SegmentFinish, TurnBudget, TurnRunCompleted, TurnRunStarted, TurnRunStatus
 from tomo_core.conversation.parsing import ConversationOutputError
@@ -96,6 +97,83 @@ class ConversationEngineTests(unittest.TestCase):
         self.assertEqual(result.plan.response_goal, "answer directly")
         self.assertEqual(result.frames[0].text, "Fixed frame.")
         self.assertIn("fixed turn plan", provider.calls[1][0][0]["content"])
+
+    def test_latency_labels_provider_repairs_and_aggregate_tool_batches_without_content(self):
+        from tomo_core.tools import BoundTool, ToolRegistry, ToolSpec
+
+        provider = ScriptedProvider([
+            [ProviderTextDelta("not json\n")],
+            [ProviderTextDelta(PLAN + '{"type":"frame","text":"Done."}\n'), ProviderStreamCompleted("stop")],
+        ])
+        registry = ToolRegistry((BoundTool(ToolSpec("search", "search", {"type": "object", "properties": {}}), lambda _: "private result"),))
+        with patch("tomo_core.conversation.engine.latency_trace.emit_sandbox") as emit:
+            ConversationEngine(provider, tool_registry=registry).respond(self.request())
+        provider_calls = [call for call in emit.call_args_list if call.args[0] == "sandbox_provider_attempt"]
+        tool_calls = [call for call in emit.call_args_list if call.args[0] == "sandbox_tool_batch"]
+        self.assertEqual([(call.kwargs["attempt"], call.kwargs["segment"], call.kwargs["repair"]) for call in provider_calls], [(1, 0, 0), (2, 0, 1)])
+        self.assertEqual([call.kwargs["outcome"] for call in provider_calls], ["error", "ok"])
+        self.assertEqual(tool_calls, [])
+        self.assertNotIn("call-private", repr(emit.call_args_list))
+        self.assertNotIn("private result", repr(emit.call_args_list))
+
+    def test_latency_times_one_aggregate_tool_batch(self):
+        from tomo_core.tools import BoundTool, ToolRegistry, ToolSpec
+
+        provider = ScriptedProvider([
+            [ProviderTextDelta(PLAN), ProviderToolCallReady("call-private", "search", "{}"), ProviderStreamCompleted("tool_calls")],
+            [ProviderTextDelta('{"type":"frame","text":"Done."}\n'), ProviderStreamCompleted("stop")],
+        ])
+        registry = ToolRegistry((BoundTool(ToolSpec("search", "search", {"type": "object", "properties": {}}), lambda _: "private result"),))
+        with patch("tomo_core.conversation.engine.latency_trace.emit_sandbox") as emit:
+            ConversationEngine(provider, tool_registry=registry).respond(self.request())
+        tool_calls = [call for call in emit.call_args_list if call.args[0] == "sandbox_tool_batch"]
+        provider_calls = [call for call in emit.call_args_list if call.args[0] == "sandbox_provider_attempt"]
+        self.assertEqual([call.kwargs["outcome"] for call in provider_calls], ["ok", "ok"])
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0].kwargs["segment"], 0)
+        self.assertNotIn("call-private", repr(emit.call_args_list))
+        self.assertNotIn("private result", repr(emit.call_args_list))
+
+    def test_tool_executor_failure_keeps_provider_ok_and_marks_tool_error(self):
+        from tomo_core.tool_execution import ToolExecutor
+        from tomo_core.tools import BoundTool, ToolRegistry, ToolSpec
+
+        class ExplodingExecutor(ToolExecutor):
+            def execute_batch(self, *args, **kwargs):
+                raise RuntimeError("private executor failure")
+
+        registry = ToolRegistry((BoundTool(ToolSpec("search", "search", {"type": "object", "properties": {}}), lambda _: "result"),))
+        provider = ScriptedProvider([[ProviderTextDelta(PLAN + '{"type":"frame","text":"Checking."}\n'), ProviderToolCallReady("call-1", "search", "{}"), ProviderStreamCompleted("tool_calls")]])
+        with patch("tomo_core.conversation.engine.latency_trace.emit_sandbox") as emit:
+            events = list(ConversationEngine(provider, tool_registry=registry, tool_executor=ExplodingExecutor(registry)).respond_iter(self.request()))
+        provider_calls = [call for call in emit.call_args_list if call.args[0] == "sandbox_provider_attempt"]
+        tool_calls = [call for call in emit.call_args_list if call.args[0] == "sandbox_tool_batch"]
+        self.assertEqual([call.kwargs["outcome"] for call in provider_calls], ["ok"])
+        self.assertEqual([call.kwargs["outcome"] for call in tool_calls], ["error"])
+        self.assertEqual(events[-1].result.status, TurnRunStatus.COMPLETED_PARTIAL)
+
+    def test_provider_elapsed_excludes_tool_execution_time(self):
+        from tomo_core.tool_execution import ToolExecutor
+        from tomo_core.tools import BoundTool, ToolRegistry, ToolSpec
+
+        clock = [0.0]
+
+        class AdvancingExecutor(ToolExecutor):
+            def execute_batch(self, *args, **kwargs):
+                clock[0] += 10
+                return super().execute_batch(*args, **kwargs)
+
+        registry = ToolRegistry((BoundTool(ToolSpec("search", "search", {"type": "object", "properties": {}}), lambda _: "result"),))
+        provider = ScriptedProvider([
+            [ProviderTextDelta(PLAN), ProviderToolCallReady("call-1", "search", "{}"), ProviderStreamCompleted("tool_calls")],
+            [ProviderTextDelta('{"type":"frame","text":"Done."}\n'), ProviderStreamCompleted("stop")],
+        ])
+        with patch("tomo_core.conversation.engine.latency_trace.emit_sandbox") as emit:
+            ConversationEngine(provider, tool_registry=registry, tool_executor=AdvancingExecutor(registry), monotonic_clock=lambda: clock[0]).respond(self.request())
+        provider_calls = [call for call in emit.call_args_list if call.args[0] == "sandbox_provider_attempt"]
+        tool_calls = [call for call in emit.call_args_list if call.args[0] == "sandbox_tool_batch"]
+        self.assertEqual(provider_calls[0].kwargs["elapsed_ms"], 0)
+        self.assertEqual(tool_calls[0].kwargs["elapsed_ms"], 10000)
 
     def test_second_invalid_replacement_raises_safe_output_error(self):
         provider = ScriptedProvider([

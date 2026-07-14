@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator, Literal, TypeAlias
@@ -22,6 +23,7 @@ from .sessions import StoredMessage
 from .soul import load_soul
 from .telegram import TelegramDeliverySink
 from .tools import ToolRegistry
+from . import latency_trace
 
 
 @dataclass(frozen=True)
@@ -144,11 +146,18 @@ class PersonalAgentRuntime:
             raise ValueError("runtime only supports telegram bursts")
         is_active = is_active or (lambda: True)
         self.telegram.start_typing(burst.latest.actor_id)
+        session_load_started_at = time.monotonic()
         session = self.personal_data.load_session(self.owner_id, burst.latest.session_key)
+        if is_active():
+            latency_trace.emit_sandbox("sandbox_session_load", elapsed_ms=max(0, int((time.monotonic() - session_load_started_at) * 1000)))
         session.accept_generations(burst.accepted_generation_ids)
         for message in burst.messages:
             session.append_inbound_once(message, burst.burst_id)
-        if not self.personal_data.save_session(self.owner_id, session, generation_id=burst.generation_id, revision=burst.revision):
+        checkpoint_started_at = time.monotonic()
+        saved = self.personal_data.save_session(self.owner_id, session, generation_id=burst.generation_id, revision=burst.revision)
+        if is_active():
+            latency_trace.emit_sandbox("sandbox_checkpoint_inbound", outcome="ok" if saved else "error", elapsed_ms=max(0, int((time.monotonic() - checkpoint_started_at) * 1000)))
+        if not saved:
             current_revision = self.personal_data.current_session_revision(self.owner_id, burst.latest.session_key)
             if current_revision is None:
                 raise RuntimeError("stale_session_revision_unavailable")
@@ -156,13 +165,17 @@ class PersonalAgentRuntime:
         if not is_active():
             return
 
+        memory_started_at = time.monotonic()
         try:
             memories = self.personal_data.memory_context(MemoryContextQuery(self.owner_id, "\n".join(m.envelope.text for m in burst.messages)))
             pending_actions = self.personal_data.pending_memory_actions(self.owner_id, burst.latest.session_key)
         except (StorageBusyError, StorageSearchError, StorageCapabilityError):
             memories = ()
             pending_actions = ()
+        if is_active():
+            latency_trace.emit_sandbox("sandbox_memory_hydration", elapsed_ms=max(0, int((time.monotonic() - memory_started_at) * 1000)))
         memory_block = _memory_data_block(memories, pending_actions)
+        prompt_started_at = time.monotonic()
         history = list(session.model_history_for_burst(burst.burst_id))
         if memory_block:
             history.append({"role": "user", "content": memory_block})
@@ -172,6 +185,8 @@ class PersonalAgentRuntime:
             history=tuple(history),
         )
         governance_revision = self.personal_data.memory_settings(self.owner_id).governance_revision
+        if is_active():
+            latency_trace.emit_sandbox("sandbox_prompt_prepare", elapsed_ms=max(0, int((time.monotonic() - prompt_started_at) * 1000)))
         conversation_events = self.conversation.respond_iter(request, is_active=is_active)
         delivered: list[OutboundBubble] = []
         reaction_emoji: str | None = None
@@ -395,7 +410,11 @@ class PersonalAgentRuntime:
                 },
             )
         )
-        return self.personal_data.save_session(self.owner_id, session, generation_id=burst.generation_id, revision=burst.revision)
+        checkpoint_started_at = time.monotonic()
+        saved = self.personal_data.save_session(self.owner_id, session, generation_id=burst.generation_id, revision=burst.revision)
+        if is_active():
+            latency_trace.emit_sandbox("sandbox_checkpoint_complete", outcome="ok" if saved else "error", elapsed_ms=max(0, int((time.monotonic() - checkpoint_started_at) * 1000)))
+        return saved
 
     def _persist_provisional_frame(self, session, burst, event, delivered, is_active) -> bool:
         if not is_active():
@@ -415,7 +434,11 @@ class PersonalAgentRuntime:
             session.messages[existing_index] = StoredMessage(existing.role, " ".join(parts), existing.timestamp, {**existing.metadata, **metadata})
         if not is_active():
             return False
-        return self.personal_data.save_session(self.owner_id, session, generation_id=burst.generation_id, revision=burst.revision)
+        checkpoint_started_at = time.monotonic()
+        saved = self.personal_data.save_session(self.owner_id, session, generation_id=burst.generation_id, revision=burst.revision)
+        if is_active():
+            latency_trace.emit_sandbox("sandbox_checkpoint_frame", outcome="ok" if saved else "error", elapsed_ms=max(0, int((time.monotonic() - checkpoint_started_at) * 1000)))
+        return saved
 
     def _record_memory_diagnostic(self, reason_code: Literal["secret_detected", "invalid_provenance", "stale_governance_or_revision", "storage_failure"]) -> None:
         if len(self.memory_control_diagnostics) < 32:

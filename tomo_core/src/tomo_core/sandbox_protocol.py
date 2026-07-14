@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import asdict, dataclass
-from typing import Any, Iterable, Iterator, TypeAlias
+from typing import Any, Callable, Iterable, Iterator, TypeAlias
 
 from .conversation import ConversationMove, FrameReady, MoveConfidence, MovePlan, ReactionIntent, SegmentFinish, TurnBudget, TurnRunCompleted, TurnRunStatus, TurnUsage
 from .conversation.parsing import _validate_strict_frame_text, parse_utterance, parse_utterances
 from .models import InboundEnvelope, InboundMessage, InputBurst, MessageAttachment, OutboundBubble, ResponseContract, RuntimeConfig
 from .runtime import RuntimeCompleted, RuntimeFrameReady, RuntimeReactionReady
+from .latency_trace import SANDBOX_LATENCY_MARKER
 
 INBOUND_PROTOCOL_VERSION = 2
 PROTOCOL_VERSION = 5
@@ -80,6 +81,7 @@ class SandboxStaleEvent:
 
 
 SandboxEvent: TypeAlias = SandboxReactionEvent | SandboxFrameEvent | SandboxCompletedEvent | SandboxErrorEvent | SandboxStaleEvent
+SandboxLatency: TypeAlias = tuple[str, str, int, dict[str, int]]
 
 
 def encode_inbound(request_id: str, burst: InputBurst | InboundEnvelope) -> str:
@@ -147,7 +149,7 @@ def encode_event(request_id: str, generation_id: str, sequence: int, event: obje
     return _encode(payload)
 
 
-def iter_event_markers(chunks: Iterable[str], expected_request_id: str, expected_generation_id: str, contract: ResponseContract | None = None, budget: TurnBudget | None = None, *, expected_reaction_binding: tuple[str, str, str, str, int] | None = None) -> Iterator[SandboxEvent]:
+def iter_event_markers(chunks: Iterable[str], expected_request_id: str, expected_generation_id: str, contract: ResponseContract | None = None, budget: TurnBudget | None = None, *, expected_reaction_binding: tuple[str, str, str, str, int] | None = None, on_latency: Callable[[str, str, int, dict[str, int]], None] | None = None) -> Iterator[SandboxEvent]:
     """Parse one strictly version-consistent v2 through v5 event stream."""
     _validate_request_id(expected_request_id)
     _validate_generation_id(expected_generation_id)
@@ -160,6 +162,19 @@ def iter_event_markers(chunks: Iterable[str], expected_request_id: str, expected
 
     def process(line: str) -> SandboxEvent | None:
         nonlocal expected_sequence, stream_version, terminal, reaction_seen
+        latency_position = line.find(SANDBOX_LATENCY_MARKER)
+        if latency_position >= 0 and _PTY_PREFIX_RE.fullmatch(line[:latency_position]):
+            try:
+                telemetry = parse_latency_marker(line[latency_position + len(SANDBOX_LATENCY_MARKER):])
+            except ValueError:
+                # Telemetry is observational: malformed markers cannot fail a turn.
+                return None
+            if on_latency is not None:
+                try:
+                    on_latency(*telemetry)
+                except Exception:
+                    pass
+            return None
         position = line.find(EVENT_MARKER)
         if position < 0 or not _PTY_PREFIX_RE.fullmatch(line[:position]):
             return None
@@ -221,6 +236,28 @@ def iter_event_markers(chunks: Iterable[str], expected_request_id: str, expected
             yield event
     if not terminal:
         raise ValueError("sandbox event stream missing terminal event")
+
+
+def parse_latency_marker(payload: str) -> SandboxLatency:
+    """Accept only the fixed, ID-free sandbox telemetry wire schema."""
+    fields = payload.split(" ")
+    if not fields or any("=" not in field for field in fields):
+        raise ValueError("invalid sandbox latency marker")
+    values = dict(field.split("=", 1) for field in fields)
+    if len(values) != len(fields) or set(values) - {"phase", "outcome", "elapsed_ms", "attempt", "segment", "repair", "model_segments", "tool_rounds", "tool_calls", "contract_repairs", "visible_segments"}:
+        raise ValueError("invalid sandbox latency fields")
+    if values.get("phase") not in {"sandbox_runtime_entry", "sandbox_context_hydration", "sandbox_provider_attempt", "sandbox_tool_batch", "sandbox_checkpoint_inbound", "sandbox_checkpoint_frame", "sandbox_checkpoint_complete", "sandbox_runtime_build", "sandbox_session_load", "sandbox_memory_hydration", "sandbox_prompt_prepare"} or values.get("outcome") not in {"ok", "error"}:
+        raise ValueError("invalid sandbox latency name")
+    if "elapsed_ms" not in values:
+        raise ValueError("sandbox latency requires elapsed_ms")
+    counts: dict[str, int] = {}
+    for name, value in values.items():
+        if name in {"phase", "outcome"}:
+            continue
+        if not value.isascii() or not value.isdecimal():
+            raise ValueError("sandbox latency values must be nonnegative integers")
+        counts[name] = int(value)
+    return values["phase"], values["outcome"], counts.pop("elapsed_ms"), counts
 
 
 def _safe_result(result: object) -> dict[str, Any]:

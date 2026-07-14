@@ -56,3 +56,19 @@ class LatencyTraceTests(unittest.TestCase):
 
         with patch.dict("os.environ", self.trace_env, clear=True), patch("sys.stderr", BrokenSink()):
             latency_trace.emit("generation-secret", "dispatch_start", elapsed_ms=1)
+
+    def test_sandbox_marker_is_opt_in_and_contains_only_fixed_fields(self):
+        output = io.StringIO()
+        with patch.dict("os.environ", {}, clear=True):
+            token = latency_trace.bind_sandbox_sink(output.write)
+            latency_trace.emit_sandbox("sandbox_provider_attempt", elapsed_ms=7, attempt=2, segment=1, repair=1)
+            latency_trace.reset_sandbox_sink(token)
+        self.assertEqual(output.getvalue(), "")
+        with patch.dict("os.environ", {"TOMO_LATENCY_TRACE": "1"}, clear=True):
+            token = latency_trace.bind_sandbox_sink(output.write)
+            latency_trace.emit_sandbox("sandbox_provider_attempt", elapsed_ms=7, attempt=2, segment=1, repair=1)
+            latency_trace.emit_sandbox("sandbox_provider_attempt", elapsed_ms=7, text="private")
+            latency_trace.reset_sandbox_sink(token)
+        self.assertEqual(output.getvalue(), "TOMO_SANDBOX_LATENCY_V1=phase=sandbox_provider_attempt outcome=ok elapsed_ms=7 attempt=2 segment=1 repair=1\n")
+        self.assertNotIn("TOMO_LATENCY_TRACE_KEY", output.getvalue())
+        self.assertNotIn("test-latency", output.getvalue())

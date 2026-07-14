@@ -24,6 +24,7 @@ from tomo_core.sandbox_protocol import (
     LEGACY_EVENT_PROTOCOL_VERSION,
     PROTOCOL_VERSION,
     RESULT_MARKER,
+    SANDBOX_LATENCY_MARKER,
     SandboxCompletedEvent,
     SandboxErrorEvent,
     SandboxFrameEvent,
@@ -37,6 +38,7 @@ from tomo_core.sandbox_protocol import (
     encode_result,
     iter_event_markers,
     parse_result_marker,
+    parse_latency_marker,
 )
 
 
@@ -276,6 +278,34 @@ class SandboxProtocolTests(unittest.TestCase):
         self.assertEqual(parse_result_marker(RESULT_MARKER + result, "request-7"), [OutboundBubble("ok")])
         with self.assertRaises(Exception):
             parse_result_marker(RESULT_MARKER + encode_error("request-7", "failed"), "request-7")
+
+    def test_latency_markers_are_strict_and_do_not_change_event_sequences(self):
+        marker = SANDBOX_LATENCY_MARKER + "phase=sandbox_provider_attempt outcome=ok elapsed_ms=12 attempt=2 segment=1 repair=1"
+        received = []
+        frame, completed = self._events()
+        events = list(iter_event_markers([
+            marker + "\n",
+            EVENT_MARKER + encode_event("request-7", "gen-1", 0, frame) + "\n",
+            EVENT_MARKER + encode_event("request-7", "gen-1", 1, completed) + "\n",
+        ], "request-7", "gen-1", on_latency=lambda *item: received.append(item)))
+        self.assertEqual([type(event) for event in events], [SandboxFrameEvent, SandboxCompletedEvent])
+        self.assertEqual(received, [("sandbox_provider_attempt", "ok", 12, {"attempt": 2, "segment": 1, "repair": 1})])
+        for payload in (
+            "phase=sandbox_provider_attempt outcome=ok elapsed_ms=-1",
+            "phase=sandbox_provider_attempt outcome=ok elapsed_ms=1 text=secret",
+            "phase=sandbox_provider_attempt outcome=ok elapsed_ms=1 attempt=true",
+            "phase=dispatch_start outcome=ok elapsed_ms=1",
+        ):
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                parse_latency_marker(payload)
+        self.assertEqual(
+            [type(event) for event in iter_event_markers([
+                SANDBOX_LATENCY_MARKER + "phase=sandbox_provider_attempt outcome=ok elapsed_ms=1 text=secret\n",
+                EVENT_MARKER + encode_event("request-7", "gen-1", 0, frame) + "\n",
+                EVENT_MARKER + encode_event("request-7", "gen-1", 1, completed) + "\n",
+            ], "request-7", "gen-1")],
+            [SandboxFrameEvent, SandboxCompletedEvent],
+        )
 
     def _burst(self):
         return InputBurst("burst-1", "gen-1", 1, (InboundMessage(1, 41, InboundEnvelope("telegram", "user-1", "message-1", "hello")),))
