@@ -38,7 +38,7 @@ _PHASES = frozenset({
     "sandbox_prompt_prepare",
 })
 _OUTCOMES = frozenset({"ok", "error", "send_complete", "origin_to_delivery"})
-_COUNTS = ("attempt", "segment", "repair", "model_segments", "tool_rounds", "tool_calls", "contract_repairs", "visible_segments", "suspended_ms", "active_ms", "input_tokens", "output_tokens", "reasoning_tokens", "output_chars_through_first_frame", "first_frame_chars")
+_COUNTS = ("attempt", "segment", "repair", "model_segments", "tool_rounds", "tool_calls", "contract_repairs", "visible_segments", "suspended_ms", "active_ms", "input_tokens", "output_tokens", "reasoning_tokens", "output_chars_through_first_frame", "first_frame_chars", "plan_model", "plan_normalized", "plan_synthesized")
 SANDBOX_LATENCY_MARKER = "TOMO_SANDBOX_LATENCY_V1="
 _sandbox_sink: ContextVar[object | None] = ContextVar("sandbox_latency_sink", default=None)
 

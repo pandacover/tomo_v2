@@ -1,13 +1,14 @@
 import unittest
 from unittest.mock import patch
 
-from tomo_core.conversation import ConversationEngine, ConversationRequest, FrameReady, ReactionWindowReady, SegmentFinish, TurnBudget, TurnRunCompleted, TurnRunStarted, TurnRunStatus
+from tomo_core.conversation import ConversationEngine, ConversationRequest, FrameReady, MemoryControlReady, ReactionWindowReady, SegmentFinish, TurnBudget, TurnRunCompleted, TurnRunStarted, TurnRunStatus
 from tomo_core.conversation.parsing import ConversationOutputError
 from tomo_core.models import InboundEnvelope, ResponseContract
 from tomo_core.providers import ProviderSetupRequired, ProviderStreamCompleted, ProviderTextDelta, ProviderToolCallReady
 
 
 PLAN = '{"type":"turn_plan","primary_move":"answer","supporting_moves":["acknowledge"],"move_sequence":["acknowledge","answer"],"response_goal":"answer directly","confidence":"high"}\n'
+CANONICAL_PLAN = '{"type":"turn_plan","primary_move":"answer","supporting_moves":[],"response_goal":"answer directly","confidence":"high","reaction":null}\n'
 
 
 class ClosingIterator:
@@ -85,6 +86,148 @@ class ConversationEngineTests(unittest.TestCase):
         self.assertEqual(completed.result.segments[0].finish, SegmentFinish.COMPLETE)
         self.assertTrue(provider.iterators[0].closed)
 
+    def test_frame_only_first_attempt_synthesizes_plan_without_repair(self):
+        provider = ScriptedProvider([[ProviderTextDelta('{"type":"frame","text":"Fast answer."}\n'), ProviderStreamCompleted("stop")]])
+
+        events = list(ConversationEngine(provider).respond_iter(self.request()))
+
+        self.assertEqual([type(event) for event in events], [TurnRunStarted, FrameReady, TurnRunCompleted])
+        self.assertEqual(events[0].plan.primary.value, "answer")
+        self.assertEqual(events[1].frame.text, "Fast answer.")
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(events[-1].result.usage.contract_repairs, 0)
+
+    def test_normalized_plan_preserves_frame_without_repair(self):
+        provider = ScriptedProvider([[
+            ProviderTextDelta('{"type":"turn_plan","primary_move":"invalid","supporting_moves":[],"response_goal":true,"confidence":"certain","reaction":null}\n{"type":"frame","text":"Still valid."}\n'),
+            ProviderStreamCompleted("stop"),
+        ]])
+
+        events = list(ConversationEngine(provider).respond_iter(self.request()))
+
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(events[0].plan.primary.value, "answer")
+        self.assertEqual(events[0].plan.confidence.value, "low")
+        self.assertEqual(events[1].frame.text, "Still valid.")
+        self.assertEqual(events[-1].result.usage.contract_repairs, 0)
+
+    def test_newline_and_final_buffer_records_have_identical_turn_event_order_and_source(self):
+        record = CANONICAL_PLAN + '{"type":"frame","text":"Buffered frame."}'
+        for suffix in ("\n", ""):
+            with self.subTest(trailing_newline=bool(suffix)):
+                provider = ScriptedProvider([[
+                    ProviderTextDelta(record + suffix),
+                    ProviderStreamCompleted("stop"),
+                ]])
+                with patch("tomo_core.conversation.engine.latency_trace.emit_sandbox") as emit:
+                    events = list(ConversationEngine(provider).respond_iter(self.request()))
+
+                self.assertEqual(
+                    [type(event) for event in events],
+                    [TurnRunStarted, FrameReady, TurnRunCompleted],
+                )
+                self.assertEqual(events[1].frame.text, "Buffered frame.")
+                resolved = [call for call in emit.call_args_list if call.args[0] == "sandbox_provider_move_plan_validated"]
+                self.assertEqual(len(resolved), 1)
+                self.assertEqual(resolved[0].kwargs["plan_model"], 1)
+
+    def test_plan_resolution_emits_one_source_count(self):
+        attempts = (
+            (CANONICAL_PLAN, "plan_model"),
+            ('{"type":"turn_plan","primary_move":"invalid","supporting_moves":[],"response_goal":"answer","confidence":"low","reaction":null}\n', "plan_normalized"),
+            ('', "plan_synthesized"),
+        )
+        for plan_record, expected_count in attempts:
+            with self.subTest(expected_count=expected_count):
+                provider = ScriptedProvider([[
+                    ProviderTextDelta(plan_record + '{"type":"frame","text":"Resolved."}\n'),
+                    ProviderStreamCompleted("stop"),
+                ]])
+                with patch("tomo_core.conversation.engine.latency_trace.emit_sandbox") as emit:
+                    ConversationEngine(provider).respond(self.request())
+
+                resolved = [call for call in emit.call_args_list if call.args[0] == "sandbox_provider_move_plan_validated"]
+                self.assertEqual(len(resolved), 1)
+                self.assertEqual({name: value for name, value in resolved[0].kwargs.items() if name.startswith("plan_")}, {expected_count: 1})
+
+    def test_memory_control_before_plan_starts_turn_before_control_and_frame(self):
+        provider = ScriptedProvider([[
+            ProviderTextDelta('{"type":"memory_control","action":"set_owner_setting","setting":"capture_enabled","enabled":true,"user_intent_excerpt":"remember this"}\n{"type":"frame","text":"Noted."}\n'),
+            ProviderStreamCompleted("stop"),
+        ]])
+
+        events = list(ConversationEngine(provider).respond_iter(self.request()))
+
+        self.assertEqual([type(event) for event in events], [TurnRunStarted, MemoryControlReady, FrameReady, TurnRunCompleted])
+
+    def test_tool_only_first_segment_synthesizes_tool_plan_before_execution(self):
+        from tomo_core.tools import BoundTool, ToolRegistry, ToolSpec
+
+        executed = []
+        provider = ScriptedProvider([
+            [ProviderToolCallReady("call-1", "search", "{}"), ProviderStreamCompleted("tool_calls")],
+            [ProviderTextDelta('{"type":"frame","text":"Grounded answer."}\n'), ProviderStreamCompleted("stop")],
+        ])
+        registry = ToolRegistry((BoundTool(ToolSpec("search", "search", {"type": "object", "properties": {}}), lambda arguments: executed.append(arguments) or "found"),))
+
+        events = list(ConversationEngine(provider, tool_registry=registry).respond_iter(self.request()))
+
+        self.assertEqual([type(event) for event in events], [TurnRunStarted, FrameReady, TurnRunCompleted])
+        self.assertEqual(events[0].plan.primary.value, "act")
+        self.assertEqual(tuple(move.value for move in events[0].plan.supporting), ("answer",))
+        self.assertEqual(executed, [{}])
+        self.assertEqual(events[1].frame.text, "Grounded answer.")
+        self.assertEqual(events[-1].result.usage.contract_repairs, 0)
+
+    def test_planless_tool_preflight_resolves_registry_once_before_synthesis(self):
+        from tomo_core.tools import BoundTool, ToolRegistry, ToolSpec
+
+        class CountingRegistry(ToolRegistry):
+            def __init__(self, tools):
+                super().__init__(tools)
+                self.resolve_calls = 0
+
+            def resolve(self, name):
+                self.resolve_calls += 1
+                return super().resolve(name)
+
+        provider = ScriptedProvider([
+            [ProviderToolCallReady("call-1", "search", "{}"), ProviderStreamCompleted("tool_calls")],
+            [ProviderTextDelta('{"type":"frame","text":"Grounded answer."}\n'), ProviderStreamCompleted("stop")],
+        ])
+        registry = CountingRegistry((BoundTool(ToolSpec("search", "search", {"type": "object", "properties": {}}), lambda _: "found"),))
+
+        result = ConversationEngine(provider, tool_registry=registry).respond(self.request())
+
+        self.assertEqual(registry.resolve_calls, 1)
+        self.assertEqual(result.frames[0].text, "Grounded answer.")
+
+    def test_invalid_planless_tool_call_does_not_start_turn_or_synthesize_plan(self):
+        from tomo_core.tools import BoundTool, ToolRegistry, ToolSpec
+
+        executed = []
+        provider = ScriptedProvider([
+            [ProviderToolCallReady("call-1", "search", "not-json"), ProviderStreamCompleted("tool_calls")],
+            [ProviderToolCallReady("call-2", "search", "not-json"), ProviderStreamCompleted("tool_calls")],
+        ])
+        registry = ToolRegistry((BoundTool(ToolSpec("search", "search", {"type": "object", "properties": {}}), lambda _: executed.append(True)),))
+        events = []
+
+        with patch("tomo_core.conversation.engine.latency_trace.emit_sandbox") as emit:
+            iterator = ConversationEngine(provider, tool_registry=registry).respond_iter(self.request())
+            with self.assertRaises(ConversationOutputError):
+                while True:
+                    events.append(next(iterator))
+
+        self.assertEqual(events, [])
+        self.assertEqual(len(provider.calls), 2)
+        self.assertEqual(executed, [])
+        self.assertFalse(any(isinstance(event, TurnRunStarted) for event in events))
+        self.assertEqual(
+            [call for call in emit.call_args_list if call.args[0] == "sandbox_provider_move_plan_validated" and "plan_synthesized" in call.kwargs],
+            [],
+        )
+
     def test_invalid_output_before_a_frame_uses_one_replacement_stream_and_keeps_plan(self):
         provider = ScriptedProvider([
             [ProviderTextDelta(PLAN + "not json\n")],
@@ -156,6 +299,10 @@ class ConversationEngineTests(unittest.TestCase):
             ],
         )
         self.assertNotEqual(provider_calls[-2].kwargs["elapsed_ms"], provider_calls[-1].kwargs["elapsed_ms"])
+        self.assertEqual(
+            {name: value for name, value in provider_calls[2].kwargs.items() if name.startswith("plan_")},
+            {"plan_normalized": 1},
+        )
         self.assertEqual(provider_calls[-1].kwargs["suspended_ms"], 750)
         self.assertEqual(provider_calls[-1].kwargs["active_ms"], 250)
         self.assertEqual(provider_calls[-1].kwargs["input_tokens"], 12)
@@ -220,9 +367,9 @@ class ConversationEngineTests(unittest.TestCase):
         registry = ToolRegistry((BoundTool(ToolSpec("search", "search", {"type": "object", "properties": {}}), lambda _: "result"),))
 
         class AdvancingExecutor(ToolExecutor):
-            def execute_batch(self, *args, **kwargs):
+            def execute_prepared_batch(self, *args, **kwargs):
                 clock[0] += 10
-                return super().execute_batch(*args, **kwargs)
+                return super().execute_prepared_batch(*args, **kwargs)
 
         with patch("tomo_core.conversation.engine.latency_trace.emit_sandbox") as emit:
             iterator = ConversationEngine(provider, tool_registry=registry, tool_executor=AdvancingExecutor(registry), monotonic_clock=lambda: clock[0]).respond_iter(self.request())
@@ -246,7 +393,7 @@ class ConversationEngineTests(unittest.TestCase):
         from tomo_core.tools import BoundTool, ToolRegistry, ToolSpec
 
         class ExplodingExecutor(ToolExecutor):
-            def execute_batch(self, *args, **kwargs):
+            def execute_prepared_batch(self, *args, **kwargs):
                 raise RuntimeError("private executor failure")
 
         registry = ToolRegistry((BoundTool(ToolSpec("search", "search", {"type": "object", "properties": {}}), lambda _: "result"),))
@@ -266,9 +413,9 @@ class ConversationEngineTests(unittest.TestCase):
         clock = [0.0]
 
         class AdvancingExecutor(ToolExecutor):
-            def execute_batch(self, *args, **kwargs):
+            def execute_prepared_batch(self, *args, **kwargs):
                 clock[0] += 10
-                return super().execute_batch(*args, **kwargs)
+                return super().execute_prepared_batch(*args, **kwargs)
 
         registry = ToolRegistry((BoundTool(ToolSpec("search", "search", {"type": "object", "properties": {}}), lambda _: "result"),))
         provider = ScriptedProvider([
@@ -330,23 +477,40 @@ class ConversationEngineTests(unittest.TestCase):
         self.assertEqual(len(provider.calls), 2)
         self.assertTrue(all(call[1] == () for call in provider.calls))
 
-    def test_planless_native_tool_attempt_gets_explicit_tool_free_plan_repair(self):
+    def test_empty_stop_and_malformed_json_still_use_one_repair(self):
+        for first_attempt, repair_code in (
+            ([ProviderStreamCompleted("stop")], "missing_frame"),
+            ([ProviderTextDelta("not json\n"), ProviderStreamCompleted("stop")], "invalid_json"),
+        ):
+            with self.subTest(repair_code=repair_code):
+                provider = ScriptedProvider([
+                    first_attempt,
+                    [ProviderTextDelta(CANONICAL_PLAN + '{"type":"frame","text":"Recovered answer."}\n'), ProviderStreamCompleted("stop")],
+                ])
+
+                result = ConversationEngine(provider).respond(self.request())
+
+                self.assertEqual(result.frames[0].text, "Recovered answer.")
+                self.assertEqual(result.usage.contract_repairs, 1)
+                self.assertEqual(len(provider.calls), 2)
+                self.assertIn(repair_code, provider.calls[1][0][0]["content"])
+
+    def test_planless_native_tool_attempt_synthesizes_only_when_available(self):
         from tomo_core.tools import BoundTool, ToolRegistry, ToolSpec
 
+        executed = []
         provider = ScriptedProvider([
             [ProviderToolCallReady("call-1", "search", "{}"), ProviderStreamCompleted("tool_calls")],
-            [ProviderTextDelta(PLAN + '{"type":"frame","text":"Recovered answer."}\n'), ProviderStreamCompleted("stop")],
+            [ProviderTextDelta('{"type":"frame","text":"Recovered answer."}\n'), ProviderStreamCompleted("stop")],
         ])
-        registry = ToolRegistry((BoundTool(ToolSpec("search", "search", {"type": "object", "properties": {}}), lambda _: "found"),))
+        registry = ToolRegistry((BoundTool(ToolSpec("search", "search", {"type": "object", "properties": {}}), lambda _: executed.append(True) or "found"),))
 
         result = ConversationEngine(provider, tool_registry=registry).respond(self.request())
 
         self.assertEqual(result.frames[0].text, "Recovered answer.")
         self.assertNotEqual(provider.calls[0][1], ())
-        self.assertEqual(provider.calls[1][1], ())
-        repair_instruction = provider.calls[1][0][-1]["content"]
-        self.assertIn("missing_plan", repair_instruction)
-        self.assertIn("begin with exactly one turn_plan", repair_instruction)
+        self.assertNotEqual(provider.calls[1][1], ())
+        self.assertEqual(executed, [True])
 
     def test_setup_guidance_bypasses_structured_parsing(self):
         provider = ScriptedProvider([ProviderSetupRequired("use /connect first.")])
@@ -409,10 +573,10 @@ class ConversationEngineTests(unittest.TestCase):
                 super().__init__(tool_registry)
                 self.calls = 0
 
-            def execute_batch(self, *args, **kwargs):
+            def execute_prepared_batch(self, *args, **kwargs):
                 self.calls += 1
                 if self.calls == 1:
-                    return super().execute_batch(*args, **kwargs)
+                    return super().execute_prepared_batch(*args, **kwargs)
                 raise RuntimeError("executor infrastructure secret")
 
         tool_registry = ToolRegistry((BoundTool(ToolSpec("search", "search", {"type": "object", "properties": {}}), lambda _: "found"),))

@@ -84,6 +84,22 @@ separately counted contract-repair generation is allowed only when malformed
 first-segment output yielded neither a deliverable frame nor a tool call; once
 a frame is visible, malformed remainder completes as grounded partial output.
 
+The model-facing plan is requested but advisory. The runtime always resolves a
+MovePlan before exposing dependent TurnRun events: it preserves a canonical
+model plan, normalizes harmless plan-field drift, synthesizes a direct-answer
+plan when a Frame or memory control arrives first, or synthesizes an
+`act`-then-`answer` plan after a planless native tool batch passes strict
+preflight validation. A synthesized plan never guesses a reaction.
+
+| Layer | Contract |
+| --- | --- |
+| Model-facing plan | SHOULD emit one canonical `turn_plan`; the runtime derives move order rather than accepting a model-authored sequence |
+| Runtime plan | Required internally and classified as model-owned, normalized, or synthesized |
+| Frames | Strict JSONL records with count, sentence, character, and style limits |
+| Memory controls | Strict schema plus runtime governance; plan resolution grants no authority |
+| Native tools | Strict availability, schema, budget, confirmation, preflight, and generation fencing |
+| Malformed stream | Repair or fail; never recover records heuristically from prose or invalid JSON |
+
 ## progressive Telegram turns
 
 Telegram normal text uses an `InputBurst` rather than a flattened message. A burst contains ordered `msg_n` items with update IDs, Telegram message IDs, timestamps, and exact user text. The prompt renderer serializes those items as a deterministic user-role JSON payload, so text that looks like labels or JSON remains untrusted user content. Host-confirmed visible assistant partials are appended as assistant-role context, never interpolated into system text.

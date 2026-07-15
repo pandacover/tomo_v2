@@ -11,6 +11,7 @@ from ..providers import ProviderAdapter, ProviderSetupRequired, ProviderStreamCo
 from ..tool_execution import ToolBatchCancelled, ToolBatchValidationError, ToolExecutor
 from ..tools import ToolRegistry
 from .. import latency_trace
+from .contract import PlanSource, synthesized_tool_plan
 from .framing import SegmentFrameParser
 from .models import ConversationRequest, Frame, FrameReady, MemoryControlReady, MovePlan, ReactionWindowReady, SegmentFinish, SegmentResult, TurnBudget, TurnRunCompleted, TurnRunEvent, TurnRunResult, TurnRunStarted, TurnRunStatus, TurnUsage
 from .parsing import ConversationOutputError
@@ -171,15 +172,23 @@ class ConversationEngine:
                                 counts["reasoning_tokens"] = terminal.reasoning_tokens
                     return counts
 
-                def emit_provider_stage(phase: str, *, include_completion: bool = False) -> None:
+                def emit_provider_stage(phase: str, *, include_completion: bool = False, **stage_counts: int) -> None:
                     if phase in emitted_stages:
                         return
+                    counts = provider_counts(include_completion=include_completion)
+                    counts.update(stage_counts)
                     latency_trace.emit_sandbox(
                         phase,
                         elapsed_ms=max(0, int((self.monotonic_clock() - attempt_started_at) * 1000)),
-                        **provider_counts(include_completion=include_completion),
+                        **counts,
                     )
                     emitted_stages.add(phase)
+
+                def emit_plan_validated(source: PlanSource) -> None:
+                    emit_provider_stage(
+                        "sandbox_provider_move_plan_validated",
+                        **{f"plan_{source.value}": 1},
+                    )
 
                 def yield_provider_event(event: TurnRunEvent) -> Iterator[TurnRunEvent]:
                     nonlocal suspended_seconds
@@ -188,6 +197,49 @@ class ConversationEngine:
                         yield event
                     finally:
                         suspended_seconds += max(0.0, self.monotonic_clock() - suspended_at)
+
+                def handle_record(record: object) -> Iterator[TurnRunEvent]:
+                    nonlocal first_frame_chars, failure, plan, reaction_window_emitted
+                    if isinstance(record, MovePlan):
+                        if expired():
+                            failure = ConversationOutputError("elapsed_budget_exhausted")
+                            return
+                        if plan is not None and record != plan:
+                            raise ConversationOutputError("conflicting_plan")
+                        plan = record
+                        assert parser.plan_source is not None
+                        emit_plan_validated(parser.plan_source)
+                        if not is_active():
+                            return
+                        yield from yield_provider_event(TurnRunStarted(plan))
+                    elif not isinstance(record, Frame):
+                        if sum(len(segment.memory_controls) for segment in segments) + len(segment_memory_controls) >= 8:
+                            raise ConversationOutputError("memory_control_turn_limit")
+                        segment_memory_controls.append(record)
+                        if not is_active():
+                            return
+                        yield from yield_provider_event(MemoryControlReady(index, record, tuple(sorted(tool_observation_ids))))
+                    else:
+                        if len(frames) >= 3:
+                            raise ConversationOutputError("frame_limit")
+                        if (not segment_frames and sum(bool(s.frames) for s in segments) >= self.budget.max_visible_segments):
+                            raise ConversationOutputError("visible_segment_limit")
+                        if expired():
+                            failure = ConversationOutputError("elapsed_budget_exhausted")
+                            return
+                        segment_frames.append(record)
+                        frames.append(record)
+                        if first_frame_chars is None:
+                            first_frame_chars = len(record.text)
+                        emit_provider_stage("sandbox_provider_first_frame_validated", include_completion=True)
+                        if index == 0 and plan is not None and plan.reaction is not None and not reaction_window_emitted:
+                            reaction_window_emitted = True
+                            if not is_active():
+                                return
+                            yield from yield_provider_event(ReactionWindowReady())
+                        if not is_active():
+                            return
+                        yield from yield_provider_event(FrameReady(len(frames) - 1, record))
 
                 emit_provider_stage("sandbox_provider_attempt_start")
 
@@ -248,45 +300,9 @@ class ConversationEngine:
                                     if first_frame_chars is None:
                                         output_chars_through_first_frame += len(chunk)
                                     for record in parser.feed(chunk):
-                                        if isinstance(record, MovePlan):
-                                            if expired():
-                                                failure = ConversationOutputError("elapsed_budget_exhausted")
-                                                break
-                                            if plan is not None and record != plan:
-                                                raise ConversationOutputError("conflicting_plan")
-                                            plan = record
-                                            emit_provider_stage("sandbox_provider_move_plan_validated")
-                                            if not is_active():
-                                                return
-                                            yield from yield_provider_event(TurnRunStarted(plan))
-                                        elif not isinstance(record, Frame):
-                                            if sum(len(segment.memory_controls) for segment in segments) + len(segment_memory_controls) >= 8:
-                                                raise ConversationOutputError("memory_control_turn_limit")
-                                            segment_memory_controls.append(record)
-                                            if not is_active():
-                                                return
-                                            yield from yield_provider_event(MemoryControlReady(index, record, tuple(sorted(tool_observation_ids))))
-                                        else:
-                                            if len(frames) >= 3:
-                                                raise ConversationOutputError("frame_limit")
-                                            if (not segment_frames and sum(bool(s.frames) for s in segments) >= self.budget.max_visible_segments):
-                                                raise ConversationOutputError("visible_segment_limit")
-                                            if expired():
-                                                failure = ConversationOutputError("elapsed_budget_exhausted")
-                                                break
-                                            segment_frames.append(record)
-                                            frames.append(record)
-                                            if first_frame_chars is None:
-                                                first_frame_chars = len(record.text)
-                                            emit_provider_stage("sandbox_provider_first_frame_validated", include_completion=True)
-                                            if index == 0 and plan is not None and plan.reaction is not None and not reaction_window_emitted:
-                                                reaction_window_emitted = True
-                                                if not is_active():
-                                                    return
-                                                yield from yield_provider_event(ReactionWindowReady())
-                                            if not is_active():
-                                                return
-                                            yield from yield_provider_event(FrameReady(len(frames) - 1, record))
+                                        yield from handle_record(record)
+                                        if failure is not None:
+                                            break
                             elif isinstance(event, ProviderToolCallReady):
                                 native_calls.append(event)
                             elif isinstance(event, ProviderStreamCompleted):
@@ -322,39 +338,7 @@ class ConversationEngine:
                                 return
                             if expired():
                                 raise ConversationOutputError("elapsed_budget_exhausted")
-                            if isinstance(record, MovePlan):
-                                if plan is not None and record != plan:
-                                    raise ConversationOutputError("conflicting_plan")
-                                plan = record
-                                emit_provider_stage("sandbox_provider_move_plan_validated")
-                                if not is_active():
-                                    return
-                                yield from yield_provider_event(TurnRunStarted(plan))
-                            elif not isinstance(record, Frame):
-                                if sum(len(segment.memory_controls) for segment in segments) + len(segment_memory_controls) >= 8:
-                                    raise ConversationOutputError("memory_control_turn_limit")
-                                segment_memory_controls.append(record)
-                                if not is_active():
-                                    return
-                                yield from yield_provider_event(MemoryControlReady(index, record, tuple(sorted(tool_observation_ids))))
-                            else:
-                                if len(frames) >= 3:
-                                    raise ConversationOutputError("frame_limit")
-                                if (not segment_frames and sum(bool(s.frames) for s in segments) >= self.budget.max_visible_segments):
-                                    raise ConversationOutputError("visible_segment_limit")
-                                segment_frames.append(record)
-                                frames.append(record)
-                                if first_frame_chars is None:
-                                    first_frame_chars = len(record.text)
-                                emit_provider_stage("sandbox_provider_first_frame_validated", include_completion=True)
-                                if index == 0 and plan is not None and plan.reaction is not None and not reaction_window_emitted:
-                                    reaction_window_emitted = True
-                                    if not is_active():
-                                        return
-                                    yield from yield_provider_event(ReactionWindowReady())
-                                if not is_active():
-                                    return
-                                yield from yield_provider_event(FrameReady(len(frames) - 1, record))
+                            yield from handle_record(record)
                     except ConversationOutputError as error:
                         failure = error
                 tool_finish = terminal is not None and terminal.finish_reason == "tool_calls"
@@ -365,6 +349,23 @@ class ConversationEngine:
                 if failure is None and tool_finish and len(segment_frames) > 1:
                     failure = ConversationOutputError("tool_frame_limit")
                 if failure is None and tool_finish:
+                    prepared_calls = ()
+                    prior_call_ids = {call.call_id for segment in segments for call in segment.tool_calls}
+                    if any(call.call_id in prior_call_ids for call in native_calls):
+                        failure = ConversationOutputError("duplicate_tool_call_id")
+                    else:
+                        try:
+                            prepared_calls = self.tool_executor.prepare_batch(native_calls, self.budget.max_tool_calls - sum(len(s.tool_calls) for s in segments))
+                        except ToolBatchValidationError as error:
+                            failure = ConversationOutputError(error.code)
+                if failure is None and tool_finish:
+                    if index == 0 and plan is None:
+                        resolution = synthesized_tool_plan()
+                        plan = resolution.plan
+                        emit_plan_validated(resolution.source)
+                        if not is_active():
+                            return
+                        yield from yield_provider_event(TurnRunStarted(plan))
                     if index == 0 and plan is not None and plan.reaction is not None and not reaction_window_emitted:
                         reaction_window_emitted = True
                         yield from yield_provider_event(ReactionWindowReady())
@@ -375,43 +376,39 @@ class ConversationEngine:
                     elif len(segment_frames) > 1:
                         failure = ConversationOutputError("tool_frame_limit")
                 if failure is None and tool_finish:
-                    prior_call_ids = {call.call_id for segment in segments for call in segment.tool_calls}
-                    if any(call.call_id in prior_call_ids for call in native_calls):
-                        failure = ConversationOutputError("duplicate_tool_call_id")
+                    emit_provider_attempt("ok")
+                    try:
+                        tool_started_at = self.monotonic_clock()
+                        batch = self.tool_executor.execute_prepared_batch(prepared_calls, is_active)
+                    except ToolBatchCancelled:
+                        if is_active():
+                            latency_trace.emit_sandbox("sandbox_tool_batch", outcome="error", elapsed_ms=max(0, int((self.monotonic_clock() - tool_started_at) * 1000)), segment=index, repair=repairs)
+                        return
+                    except ToolBatchValidationError as error:
+                        if is_active():
+                            latency_trace.emit_sandbox("sandbox_tool_batch", outcome="error", elapsed_ms=max(0, int((self.monotonic_clock() - tool_started_at) * 1000)), segment=index, repair=repairs)
+                        failure = ConversationOutputError(error.code)
+                    except Exception:
+                        if is_active():
+                            latency_trace.emit_sandbox("sandbox_tool_batch", outcome="error", elapsed_ms=max(0, int((self.monotonic_clock() - tool_started_at) * 1000)), segment=index, repair=repairs)
+                        failure = ConversationOutputError("tool_executor_failure")
                     else:
-                        emit_provider_attempt("ok")
-                        try:
-                            tool_started_at = self.monotonic_clock()
-                            batch = self.tool_executor.execute_batch(native_calls, self.budget.max_tool_calls - sum(len(s.tool_calls) for s in segments), is_active)
-                        except ToolBatchCancelled:
-                            if is_active():
-                                latency_trace.emit_sandbox("sandbox_tool_batch", outcome="error", elapsed_ms=max(0, int((self.monotonic_clock() - tool_started_at) * 1000)), segment=index, repair=repairs)
+                        if is_active():
+                            # A batch is all tools in one model segment, never individual tools.
+                            latency_trace.emit_sandbox("sandbox_tool_batch", elapsed_ms=max(0, int((self.monotonic_clock() - tool_started_at) * 1000)), segment=index, repair=repairs)
+                        segments.append(SegmentResult(index, tuple(segment_frames), batch.tool_calls, SegmentFinish.TOOL_BATCH, tuple(segment_memory_controls)))
+                        prior_messages.append(_assistant_continuation("".join(raw) or None, batch.tool_calls))
+                        prior_messages.extend(_tool_continuation(observation) for observation in batch.observations)
+                        tool_observation_ids.update(observation.call_id for observation in batch.observations)
+                        if not is_active():
                             return
-                        except ToolBatchValidationError as error:
-                            if is_active():
-                                latency_trace.emit_sandbox("sandbox_tool_batch", outcome="error", elapsed_ms=max(0, int((self.monotonic_clock() - tool_started_at) * 1000)), segment=index, repair=repairs)
-                            failure = ConversationOutputError(error.code)
-                        except Exception:
-                            if is_active():
-                                latency_trace.emit_sandbox("sandbox_tool_batch", outcome="error", elapsed_ms=max(0, int((self.monotonic_clock() - tool_started_at) * 1000)), segment=index, repair=repairs)
-                            failure = ConversationOutputError("tool_executor_failure")
-                        else:
-                            if is_active():
-                                # A batch is all tools in one model segment, never individual tools.
-                                latency_trace.emit_sandbox("sandbox_tool_batch", elapsed_ms=max(0, int((self.monotonic_clock() - tool_started_at) * 1000)), segment=index, repair=repairs)
-                            segments.append(SegmentResult(index, tuple(segment_frames), batch.tool_calls, SegmentFinish.TOOL_BATCH, tuple(segment_memory_controls)))
-                            prior_messages.append(_assistant_continuation("".join(raw) or None, batch.tool_calls))
-                            prior_messages.extend(_tool_continuation(observation) for observation in batch.observations)
-                            tool_observation_ids.update(observation.call_id for observation in batch.observations)
-                            if not is_active():
+                        if expired():
+                            if frames:
+                                yield completed(TurnRunStatus.COMPLETED_PARTIAL)
                                 return
-                            if expired():
-                                if frames:
-                                    yield completed(TurnRunStatus.COMPLETED_PARTIAL)
-                                    return
-                                raise ConversationOutputError("elapsed_budget_exhausted")
-                            index += 1
-                            break
+                            raise ConversationOutputError("elapsed_budget_exhausted")
+                        index += 1
+                        break
                 if failure is None and (plan is None or not segment_frames):
                     failure = ConversationOutputError("missing_frame")
                 # Finalize after parsing and contract validation, before any tool work.

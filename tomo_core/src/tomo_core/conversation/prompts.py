@@ -6,7 +6,8 @@ from collections.abc import Mapping, Sequence
 from ..context import ContextSnapshot
 from ..models import InboundEnvelope, InputBurst
 from ..skills import render_capability_skill_index
-from .models import ConversationMove, ConversationRequest, MovePlan, REACTION_EMOJI_OPTIONS, TurnBudget
+from .contract import render_first_segment_contract, render_later_segment_contract
+from .models import ConversationMove, ConversationRequest, MovePlan, TurnBudget
 from .moves import render_move_procedures
 
 
@@ -62,15 +63,19 @@ def build_segment_repair_messages(
     """Build a replacement segment that retains an already validated turn plan."""
     messages = build_segment_messages(request, context, budget, segment_index=1, plan=plan, prior_messages=prior_messages)
     frame_count = _frame_count_phrase(budget.max_frames_per_segment)
-    messages.append(
-        {
-            "role": "system",
-            "content": (
-                f"the previous segment violated the JSONL contract: {safe_code}.\n"
-                f"replace it with {frame_count} frame JSONL records only. preserve the fixed turn plan exactly. "
-                "do not emit a turn_plan, native tool call, explanation, markdown, or any text outside JSONL records."
-            ),
-        }
+    _prepend_repair_instruction(
+        messages,
+        render_later_segment_contract(
+            max_frames=budget.max_frames_per_segment,
+            max_sentences=budget.max_sentences_per_frame,
+            max_chars=budget.max_chars_per_frame,
+            native_tools_available=False,
+        ),
+        (
+            f"the previous segment violated the JSONL contract: {safe_code}. "
+            f"replace it with {frame_count} frame records only. preserve the fixed turn plan exactly. "
+            "do not emit a turn_plan or native tool call."
+        ),
     )
     return messages
 
@@ -91,24 +96,24 @@ def build_first_segment_repair_messages(
         prior_messages=prior_messages,
         tools_available=(),
     )
-    frame_count = _frame_count_phrase(budget.max_frames_per_segment)
-    messages.append(
-        {
-            "role": "system",
-            "content": (
-                f"the previous segment violated the JSONL contract: {safe_code}.\n"
-                "replace the entire segment. begin with exactly one turn_plan JSONL record, then emit "
-                f"{frame_count} frame JSONL records. native tools are disabled for this repair. "
-                "do not emit a native tool call, explanation, markdown, or any text outside JSONL records."
-            ),
-        }
+    _prepend_repair_instruction(
+        messages,
+        render_first_segment_contract(
+            max_frames=budget.max_frames_per_segment,
+            max_sentences=budget.max_sentences_per_frame,
+            max_chars=budget.max_chars_per_frame,
+            native_tools_available=False,
+        ),
+        (
+            f"the previous segment violated the JSONL contract: {safe_code}. "
+            "replace the entire segment with a canonical turn_plan plus mandatory frame records. "
+            "native tools are disabled for this repair."
+        ),
     )
     return messages
 
 
 def _first_segment_system(soul: str, budget: TurnBudget, tool_schemas: tuple[dict[str, object], ...]) -> str:
-    frame_count = _frame_count_phrase(budget.max_frames_per_segment)
-    reaction_options = json.dumps(REACTION_EMOJI_OPTIONS, ensure_ascii=False, separators=(",", ":"))
     tool_guidance = (
         "batch independent related native tool calls in one assistant response. tool announcements are optional social output, never execution telemetry; do not add redundant completion messages."
         if tool_schemas
@@ -116,50 +121,57 @@ def _first_segment_system(soul: str, budget: TurnBudget, tool_schemas: tuple[dic
     )
     return (
         "you are tomo. follow the supplied SOUL completely.\n"
-        "produce JSON Lines only. emit one JSON object per physical line, with no code fences, backticks, or prose outside records.\n"
-        f"generate exactly one internal turn_plan JSONL record before any frame record; after that plan and before frames, emit zero to five memory_control records. then zero to {_frame_count_limit(budget.max_frames_per_segment)} frame JSONL records.\n"
-        '{"type":"turn_plan","primary_move":"answer","supporting_moves":[],"move_sequence":["answer"],"response_goal":"...","confidence":"low","reaction":null}\n'
-        '{"type":"frame","text":"..."}\n'
         "memory_control records are optional and internal. follow the indexed memory skill when emitting them.\n"
-        f"the turn_plan fields are primary_move, supporting_moves, response_goal, confidence, and reaction. reaction must be exactly one of {reaction_options} or null. use it very sparsely; use null for commands, auth, errors, routine acknowledgements, ambiguity, corrections, opt-outs, serious, sensitive, or distressing content. never mention reactions to the user. moves are turn-level purposes, never frame or bubble sections; MovePlan does not determine frame count.\n"
-        f"ordinary completion uses {frame_count} frames. when making native tool calls, emit zero or one useful pre-tool frame.\n"
-        f"target one to two sentences per frame and no more than {frame_count} frames this segment. hard runtime limits: "
-        f"at most {budget.max_frames_per_segment} frames per segment, {budget.max_sentences_per_frame} sentences per frame, and {budget.max_chars_per_frame} characters per frame.\n"
+        "use reactions very sparsely; use null for commands, auth, errors, routine acknowledgements, ambiguity, corrections, opt-outs, serious, sensitive, or distressing content. never mention reactions to the user. moves are turn-level purposes, never frame or bubble sections; MovePlan does not determine frame count.\n"
         "never use markdown, internal labels, em dashes, or en dashes in frame text. never claim an action happened without a supplied observation.\n"
         f"{tool_guidance}\n"
         "do not offer mutation, booking, purchase, send, delete, or other side-effect capabilities unless an exposed bound tool and confirmation path exist.\n"
         f"allowed native tool schemas: {json.dumps(tool_schemas, ensure_ascii=False, separators=(',', ':'))}\n\n"
         f"{render_capability_skill_index()}\n\n"
         f"<TOMO_SOUL>\n{soul}\n</TOMO_SOUL>\n\n"
-        f"move planning vocabulary:\n{render_move_procedures(tuple(ConversationMove))}"
+        f"move planning vocabulary:\n{render_move_procedures(tuple(ConversationMove))}\n\n"
+        + render_first_segment_contract(
+            max_frames=budget.max_frames_per_segment,
+            max_sentences=budget.max_sentences_per_frame,
+            max_chars=budget.max_chars_per_frame,
+            native_tools_available=bool(tool_schemas),
+        )
     )
 
 
 def _later_segment_system(soul: str, budget: TurnBudget, plan: MovePlan, tool_schemas: tuple[dict[str, object], ...]) -> str:
     supporting = ",".join(move.value for move in plan.supporting) or "none"
-    frame_count = _frame_count_phrase(budget.max_frames_per_segment)
     completion_guidance = (
-        f"either make another native tool round with zero or one useful pre-tool frame, or complete with {frame_count} final frames."
+        "either make another native tool round or complete with final frames."
         if tool_schemas
-        else f"native tools are unavailable. do not call tools. complete with {frame_count} final frame JSONL records."
+        else "native tools are unavailable. do not call tools. complete with final frame records."
     )
     return (
         "you are tomo. follow the supplied SOUL completely.\n"
-        "produce JSON Lines only. emit one JSON object per physical line, with no code fences, backticks, or prose outside records. do not emit a turn_plan record; reuse the fixed turn plan. emit zero to five optional internal memory_control records before any frame record.\n"
-        '{"type":"frame","text":"..."}\n'
         "memory_control records are optional and internal. follow the indexed memory skill when emitting them.\n"
-        f"fixed turn plan: primary_move={plan.primary.value}; supporting_moves={supporting}; confidence={plan.confidence.value}.\n"
         f"{completion_guidance}\n"
         "original request and conversation history remain valid context for final frames. claims about tool outcomes or actions must be grounded in supplied tool observations.\n"
-        "target one to two sentences per frame. hard runtime limits: "
-        f"at most {budget.max_frames_per_segment} frames per segment, {budget.max_sentences_per_frame} sentences per frame, and {budget.max_chars_per_frame} characters per frame.\n"
         "never use markdown, internal labels, em dashes, or en dashes in frame text. never claim an action happened without a supplied observation.\n"
         "tool announcements are optional social output, never execution telemetry.\n"
         "do not offer mutation, booking, purchase, send, delete, or other side-effect capabilities unless an exposed bound tool and confirmation path exist.\n"
         f"allowed native tool schemas: {json.dumps(tool_schemas, ensure_ascii=False, separators=(',', ':'))}\n\n"
         f"{render_capability_skill_index()}\n\n"
-        f"<TOMO_SOUL>\n{soul}\n</TOMO_SOUL>"
+        f"<TOMO_SOUL>\n{soul}\n</TOMO_SOUL>\n\n"
+        f"fixed turn plan: primary_move={plan.primary.value}; supporting_moves={supporting}; confidence={plan.confidence.value}.\n\n"
+        + render_later_segment_contract(
+            max_frames=budget.max_frames_per_segment,
+            max_sentences=budget.max_sentences_per_frame,
+            max_chars=budget.max_chars_per_frame,
+            native_tools_available=bool(tool_schemas),
+        )
     )
+
+
+def _prepend_repair_instruction(messages: list[dict[str, object]], contract: str, instruction: str) -> None:
+    system = messages[0]["content"]
+    if not isinstance(system, str) or not system.endswith(contract):
+        raise ValueError("repair prompt must end with its output contract")
+    messages[0]["content"] = f"{system.removesuffix(contract)}{instruction}\n\n{contract}"
 
 
 def _frame_count_limit(max_frames: int) -> str:

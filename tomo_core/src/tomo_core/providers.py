@@ -407,18 +407,18 @@ class StaticProvider:
         if tools:
             raise ValueError("static provider does not support tool calls")
         system_text = "\n".join(message["content"] for message in messages if message.get("role") == "system" and isinstance(message.get("content"), str))
-        if "generate exactly one internal turn_plan JSONL record" in system_text:
+        if "SHOULD emit one turn_plan before controls or frames" in system_text:
             plan = {
                 "type": "turn_plan",
                 "primary_move": "answer",
                 "supporting_moves": [],
-                "move_sequence": ["answer"],
                 "response_goal": "return the configured static smoke response",
                 "confidence": "high",
+                "reaction": None,
             }
             frame = {"type": "frame", "text": self.response}
             yield ProviderTextDelta("\n".join(json.dumps(record, separators=(",", ":")) for record in (plan, frame)))
-        elif "do not emit a turn_plan record; reuse the fixed turn plan" in system_text:
+        elif "do not emit a turn_plan; reuse the fixed turn plan" in system_text:
             yield ProviderTextDelta(json.dumps({"type": "frame", "text": self.response}, separators=(",", ":")))
         else:
             yield ProviderTextDelta(self.complete(messages, actor_id=actor_id))
@@ -427,7 +427,7 @@ class StaticProvider:
     def complete(self, messages: list[dict[str, str]], actor_id: str | None = None) -> str:
         system_text = "\n".join(message["content"] for message in messages if message.get("role") == "system")
         if '"primary_move"' in system_text and '"supporting_moves"' in system_text:
-            return json.dumps({"primary_move": "answer", "supporting_moves": [], "move_sequence": ["answer"], "response_goal": "return the configured static smoke response", "confidence": "high"})
+            return json.dumps({"primary_move": "answer", "supporting_moves": [], "response_goal": "return the configured static smoke response", "confidence": "high"})
         if '"utterance"' in system_text:
             return json.dumps({"utterance": self.response})
         if '"utterances"' in system_text:

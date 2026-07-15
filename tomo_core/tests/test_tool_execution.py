@@ -80,6 +80,31 @@ class ToolExecutionTests(unittest.TestCase):
             executor.execute_batch((ProviderToolCallReady("id", "known", "{}"),), 0, lambda: True)
         self.assertEqual(invoked, [])
 
+    def test_prepare_batch_validates_without_invoking_tools(self):
+        invoked = []
+        executor = ToolExecutor(_registry(_tool("known", lambda _: invoked.append(True))))
+
+        with self.assertRaisesRegex(ToolBatchValidationError, "invalid_tool_arguments"):
+            executor.prepare_batch((ProviderToolCallReady("id", "known", "not-json"),), 1)
+
+        self.assertEqual(invoked, [])
+
+    def test_execute_prepared_batch_uses_the_exact_preflight_result(self):
+        resolved = []
+
+        class CountingRegistry(ToolRegistry):
+            def resolve(self, name):
+                resolved.append(name)
+                return super().resolve(name)
+
+        executor = ToolExecutor(CountingRegistry((_tool("known", lambda _: "ok"),)))
+        prepared = executor.prepare_batch((ProviderToolCallReady("id", "known", "{}"),), 1)
+
+        result = executor.execute_prepared_batch(prepared, lambda: True)
+
+        self.assertEqual(resolved, ["known"])
+        self.assertEqual(result.observations[0].content, "ok")
+
     def test_batch_exceeding_remaining_budget_invokes_zero_tools(self):
         invoked = []
         executor = ToolExecutor(_registry(_tool("known", lambda _: invoked.append(True))))

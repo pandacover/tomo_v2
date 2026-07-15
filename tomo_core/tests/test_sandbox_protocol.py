@@ -280,7 +280,7 @@ class SandboxProtocolTests(unittest.TestCase):
             parse_result_marker(RESULT_MARKER + encode_error("request-7", "failed"), "request-7")
 
     def test_latency_markers_are_strict_and_do_not_change_event_sequences(self):
-        marker = SANDBOX_LATENCY_MARKER + "phase=sandbox_provider_attempt outcome=ok elapsed_ms=12 attempt=2 segment=1 repair=1"
+        marker = SANDBOX_LATENCY_MARKER + "phase=sandbox_provider_attempt outcome=ok elapsed_ms=12 attempt=2 segment=1 repair=1 plan_model=1 plan_normalized=0 plan_synthesized=0"
         received = []
         frame, completed = self._events()
         events = list(iter_event_markers([
@@ -289,11 +289,13 @@ class SandboxProtocolTests(unittest.TestCase):
             EVENT_MARKER + encode_event("request-7", "gen-1", 1, completed) + "\n",
         ], "request-7", "gen-1", on_latency=lambda *item: received.append(item)))
         self.assertEqual([type(event) for event in events], [SandboxFrameEvent, SandboxCompletedEvent])
-        self.assertEqual(received, [("sandbox_provider_attempt", "ok", 12, {"attempt": 2, "segment": 1, "repair": 1})])
+        self.assertEqual(received, [("sandbox_provider_attempt", "ok", 12, {"attempt": 2, "segment": 1, "repair": 1, "plan_model": 1, "plan_normalized": 0, "plan_synthesized": 0})])
         for payload in (
             "phase=sandbox_provider_attempt outcome=ok elapsed_ms=-1",
             "phase=sandbox_provider_attempt outcome=ok elapsed_ms=1 text=secret",
             "phase=sandbox_provider_attempt outcome=ok elapsed_ms=1 attempt=true",
+            "phase=sandbox_provider_attempt outcome=ok elapsed_ms=1 plan_model=true",
+            "phase=sandbox_provider_attempt outcome=ok elapsed_ms=1 plan_normalized=-1",
             "phase=dispatch_start outcome=ok elapsed_ms=1",
             "phase=sandbox_reconcile outcome=ok elapsed_ms=1",
         ):

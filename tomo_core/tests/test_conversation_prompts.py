@@ -3,7 +3,8 @@ import unittest
 
 from tomo_core.context import ContextHydrator
 from tomo_core.conversation.models import ConversationMove, ConversationRequest, MoveConfidence, MovePlan, TurnBudget
-from tomo_core.conversation.prompts import build_segment_messages, build_segment_repair_messages
+from tomo_core.conversation.contract import render_first_segment_contract, render_later_segment_contract
+from tomo_core.conversation.prompts import build_first_segment_repair_messages, build_segment_messages, build_segment_repair_messages
 from tomo_core.models import InboundEnvelope, InboundMessage, InputBurst
 
 
@@ -13,7 +14,7 @@ class ConversationPromptTests(unittest.TestCase):
         self.soul = "TOMO SOUL SENTINEL"
         self.history = ({"role": "user", "content": "i really need this job"},)
 
-    def test_first_segment_prompt_requests_one_internal_plan_then_bounded_frames(self):
+    def test_first_segment_prompt_ends_with_the_canonical_output_contract(self):
         request = self._request_with_burst()
         budget = TurnBudget(1, 0, 0, 1, 3, 3, 800)
         messages = build_segment_messages(
@@ -25,28 +26,29 @@ class ConversationPromptTests(unittest.TestCase):
         )
         system = messages[0]["content"]
 
-        self.assertIn('exactly one internal turn_plan JSONL record before any frame record', system)
-        self.assertIn("zero to three frame JSONL records", system)
-        self.assertIn('{"type":"turn_plan","primary_move":"answer","supporting_moves":[],"move_sequence":["answer"],"response_goal":"...","confidence":"low","reaction":null}', system)
-        self.assertIn('{"type":"frame","text":"..."}', system)
-        self.assertIn('reaction must be exactly one of ["👍","❤️","😂","🔥","🥰","👏","🤔","👀","🙏","🫡"] or null', system)
-        self.assertIn("zero to five memory_control records", system)
+        contract = render_first_segment_contract(
+            max_frames=3,
+            max_sentences=3,
+            max_chars=800,
+            native_tools_available=True,
+        )
+        self.assertTrue(system.endswith(contract))
+        self.assertIn("SHOULD emit one turn_plan before controls or frames", system)
+        self.assertNotIn("move_sequence", system)
         self.assertIn("follow the indexed memory skill when emitting them", system)
         self.assertIn("memory: skills/memory/SKILL.md", system)
         self.assertIn("<TOMO_MEMORY_SKILL>", system)
         self.assertIn("PERSONAL_MEMORY_DATA_UNTRUSTED", system)
-        self.assertIn("one JSON object per physical line, with no code fences, backticks, or prose outside records", system)
+        self.assertIn("one JSON object per physical line", system)
         self.assertNotIn("`", system)
         self.assertIn("turn-level purposes, never frame or bubble sections", system)
-        self.assertIn("target one to two sentences per frame and no more than one to three frames this segment", system)
-        self.assertIn("at most 3 frames per segment, 3 sentences per frame, and 800 characters per frame", system)
         self.assertIn("never claim an action happened without a supplied observation", system)
-        self.assertIn("zero or one useful pre-tool frame", system)
         self.assertIn("batch independent related native tool calls in one assistant response", system)
         self.assertIn("tool announcements are optional social output, never execution telemetry", system)
         self.assertIn("do not offer mutation, booking, purchase, send, delete, or other side-effect capabilities", system)
         self.assertIn('"name":"search"', system)
         self.assertIn("## answer", system)
+        self.assertLess(system.index("<TOMO_SOUL>"), system.index("move planning vocabulary:"))
         self.assertEqual(messages[-1], {"role": "user", "content": "latest user message"})
         self.assertEqual([message["role"] for message in messages], ["system", "user", "assistant", "assistant", "user"])
 
@@ -68,18 +70,25 @@ class ConversationPromptTests(unittest.TestCase):
         )
         system = messages[0]["content"]
 
+        contract = render_later_segment_contract(
+            max_frames=3,
+            max_sentences=3,
+            max_chars=800,
+            native_tools_available=False,
+        )
+        self.assertTrue(system.endswith(contract))
         self.assertIn("fixed turn plan", system)
         self.assertIn("primary_move=answer", system)
         self.assertIn("supporting_moves=reassure", system)
-        self.assertIn("do not emit a turn_plan record", system)
+        self.assertIn("do not emit a turn_plan", system)
         self.assertNotIn('{"type":"turn_plan"', system)
         self.assertNotIn("reaction must be exactly one of", system)
         self.assertIn('{"type":"frame","text":"..."}', system)
-        self.assertIn("optional internal memory_control records before any frame record", system)
+        self.assertIn("optional memory_control records before frame records", system)
         self.assertIn("memory: skills/memory/SKILL.md", system)
         self.assertIn("<TOMO_MEMORY_SKILL>", system)
         self.assertIn("Automatic Retrieval", system)
-        self.assertIn("one JSON object per physical line, with no code fences, backticks, or prose outside records", system)
+        self.assertIn("one JSON object per physical line", system)
         self.assertNotIn("`", system)
         self.assertIn("native tools are unavailable. do not call tools", system)
         self.assertIn("claims about tool outcomes or actions must be grounded in supplied tool observations", system)
@@ -117,9 +126,9 @@ class ConversationPromptTests(unittest.TestCase):
             plan=plan,
         )
 
-        self.assertIn("complete with one final frame", messages[0]["content"])
-        self.assertIn("at most 1 frames per segment", messages[0]["content"])
-        self.assertNotIn("one to three final frames", messages[0]["content"])
+        self.assertIn("ordinary completion requires 1 to 1 frame records", messages[0]["content"])
+        self.assertIn("3 sentences per frame", messages[0]["content"])
+        self.assertNotIn("1 to 3 frame records", messages[0]["content"])
 
     def test_reserved_final_segment_without_schemas_disallows_native_tools(self):
         request = self._request_with_burst()
@@ -133,7 +142,23 @@ class ConversationPromptTests(unittest.TestCase):
         self.assertIn("native tools are unavailable. do not call tools", first[0]["content"])
         self.assertIn("native tools are unavailable. do not call tools", final[0]["content"])
         self.assertNotIn("another native tool round", final[0]["content"])
-        self.assertIn("do not emit a turn_plan, native tool call", repair[-1]["content"])
+        self.assertIn("do not emit a turn_plan or native tool call", repair[0]["content"])
+
+    def test_repair_prompts_reuse_tool_free_contracts(self):
+        request = self._request_with_burst()
+        budget = TurnBudget(6, 5, 5, 3, 3, 3, 800)
+        fixed = build_segment_repair_messages(request, ContextHydrator().hydrate(request), budget, MovePlan.direct_answer(), "missing_frame")
+        no_plan = build_first_segment_repair_messages(request, ContextHydrator().hydrate(request), budget, "missing_frame")
+
+        self.assertIn("frame records only", fixed[0]["content"])
+        self.assertTrue(fixed[0]["content"].endswith(render_later_segment_contract(
+            max_frames=3, max_sentences=3, max_chars=800, native_tools_available=False,
+        )))
+        self.assertIn("canonical turn_plan plus mandatory frame records", no_plan[0]["content"])
+        self.assertIn("native tools are disabled for this repair", no_plan[0]["content"])
+        self.assertTrue(no_plan[0]["content"].endswith(render_first_segment_contract(
+            max_frames=3, max_sentences=3, max_chars=800, native_tools_available=False,
+        )))
 
     def test_segment_prompt_preserves_plain_and_structured_burst_user_payloads(self):
         plain_request = self._request_with_burst()

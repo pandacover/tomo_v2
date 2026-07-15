@@ -30,6 +30,13 @@ class ToolBatchResult:
     observations: tuple[ToolObservation, ...]
 
 
+@dataclass(frozen=True)
+class _PreparedToolCall:
+    call: ToolCall
+    invoke: Callable[[dict[str, object]], object]
+    arguments: dict[str, object]
+
+
 _INVOCATION_FAILED = object()
 
 
@@ -97,12 +104,11 @@ class ToolExecutor:
     def registry(self) -> ToolRegistry:
         return self._registry
 
-    def execute_batch(
+    def prepare_batch(
         self,
         provider_calls: Sequence[ProviderToolCallReady],
         remaining_tool_calls: int,
-        is_active: Callable[[], bool],
-    ) -> ToolBatchResult:
+    ) -> tuple[_PreparedToolCall, ...]:
         calls = tuple(provider_calls)
         if not calls:
             raise ToolBatchValidationError("empty_tool_batch")
@@ -110,14 +116,12 @@ class ToolExecutor:
             raise ToolBatchValidationError("invalid_tool_budget")
         if len(calls) > remaining_tool_calls:
             raise ToolBatchValidationError("tool_budget_exceeded")
-        if not callable(is_active):
-            raise ToolBatchValidationError("invalid_activity_check")
         if any(not isinstance(call, ProviderToolCallReady) for call in calls):
             raise ToolBatchValidationError("invalid_tool_call")
         if len({call.call_id for call in calls}) != len(calls):
             raise ToolBatchValidationError("duplicate_tool_call_id")
 
-        parsed: list[tuple[ToolCall, Callable[[dict[str, object]], object], dict[str, object]]] = []
+        prepared: list[_PreparedToolCall] = []
         for provider_call in calls:
             arguments = _parse_object(provider_call.arguments_json)
             try:
@@ -126,12 +130,35 @@ class ToolExecutor:
                 raise ToolBatchValidationError(error.code) from error
             if not tool.spec.read_only or not tool.spec.parallel_safe:
                 raise ToolBatchValidationError("unsupported_tool")
-            parsed.append((ToolCall(provider_call.call_id, provider_call.name, arguments), tool.invoke, copy.deepcopy(arguments)))
+            prepared.append(_PreparedToolCall(ToolCall(provider_call.call_id, provider_call.name, arguments), tool.invoke, copy.deepcopy(arguments)))
+        return tuple(prepared)
+
+    def execute_batch(
+        self,
+        provider_calls: Sequence[ProviderToolCallReady],
+        remaining_tool_calls: int,
+        is_active: Callable[[], bool],
+    ) -> ToolBatchResult:
+        parsed = self.prepare_batch(provider_calls, remaining_tool_calls)
+        return self.execute_prepared_batch(parsed, is_active)
+
+    def execute_prepared_batch(
+        self,
+        prepared_calls: Sequence[_PreparedToolCall],
+        is_active: Callable[[], bool],
+    ) -> ToolBatchResult:
+        if not callable(is_active):
+            raise ToolBatchValidationError("invalid_activity_check")
+        parsed = tuple(prepared_calls)
+        if not parsed:
+            raise ToolBatchValidationError("empty_tool_batch")
+        if any(not isinstance(call, _PreparedToolCall) for call in parsed):
+            raise ToolBatchValidationError("invalid_tool_call")
 
         if not is_active():
             raise ToolBatchCancelled()
-        with ThreadPoolExecutor(max_workers=min(len(parsed), remaining_tool_calls)) as workers:
-            futures = [workers.submit(invoke, arguments) for _, invoke, arguments in parsed]
+        with ThreadPoolExecutor(max_workers=len(parsed)) as workers:
+            futures = [workers.submit(prepared_call.invoke, prepared_call.arguments) for prepared_call in parsed]
             results = []
             for future in futures:
                 try:
@@ -142,7 +169,7 @@ class ToolExecutor:
         if not is_active():
             raise ToolBatchCancelled()
         observations = tuple(
-            _observation(call, result) if result is not _INVOCATION_FAILED else ToolObservation(call.call_id, call.name, False, "Tool execution failed.", "tool_execution_failed")
-            for (call, _, _), result in zip(parsed, results)
+            _observation(prepared_call.call, result) if result is not _INVOCATION_FAILED else ToolObservation(prepared_call.call.call_id, prepared_call.call.name, False, "Tool execution failed.", "tool_execution_failed")
+            for prepared_call, result in zip(parsed, results)
         )
-        return ToolBatchResult(tuple(call for call, _, _ in parsed), observations)
+        return ToolBatchResult(tuple(prepared_call.call for prepared_call in parsed), observations)

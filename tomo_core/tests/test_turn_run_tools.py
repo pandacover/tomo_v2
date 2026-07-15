@@ -246,7 +246,7 @@ class TurnRunToolTests(unittest.TestCase):
         result = ConversationEngine(provider, tool_registry=registry(tool("lookup", lambda _: "ok"))).respond(self.request())
 
         self.assertEqual([frame.text for frame in result.frames], ["First.", "Second.", "Final."])
-        self.assertIn("at most 1 frames per segment", provider.calls[2][0][0]["content"])
+        self.assertIn("ordinary completion requires 1 to 1 frame records", provider.calls[2][0][0]["content"])
 
     def test_fourth_frame_completes_partial_without_executing_later_tools(self):
         invoked = []

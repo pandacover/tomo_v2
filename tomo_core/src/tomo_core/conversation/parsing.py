@@ -8,10 +8,7 @@ from math import isfinite
 from ..delivery import split_sentences
 from ..models import ResponseContract
 from ..personal_data import MemoryControl, MemoryGovernanceControl, MemorySourceRef, MemoryWriteControl, OwnerSettingControl, PendingMemoryActionControl
-from .models import ConversationMove, MoveConfidence, MovePlan, ReactionIntent
 
-_REQUIRED_MOVE_PLAN_KEYS = {"primary_move", "supporting_moves", "response_goal", "confidence"}
-_ALLOWED_MOVE_PLAN_KEYS = {*_REQUIRED_MOVE_PLAN_KEYS, "move_sequence", "reaction"}
 _MARKDOWN_RE = re.compile(
     r"(?:^|\n)\s*(?:#{1,6}\s|>|[-*+]\s)|`|\[[^\]]+\]\([^)]+\)|\*\*[^*]+\*\*|(?<!\*)\*[^*\n]+\*(?!\*)"
 )
@@ -29,34 +26,6 @@ class ConversationOutputError(ValueError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(f"invalid conversation output: {code}")
-
-
-def _parse_optional_reaction(value: object) -> ReactionIntent | None:
-    if value is None:
-        return None
-    try:
-        return ReactionIntent(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _parse_strict_move_plan_payload(payload: object) -> MovePlan:
-    if not isinstance(payload, dict) or set(payload) - _ALLOWED_MOVE_PLAN_KEYS or not _REQUIRED_MOVE_PLAN_KEYS <= set(payload):
-        raise ValueError("invalid move plan keys")
-    supporting = payload["supporting_moves"]
-    if not isinstance(supporting, list):
-        raise ValueError("supporting_moves must be a list")
-    response_goal = payload["response_goal"]
-    if not isinstance(response_goal, str):
-        raise ValueError("response_goal must be text")
-    return MovePlan(
-        primary=ConversationMove(payload["primary_move"]),
-        supporting=tuple(ConversationMove(item) for item in supporting),
-        response_goal=response_goal,
-        confidence=MoveConfidence(payload["confidence"]),
-        sequence=tuple(ConversationMove(item) for item in payload.get("move_sequence", (payload["primary_move"], *supporting))),
-        reaction=_parse_optional_reaction(payload.get("reaction")),
-    )
 
 
 def _parse_memory_control_payload(payload: object) -> MemoryControl:

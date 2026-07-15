@@ -64,6 +64,9 @@ _SANDBOX_LATENCY_COUNTS = frozenset({
     "reasoning_tokens",
     "output_chars_through_first_frame",
     "first_frame_chars",
+    "plan_model",
+    "plan_normalized",
+    "plan_synthesized",
 })
 
 

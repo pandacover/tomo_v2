@@ -1,7 +1,8 @@
 import unittest
 
 from tomo_core.conversation.framing import SegmentFrameParser
-from tomo_core.conversation.models import ConversationMove, Frame, TurnBudget
+from tomo_core.conversation.contract import PlanSource
+from tomo_core.conversation.models import ConversationMove, Frame, MovePlan, TurnBudget
 from tomo_core.conversation.parsing import ConversationOutputError
 
 
@@ -56,27 +57,49 @@ class SegmentFrameParserTests(unittest.TestCase):
                 records = parser.feed('{"type":"turn_plan","primary_move":"answer","supporting_moves":[],"response_goal":"answer","confidence":"low","reaction":' + repr(reaction).replace("'", '"') + '}\n')
                 self.assertIsNone(records[0].reaction)
 
-    def test_first_segment_requires_one_plan_before_frames_but_allows_zero_frames(self):
+    def test_memory_control_without_plan_emits_plan_before_control(self):
         parser = SegmentFrameParser(segment_index=0, first_segment=True, budget=budget())
-        with self.assertRaises(ConversationOutputError) as raised:
-            parser.feed('{"type":"frame","text":"Too early."}\n')
-        self.assertEqual(raised.exception.code, "missing_plan")
 
+        records = parser.feed(
+            '{"type":"memory_control","action":"set_owner_setting","setting":"capture_enabled","enabled":true,"user_intent_excerpt":"remember this"}\n'
+        )
+
+        self.assertEqual(records[0], MovePlan.direct_answer())
+        self.assertEqual(records[1].action, "set_owner_setting")
+        self.assertIs(parser.plan_source, PlanSource.SYNTHESIZED)
+
+    def test_advisory_plan_drift_is_normalized_before_a_valid_frame(self):
         parser = SegmentFrameParser(segment_index=0, first_segment=True, budget=budget())
-        records = parser.feed('{"type":"turn_plan","primary_move":"answer","supporting_moves":[],"response_goal":"answer directly","confidence":"low"}\n')
-        self.assertEqual(records[0].response_goal, "answer directly")
+
+        records = parser.feed(
+            '{"type":"turn_plan","primary_move":"invalid","supporting_moves":["reassure","invalid","reassure"],"response_goal":true,"confidence":"certain","reaction":"unsupported","extra":"ignored"}\n'
+            '{"type":"frame","text":"Still valid."}\n'
+        )
+
+        self.assertIs(records[0].primary, ConversationMove.ANSWER)
+        self.assertEqual(records[0].supporting, (ConversationMove.REASSURE,))
+        self.assertIsNone(records[0].reaction)
+        self.assertEqual(records[1], Frame(0, 0, "Still valid."))
+        self.assertIs(parser.plan_source, PlanSource.NORMALIZED)
+
+    def test_first_frame_without_plan_emits_synthesized_plan_then_frame(self):
+        parser = SegmentFrameParser(segment_index=0, first_segment=True, budget=budget())
+
+        records = parser.feed('{"type":"frame","text":"Direct answer."}\n')
+
+        self.assertEqual(records, [MovePlan.direct_answer(), Frame(0, 0, "Direct answer.")])
+        self.assertIs(parser.plan_source, PlanSource.SYNTHESIZED)
         self.assertEqual(parser.finish(), [])
 
     def test_rejects_invalid_record_shapes_and_plan_ordering_with_safe_codes(self):
         cases = [
-            ('{"type":"turn_plan","primary_move":"answer","supporting_moves":[],"response_goal":"goal","confidence":"low","extra":"x"}\n', "invalid_plan"),
             ('{"type":"frame","text":"ok","extra":"x"}\n', "invalid_frame"),
             ('{"type":"unknown"}\n', "invalid_record"),
             ('{"type":"frame","text":"line\\nbreak"}\n', "invalid_frame"),
         ]
         for raw, code in cases:
             with self.subTest(code=code):
-                parser = SegmentFrameParser(segment_index=1, first_segment=code == "invalid_plan", budget=budget())
+                parser = SegmentFrameParser(segment_index=1, first_segment=False, budget=budget())
                 with self.assertRaises(ConversationOutputError) as raised:
                     parser.feed(raw)
                 self.assertEqual(raised.exception.code, code)
@@ -88,11 +111,16 @@ class SegmentFrameParserTests(unittest.TestCase):
             parser.feed('{"type":"turn_plan","primary_move":"answer","supporting_moves":[],"response_goal":"goal","confidence":"low"}\n')
         self.assertEqual(raised.exception.code, "duplicate_plan")
 
-    def test_finish_rejects_incomplete_or_garbage_json_and_missing_first_plan(self):
+        parser = SegmentFrameParser(segment_index=0, first_segment=True, budget=budget())
+        parser.feed('{"type":"frame","text":"First."}\n')
+        with self.assertRaises(ConversationOutputError) as raised:
+            parser.feed('{"type":"turn_plan","primary_move":"answer","supporting_moves":[],"response_goal":"goal","confidence":"low"}\n')
+        self.assertEqual(raised.exception.code, "late_plan")
+
+    def test_finish_rejects_incomplete_or_garbage_json_and_allows_empty_first_segment(self):
         cases = [
             (False, '{"type":"frame","text":"unfinished', "invalid_json"),
             (False, '{"type":"frame","text":"valid"} garbage', "invalid_json"),
-            (True, "\n\n", "missing_plan"),
         ]
         for first_segment, raw, code in cases:
             with self.subTest(code=code):
@@ -101,6 +129,10 @@ class SegmentFrameParserTests(unittest.TestCase):
                 with self.assertRaises(ConversationOutputError) as raised:
                     parser.finish()
                 self.assertEqual(raised.exception.code, code)
+
+        parser = SegmentFrameParser(segment_index=0, first_segment=True, budget=budget())
+        parser.feed("\n\n")
+        self.assertEqual(parser.finish(), [])
 
     def test_ignores_blank_lines_and_rejects_plan_records_after_the_first_segment(self):
         parser = SegmentFrameParser(segment_index=3, first_segment=False, budget=budget())

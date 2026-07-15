@@ -195,8 +195,8 @@ class ProviderStreamingTests(unittest.TestCase):
 
     def test_static_provider_emits_turnrun_jsonl_for_first_and_fixed_plan_segments(self):
         provider = StaticProvider("hello")
-        first_messages = [{"role": "system", "content": "generate exactly one internal turn_plan JSONL record before any frame record."}]
-        later_messages = [{"role": "system", "content": "do not emit a turn_plan record; reuse the fixed turn plan."}]
+        first_messages = [{"role": "system", "content": "SHOULD emit one turn_plan before controls or frames."}]
+        later_messages = [{"role": "system", "content": "do not emit a turn_plan; reuse the fixed turn plan."}]
 
         first_events = list(provider.stream(first_messages))
         later_events = list(provider.stream(later_messages))
@@ -208,7 +208,7 @@ class ProviderStreamingTests(unittest.TestCase):
         self.assertEqual(
             first_records,
             [
-                {"type": "turn_plan", "primary_move": "answer", "supporting_moves": [], "move_sequence": ["answer"], "response_goal": "return the configured static smoke response", "confidence": "high"},
+                {"type": "turn_plan", "primary_move": "answer", "supporting_moves": [], "response_goal": "return the configured static smoke response", "confidence": "high", "reaction": None},
                 {"type": "frame", "text": "hello"},
             ],
         )
