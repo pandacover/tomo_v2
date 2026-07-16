@@ -15,7 +15,7 @@ In scope:
 - allow one undelivered contract-repair generation after malformed first-segment output;
 - preserve one logical assistant turn even when Telegram receives several bubbles.
 
-`PersonalAgentRuntime` owns transport and delivery while `PersonalDataRepository` is the only runtime boundary for owner-scoped sessions, memories, and settings. SQLite is its first adapter; SQL, FTS, and connection mechanics do not enter conversation code. The owner is the Tomo instance ID, never a connector actor ID. Local direct use defaults to owner `local`; hosted sandbox use requires `TOMO_INSTANCE_ID`. JSON session files are import-only compatibility artifacts after cutover.
+`PersonalAgentRuntime` owns transport and delivery while `PersonalDataRepository` is the only runtime boundary for owner-scoped sessions, memories, and settings. SQLite is its first adapter; SQL, FTS, and connection mechanics do not enter conversation code. The owner is the Tomo instance ID, never a connector actor ID. Local direct use defaults to owner `local`; hosted sandbox use requires `TOMO_INSTANCE_ID`. SQLite is authoritative; legacy JSON session files are not read.
 
 Explicitly deferred:
 

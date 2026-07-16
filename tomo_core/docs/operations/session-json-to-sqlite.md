@@ -1,4 +1,4 @@
-# Session JSON to SQLite Operations
+# Session JSON Retirement Operations
 
 ## Data location and identity
 
@@ -11,32 +11,22 @@ Local direct runtime defaults to owner `local`. Hosted sandbox runtime requires
 `TOMO_INSTANCE_ID`; missing identity produces `missing_owner_id`. Always use
 the Tomo owner ID with `--owner`, never a connector actor ID.
 
-## Rollout and rollback
+## Completed cutover and cleanup
 
-1. Stop the runtime and take a volume-level backup of the data directory.
-2. Deploy the SQLite build. Runtime initialization imports
-   `<data-dir>/sessions/*.json` once for its owner, including a `.json.recovery`
-   file only when its primary JSON is missing or invalid.
-3. Verify integrity and export each owner before declaring the rollout complete.
-4. Retain the untouched JSON files and volume backup. New runtime writes go to
-   SQLite only.
+SQLite is authoritative. The runtime no longer reads or imports
+`<data-dir>/sessions/*.json`, including recovery copies.
 
-The importer records each source path and SHA-256 with its imported rows. A
-matching file is skipped on later starts. A changed already-imported file fails
-with `legacy_session_file_changed`; invalid data without a usable recovery copy
-fails with `invalid_legacy_session`. Do not edit, delete, or reverse-write the
-legacy JSON files during recovery.
-
-To roll back, stop the SQLite build and restore the prior build against the
-untouched JSON files. Do not automatically copy SQLite changes back into JSON.
-To restore portable data into an adapter, use the canonical JSONL import API in
-the target deployment, rebuild its index, verify counts and integrity, then
-switch configuration. There is currently no `personal-data import` CLI command.
+After a volume-level backup and inspection of any legacy files, operators may
+delete only `<data-dir>/sessions`. Do not delete `tomo.sqlite3`, checkpoint
+files, or any current SQLite storage. Legacy JSON cannot restore deleted SQLite
+owner data.
 
 ## Supported CLI commands
 
 Run these from `tomo_core` with `PYTHONPATH=src`, or use the installed
-`tomo-core` executable in place of `python -m tomo_core.cli`.
+`tomo-core` executable in place of `python -m tomo_core.cli`. Do not treat a
+direct CLI invocation against a mounted production volume as safe; use the
+deployment's approved maintenance workflow.
 
 ```bash
 PYTHONPATH=src python -m tomo_core.cli personal-data integrity-check --data-dir /secure/tomo

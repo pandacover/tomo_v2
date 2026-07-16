@@ -75,7 +75,6 @@ CREATE TABLE memory_sources(memory_id TEXT NOT NULL REFERENCES memories(id) ON D
 CREATE TABLE owner_memory_settings(owner_id TEXT PRIMARY KEY,capture_enabled INTEGER NOT NULL DEFAULT 1,retrieval_enabled INTEGER NOT NULL DEFAULT 1,reactions_enabled INTEGER NOT NULL DEFAULT 1,governance_revision INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL);
 CREATE TABLE pending_memory_actions(id TEXT PRIMARY KEY,owner_id TEXT NOT NULL,session_key TEXT NOT NULL,action TEXT NOT NULL,target_ids_json TEXT NOT NULL,expires_at TEXT NOT NULL,created_at TEXT NOT NULL);
 CREATE TABLE memory_deletion_tombstones(id TEXT PRIMARY KEY,owner_id TEXT NOT NULL,deleted_at TEXT NOT NULL,request_key TEXT NOT NULL,UNIQUE(owner_id,request_key));
-CREATE TABLE legacy_session_imports(source_path TEXT PRIMARY KEY,source_sha256 TEXT NOT NULL,imported_at TEXT NOT NULL);
 CREATE VIRTUAL TABLE messages_fts USING fts5(record_id UNINDEXED,owner_id UNINDEXED,content,tokenize='unicode61 remove_diacritics 2');
 CREATE VIRTUAL TABLE memories_fts USING fts5(record_id UNINDEXED,owner_id UNINDEXED,search_text,tokenize='unicode61 remove_diacritics 2');
 CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN INSERT INTO messages_fts(record_id,owner_id,content) SELECT new.id,s.owner_id,new.content FROM sessions s WHERE s.id=new.session_id; END;
@@ -738,28 +737,3 @@ class SqlitePersonalDataRepository:
             try: c.rollback()
             except Exception: pass
             raise
-    def legacy_import_hash(self, path):
-        with self._connection() as c:
-            row=c.execute("SELECT source_sha256 FROM legacy_session_imports WHERE source_path=?",(path,)).fetchone(); return row[0] if row else None
-    @_checkpoint_after_write
-    def import_legacy_session_file(self, owner, session, path, digest):
-        # The marker and all imported rows commit together; files are never changed.
-        try:
-            with self._connection() as c:
-                c.execute("BEGIN IMMEDIATE")
-                existing=c.execute("SELECT source_sha256 FROM legacy_session_imports WHERE source_path=?",(path,)).fetchone()
-                if existing:
-                    if existing[0]!=digest: raise ValueError("legacy_session_file_changed")
-                    c.rollback(); return
-                s=self._session(c,owner,session.session_key,True); now=utc_now_iso()
-                for pos,m in enumerate(session.messages):
-                    d=m.metadata; gen=d.get("generation_id"); update=d.get("update_id"); burst=d.get("burst_id")
-                    mid=_id("legacy",path,pos) if not gen and update is None else _id("message",s["id"],m.role,burst,update) if m.role=="user" and update is not None else _id("message",s["id"],m.role,gen)
-                    status="accepted" if gen in session.accepted_generation_ids else d.get("generation_status")
-                    metadata = dict(d)
-                    if not gen and update is None:
-                        metadata["legacy_message_id"] = mid
-                    c.execute("INSERT OR IGNORE INTO messages VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(mid,s["id"],m.role,m.content,m.timestamp,d.get("ordinal",pos),d.get("message_id"),update,burst,gen,status,json.dumps(metadata,sort_keys=True,default=str),now))
-                for gen in session.accepted_generation_ids:c.execute("INSERT OR IGNORE INTO accepted_generations VALUES(?,?,?)",(s["id"],gen,now))
-                c.execute("UPDATE messages SET generation_status='accepted' WHERE session_id=? AND generation_id IN (SELECT generation_id FROM accepted_generations WHERE session_id=?)",(s["id"],s["id"])); c.execute("INSERT INTO legacy_session_imports VALUES(?,?,?)",(path,digest,now)); c.commit()
-        except sqlite3.OperationalError as e: raise self._safe(e) from None

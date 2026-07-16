@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,7 +11,7 @@ from tomo_core.grok_auth import GrokAuthStore
 from tomo_core.providers import GrokAuthProvider, ProviderStreamCompleted, ProviderTextDelta
 from tomo_core.runtime import RuntimeCompleted, RuntimeFrameReady, RuntimeReactionReady, StaleSessionRevisionError, _safe_memory_control
 from tomo_core.personal_data import MemorySourceRef, MemoryWriteControl
-from tomo_core.sessions import ConversationSession, JsonSessionStore, StoredMessage
+from tomo_core.sessions import ConversationSession, StoredMessage
 from tomo_core.sqlite_personal_data import SqlitePersonalDataRepository
 from tomo_core.telegram import FakeTelegramClient, TelegramDeliverySink
 
@@ -346,10 +347,10 @@ class RuntimeConversationMoveTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             soul_path = Path(tmp) / "SOUL.md"
             soul_path.write_text("SOUL SENTINEL", encoding="utf-8")
-            store = JsonSessionStore(tmp)
-            session = store.load("telegram:actor:user-1")
+            repository = SqlitePersonalDataRepository(Path(tmp) / "tomo.sqlite3")
+            session = ConversationSession("telegram:actor:user-1")
             session.append(StoredMessage("assistant", "visible only. unsent completion.", metadata={"generation_id": "gen-old", "generation_status": "provisional"}))
-            store.save(session)
+            repository.save_session("local", session)
             provider = ScriptedProvider([stream("fresh answer.")])
             runtime = PersonalAgentRuntime(provider, TelegramDeliverySink(FakeTelegramClient()), RuntimeConfig(data_dir=tmp, soul_path=str(soul_path)))
             burst = InputBurst(
@@ -406,10 +407,10 @@ class RuntimeConversationMoveTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             soul_path = Path(tmp) / "SOUL.md"
             soul_path.write_text("SOUL SENTINEL", encoding="utf-8")
-            store = JsonSessionStore(tmp)
-            session = store.load("telegram:actor:user-1")
-            session.append(StoredMessage("user", "old context"))
-            store.save(session)
+            repository = SqlitePersonalDataRepository(Path(tmp) / "tomo.sqlite3")
+            session = ConversationSession("telegram:actor:user-1")
+            session.append(StoredMessage("user", "old context", metadata={"burst_id": "old-context", "update_id": 1}))
+            repository.save_session("local", session)
             provider = ScriptedProvider([stream("i get why that plan looks tempting.", "but the risky part is cooked, use the safer route first.")])
             client = FakeTelegramClient()
             runtime = PersonalAgentRuntime(provider, TelegramDeliverySink(client), RuntimeConfig(data_dir=tmp, soul_path=str(soul_path)))
@@ -431,6 +432,26 @@ class RuntimeConversationMoveTests(unittest.TestCase):
             self.assertNotIn("chain_of_thought", metadata_text)
             self.assertNotIn("primary_move\":", metadata_text)
             self.assertNotIn("access_token", metadata_text)
+
+    def test_runtime_ignores_legacy_json_after_owner_deletion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            soul_path = Path(tmp) / "SOUL.md"
+            soul_path.write_text("SOUL", encoding="utf-8")
+            repository = SqlitePersonalDataRepository(Path(tmp) / "tomo.sqlite3")
+            session = ConversationSession("telegram:actor:user-1")
+            session.append(StoredMessage("user", "SQLite session"))
+            repository.save_session("local", session)
+            repository.delete_owner("local")
+            sessions_dir = Path(tmp) / "sessions"
+            sessions_dir.mkdir()
+            (sessions_dir / "telegram_actor_user-1.json").write_text(
+                json.dumps({"session_key": session.session_key, "messages": [{"role": "user", "content": "legacy JSON session"}]}),
+                encoding="utf-8",
+            )
+
+            PersonalAgentRuntime(ScriptedProvider([]), TelegramDeliverySink(FakeTelegramClient()), RuntimeConfig(data_dir=tmp, soul_path=str(soul_path)))
+
+            self.assertEqual(repository.load_session("local", session.session_key).messages, [])
 
 
 if __name__ == "__main__":

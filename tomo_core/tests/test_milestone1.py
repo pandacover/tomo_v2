@@ -6,7 +6,7 @@ from tomo_core import ConversationEngine, ConversationRequest, InboundEnvelope, 
 from tomo_core.conversation.parsing import ConversationOutputError
 from tomo_core.delivery import DeliveryPlanner, split_sentences
 from tomo_core.providers import StaticProvider
-from tomo_core.sessions import JsonSessionStore, StoredMessage
+from tomo_core.sessions import ConversationSession, StoredMessage
 from tomo_core.sqlite_personal_data import SqlitePersonalDataRepository
 from tomo_core.telegram import FakeTelegramClient, TelegramDeliverySink
 
@@ -117,8 +117,8 @@ class MilestoneOneTests(unittest.TestCase):
 
     def test_session_persists_burst_messages_once_and_filters_provisional_history(self):
         with tempfile.TemporaryDirectory() as tmp:
-            store = JsonSessionStore(tmp)
-            session = store.load("telegram:actor:u")
+            repository = SqlitePersonalDataRepository(Path(tmp) / "tomo.sqlite3")
+            session = ConversationSession("telegram:actor:u")
             first = InboundMessage(1, 41, InboundEnvelope("telegram", "u", "101", "first", timestamp="2026-07-11T00:00:00+00:00"))
             second = InboundMessage(2, 42, InboundEnvelope("telegram", "u", "102", "second", timestamp="2026-07-11T00:00:03+00:00"))
 
@@ -129,9 +129,9 @@ class MilestoneOneTests(unittest.TestCase):
             session.append(StoredMessage("assistant", "stale draft", metadata={"generation_id": "gen-old", "generation_status": "provisional"}))
             session.append(StoredMessage("assistant", "accepted draft", metadata={"generation_id": "gen-ok", "generation_status": "provisional"}))
             session.accept_generations(("gen-ok",))
-            store.save_atomic(session)
+            repository.save_session("local", session)
 
-            saved = JsonSessionStore(tmp).load("telegram:actor:u")
+            saved = repository.load_session("local", "telegram:actor:u")
             user_messages = [message for message in saved.messages if message.role == "user"]
             self.assertEqual([message.content for message in user_messages], ["first", "second"])
             self.assertEqual(user_messages[0].metadata["update_id"], 41)
@@ -143,24 +143,6 @@ class MilestoneOneTests(unittest.TestCase):
 
             unaccepted_history = saved.model_history_for_burst("burst-2")
             self.assertNotIn("stale draft", [item["content"] for item in unaccepted_history])
-
-            saved_path = store._path("telegram:actor:u")
-            self.assertEqual(saved_path.read_text(encoding="utf-8")[0], "{")
-            self.assertEqual(list(saved_path.parent.glob("*.tmp")), [])
-
-    def test_stale_session_snapshots_merge_without_losing_newer_messages(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            store = JsonSessionStore(tmp)
-            stale = store.load("telegram:actor:u")
-            newer = store.load("telegram:actor:u")
-            newer.append(StoredMessage("user", "newer", metadata={"burst_id": "b2", "update_id": 2}))
-            store.save_atomic(newer)
-            stale.append(StoredMessage("user", "older", metadata={"burst_id": "b1", "update_id": 1}))
-
-            store.save_atomic(stale)
-
-            saved = store.load("telegram:actor:u")
-            self.assertEqual({message.content for message in saved.messages}, {"newer", "older"})
 
 
 if __name__ == "__main__":

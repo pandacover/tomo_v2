@@ -12,7 +12,6 @@ from .graph import build_langgraph_or_linear
 from .models import InboundEnvelope, InputBurst, OutboundBubble, RuntimeConfig
 from .providers import ProviderAdapter
 from .reaction_service import ReactionDeliveryKey, ReactionService
-from .legacy_session_import import import_legacy_sessions
 from .memory_governance import MemoryGovernanceService
 from .personal_data import (MemoryContextQuery, MemoryWriteControl,
                             PersonalDataRepository, StorageBusyError,
@@ -112,7 +111,6 @@ class PersonalAgentRuntime:
         self.reactions = ReactionService()
         self.memory_control_diagnostics: list[MemoryControlDiagnostic] = []
         self.sessions = _OwnerSessionStore(self.personal_data, self.owner_id)
-        import_legacy_sessions(self.personal_data, self.owner_id, self.config.data_dir)
         self.graph = self._build_graph()
 
     def handle_telegram_text(self, envelope: InboundEnvelope) -> list[dict[str, str | None]]:
