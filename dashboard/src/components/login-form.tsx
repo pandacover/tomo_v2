@@ -23,19 +23,50 @@ export function LoginForm({ next = '/api/onboarding/telegram' }: LoginFormProps)
   }
 
   return (
-    <form onSubmit={submit} className="mx-auto flex max-w-md flex-col gap-4 rounded-[2rem] border border-tomo-ink/10 bg-white/70 p-8 shadow-xl backdrop-blur">
-      <h1 className="font-heading text-4xl font-black text-tomo-ink">text tomo</h1>
-      <p className="text-sm text-tomo-ink/70">sign in first, then we&apos;ll open telegram and bind your chat.</p>
+    <form onSubmit={submit} className="login-form">
+      <div className="login-form-heading">
+        <p className="login-form-mark">tomo</p>
+        <h1>continue the conversation.</h1>
+        <p>Sign in to connect this conversation with Telegram.</p>
+      </div>
       {mode === 'signup' ? (
-        <input className="rounded-full border px-4 py-3" value={name} onChange={(e) => setName(e.target.value)} placeholder="name" />
+        <label className="login-field">
+          name
+          <input
+            className="form-input"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            autoComplete="name"
+            required
+          />
+        </label>
       ) : null}
-      <input className="rounded-full border px-4 py-3" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="email" type="email" required />
-      <input className="rounded-full border px-4 py-3" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="password" type="password" required minLength={8} />
-      {error ? <p className="text-sm text-red-600">{error}</p> : null}
-      <button className="rounded-full bg-tomo-ink px-6 py-3 font-heading font-black uppercase tracking-widest text-white" type="submit">
-        continue
-      </button>
-      <button className="text-sm underline" type="button" onClick={() => setMode(mode === 'signin' ? 'signup' : 'signin')}>
+      <label className="login-field">
+        email
+        <input
+          className="form-input"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          autoComplete="email"
+          type="email"
+          required
+        />
+      </label>
+      <label className="login-field">
+        password
+        <input
+          className="form-input"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          autoComplete={mode === 'signup' ? 'new-password' : 'current-password'}
+          type="password"
+          required
+          minLength={8}
+        />
+      </label>
+      {error ? <p className="login-error" role="alert">{error}</p> : null}
+      <button className="submit-button" type="submit">continue to telegram</button>
+      <button className="login-mode-toggle" type="button" onClick={() => setMode(mode === 'signin' ? 'signup' : 'signin')}>
         {mode === 'signin' ? 'new here? make an account' : 'already have an account? sign in'}
       </button>
     </form>

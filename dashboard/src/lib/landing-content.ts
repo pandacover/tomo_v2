@@ -1,49 +1,37 @@
 export const siteMeta = {
-  title: 'tomo, the thoughtful companion',
-  description: 'meet tomo, a stalker, an assistant, a friend.',
-  icon: '/images/favicon.png',
+  title: 'tomo | your context, carried forward',
+  description: 'A private personal assistant for keeping track of the details you choose to share.',
 };
 
-export const navLinks = [
-  { href: '#how-it-works', label: 'how it works' },
-  { href: '#about-tomo', label: 'about tomo' },
-];
-
 export const hero = {
-  eyebrow: 'introducing tomo 1.0',
-  headline: 'meet tomo,',
-  highlights: ['a stalker,', 'an assistant,', 'a friend'],
   cta: 'text tomo',
+  image: 'https://images.unsplash.com/photo-1464278533981-50106e6176b1?auto=format&fit=crop&w=2400&q=90',
 };
 
 export const principles = [
   {
-    title: 'privacy by design',
-    body: 'your conversations are yours alone. tomo only keeps what you choose to share.',
-    tone: 'dark',
+    title: 'Your context stays yours.',
+    body: 'Tomo works only with the context you choose to share. privacy by design means your conversations are not a product.',
+    tone: 'ink',
   },
   {
-    title: 'seamless integration',
-    body: 'connect calendar, notes, and your local environment so tomo can act naturally.',
-    tone: 'accent',
+    title: 'Useful before it is loud.',
+    body: 'A considered reminder or an opened loop is enough. The point is less management and more room to keep moving.',
+    tone: 'paper',
   },
 ] as const;
 
-export const features = [
+export const signalTrace = [
   {
-    title: 'authentic connection',
-    body: 'moving beyond commands. tomo learns your preferences, mood, and subtle cues to feel genuinely supportive.',
-    accentEdge: 'left',
+    title: 'Say what is on your mind.',
+    body: 'Share the details that matter, in a conversation that can continue when you return.',
   },
   {
-    title: 'intuitive support',
-    body: 'anticipating needs before they are voiced. from schedules to pauses, tomo aligns with your natural pace.',
-    accentEdge: 'right',
-    reverse: true,
+    title: 'Bring the right things together.',
+    body: 'Tomo can use the connections you choose to make the next step clearer.',
   },
   {
-    title: 'grounded intelligence',
-    body: 'no hallucinations, just clarity. tomo uses verified data and local context to stay accurate and useful.',
-    accentEdge: 'top',
+    title: 'Pick up where you left off.',
+    body: 'A useful thread does not disappear just because the day got busy.',
   },
 ] as const;
