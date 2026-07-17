@@ -200,6 +200,21 @@ class TelegramUpdateRouterTests(unittest.TestCase):
             self.assertTrue(router.process_next(now=1))
             self.assertIsInstance(processed[0], TelegramGenerationWork)
 
+    def test_router_stops_when_telegram_work_is_exhausted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TelegramOnboardingStore(tmp)
+            store.enqueue_update(1, "123", '{"update_id":1}', now=0)
+            processed = []
+            router = TelegramUpdateRouter(
+                client=FakeTelegramClient([]),
+                store=store,
+                process_update=processed.append,
+            )
+
+            self.assertTrue(router.process_next(now=1))
+            self.assertEqual(processed, [{"update_id": 1}])
+            self.assertFalse(router.process_next(now=1))
+
     def test_poll_schedules_superseded_generation_cancellation_without_blocking(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = TelegramOnboardingStore(tmp)

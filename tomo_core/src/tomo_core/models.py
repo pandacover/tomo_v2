@@ -101,6 +101,97 @@ class InputBurst:
 
 
 @dataclass(frozen=True)
+class AutomationFact:
+    value: str
+    source: str
+    observed_at: str
+    freshness: str
+    uncertainty: str
+
+    def __post_init__(self) -> None:
+        for name, maximum in (("value", 2000), ("source", 256), ("freshness", 128), ("uncertainty", 512)):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip() or len(value) > maximum:
+                raise ValueError(f"automation fact {name} is invalid")
+            object.__setattr__(self, name, value.strip())
+        try:
+            observed_at = datetime.fromisoformat(self.observed_at.replace("Z", "+00:00"))
+        except (AttributeError, ValueError) as error:
+            raise ValueError("automation fact observed_at must be timezone-aware ISO-8601") from error
+        if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+            raise ValueError("automation fact observed_at must be timezone-aware ISO-8601")
+
+
+@dataclass(frozen=True)
+class AutomationTurn:
+    generation_id: str
+    revision: int
+    job_id: str
+    run_id: str
+    actor_id: str
+    chat_id: str
+    intent: str
+    scheduled_for: str
+    previous_outcome: str | None = None
+    trigger: Literal["schedule", "catchup", "manual", "lifecycle"] = "schedule"
+    will_end_after_run: bool = False
+    connector: Connector = "telegram"
+    constraints: tuple[str, ...] = ()
+    successful_runs: int = 0
+    facts: tuple[AutomationFact, ...] = ()
+
+    def __post_init__(self) -> None:
+        for name in ("generation_id", "job_id", "run_id", "actor_id", "chat_id", "intent"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"automation {name} is required")
+        if not isinstance(self.revision, int) or isinstance(self.revision, bool) or self.revision < 1:
+            raise ValueError("automation revision must be at least one")
+        if self.connector != "telegram":
+            raise ValueError("automation connector must be telegram")
+        if self.trigger not in {"schedule", "catchup", "manual", "lifecycle"}:
+            raise ValueError("invalid automation trigger")
+        if self.previous_outcome is not None and (not isinstance(self.previous_outcome, str) or not self.previous_outcome.strip()):
+            raise ValueError("automation previous_outcome must be non-empty when supplied")
+        if not isinstance(self.will_end_after_run, bool):
+            raise ValueError("automation will_end_after_run must be boolean")
+        if isinstance(self.successful_runs, bool) or not isinstance(self.successful_runs, int) or self.successful_runs < 0:
+            raise ValueError("automation successful_runs must be non-negative")
+        constraints = tuple(self.constraints)
+        if any(not isinstance(value, str) or not value.strip() for value in constraints):
+            raise ValueError("automation constraints must be non-blank strings")
+        object.__setattr__(self, "constraints", constraints)
+        try:
+            facts = tuple(fact if isinstance(fact, AutomationFact) else AutomationFact(**fact) for fact in self.facts)
+        except (TypeError, ValueError) as error:
+            raise ValueError("automation facts are invalid") from error
+        if len(facts) > 8:
+            raise ValueError("automation facts cannot exceed eight entries")
+        object.__setattr__(self, "facts", facts)
+        try:
+            parsed = datetime.fromisoformat(self.scheduled_for.replace("Z", "+00:00"))
+        except (AttributeError, ValueError) as error:
+            raise ValueError("automation scheduled_for must be timezone-aware ISO-8601") from error
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError("automation scheduled_for must be timezone-aware ISO-8601")
+
+    @property
+    def session_key(self) -> str:
+        return f"{self.connector}:actor:{self.actor_id}"
+
+    @property
+    def event_text(self) -> str:
+        prior = self.previous_outcome or "none"
+        return (
+            "AUTOMATION EVENT. This is system-originated scheduled work, not a user message.\n"
+            f"Intent: {self.intent}\nScheduled for: {self.scheduled_for}\n"
+            f"Job: {self.job_id}; run: {self.run_id}; trigger: {self.trigger}; prior outcome: {prior}; completed runs: {self.successful_runs}; constraints: {self.constraints}; "
+            f"will end after run: {str(self.will_end_after_run).lower()}."
+            + ("\nConnected facts: " + "; ".join(f"value={fact.value}; source={fact.source}; observed_at={fact.observed_at}; freshness={fact.freshness}; uncertainty={fact.uncertainty}" for fact in self.facts) if self.facts else "")
+        )
+
+
+@dataclass(frozen=True)
 class OutboundBubble:
     text: str
     reply_to_message_id: str | None = None

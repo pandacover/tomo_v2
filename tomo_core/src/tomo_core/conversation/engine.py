@@ -6,7 +6,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import replace
 
 from ..context import ContextHydrator
-from ..models import ResponseContract
+from ..models import AutomationTurn, ResponseContract
 from ..providers import ProviderAdapter, ProviderSetupRequired, ProviderStreamCompleted, ProviderTextDelta, ProviderToolCallReady
 from ..tool_execution import ToolBatchCancelled, ToolBatchValidationError, ToolExecutor
 from ..tools import ToolRegistry
@@ -244,7 +244,8 @@ class ConversationEngine:
                 emit_provider_stage("sandbox_provider_attempt_start")
 
                 try:
-                    stream = self.provider.stream(messages, tools=schemas, actor_id=request.burst.latest.actor_id)
+                    actor_id = request.burst.actor_id if isinstance(request.burst, AutomationTurn) else request.burst.latest.actor_id
+                    stream = self.provider.stream(messages, tools=schemas, actor_id=actor_id)
                 except ProviderSetupRequired as error:
                     emit_provider_attempt("error")
                     if not segments:
@@ -342,6 +343,18 @@ class ConversationEngine:
                     except ConversationOutputError as error:
                         failure = error
                 tool_finish = terminal is not None and terminal.finish_reason == "tool_calls"
+                if failure is None and tool_finish and native_calls and all(self.tool_registry.is_blocked(call.name) for call in native_calls):
+                    if plan is None:
+                        resolution = synthesized_tool_plan()
+                        plan = resolution.plan
+                        emit_plan_validated(resolution.source)
+                        if not is_active():
+                            return
+                        yield from yield_provider_event(TurnRunStarted(plan))
+                    # Do not retain or surface blocked tool names or arguments.
+                    segments.append(SegmentResult(index, (), (), SegmentFinish.FAILED))
+                    yield completed(TurnRunStatus.APPROVAL_NEEDED)
+                    return
                 if failure is None and ((terminal.finish_reason == "stop" and native_calls) or (tool_finish and not native_calls) or (terminal.finish_reason not in {"stop", "tool_calls"})):
                     failure = ConversationOutputError("mismatched_tool_completion")
                 if failure is None and tool_finish and not schemas:

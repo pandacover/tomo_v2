@@ -24,6 +24,7 @@ class HostedRuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config.telegram_delivery_pace_seconds, 1.5)
         self.assertEqual(config.xai_model, "grok-4.5")
         self.assertEqual(config.xai_reasoning_effort, "medium")
+        self.assertEqual(config.control_public_url, "http://127.0.0.1:8787")
 
     def test_local_mode_rejects_each_daytona_hosted_variable(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -69,6 +70,7 @@ class HostedRuntimeConfigTests(unittest.TestCase):
                     "TOMO_DAYTONA_SNAPSHOT": "tomo-snapshot",
                     "TOMO_DAYTONA_SANDBOX_DATA_DIR": "/var/lib/tomo",
                     "TOMO_SUPERGROK_OAUTH_JSON_B64": base64.b64encode(b"{}").decode("ascii"),
+                    "TOMO_CONTROL_PUBLIC_URL": "https://control.example.test",
                     "TOMO_TELEGRAM_POLL_TIMEOUT": "45",
                     "TOMO_TELEGRAM_INPUT_DEBOUNCE_SECONDS": "0.25",
                     "TOMO_TELEGRAM_DELIVERY_PACE_SECONDS": "0",
@@ -86,6 +88,23 @@ class HostedRuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config.xai_model, "grok-4.5")
         self.assertEqual(config.xai_reasoning_effort, "medium")
 
+    def test_hosted_control_url_derives_from_railway_domain_and_rejects_non_https_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = {
+                "TOMO_HOSTED_RUNTIME": "daytona",
+                "TOMO_TELEGRAM_GLOBAL_BOT_TOKEN": "bot-token",
+                "TOMO_CORE_DATA_DIR": tmp,
+                "DAYTONA_API_KEY": "daytona-key",
+                "TOMO_DAYTONA_SNAPSHOT": "tomo-snapshot",
+                "TOMO_DAYTONA_SANDBOX_DATA_DIR": "/var/lib/tomo",
+                "TOMO_SUPERGROK_OAUTH_JSON_B64": base64.b64encode(b"{}").decode("ascii"),
+            }
+
+            config = HostedRuntimeConfig.from_env({**base, "RAILWAY_PUBLIC_DOMAIN": "control.example.test"})
+            self.assertEqual(config.control_public_url, "https://control.example.test")
+            with self.assertRaisesRegex(ValueError, "TOMO_CONTROL_PUBLIC_URL"):
+                HostedRuntimeConfig.from_env({**base, "TOMO_CONTROL_PUBLIC_URL": "http://control.example.test"})
+
     def test_daytona_mode_loads_xai_model_and_reasoning_effort_overrides(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = {
@@ -96,6 +115,7 @@ class HostedRuntimeConfigTests(unittest.TestCase):
                 "TOMO_DAYTONA_SNAPSHOT": "tomo-snapshot",
                 "TOMO_DAYTONA_SANDBOX_DATA_DIR": "/var/lib/tomo",
                 "TOMO_SUPERGROK_OAUTH_JSON_B64": base64.b64encode(b"{}").decode("ascii"),
+                "TOMO_CONTROL_PUBLIC_URL": "https://control.example.test",
                 "TOMO_XAI_MODEL": "grok-test-next",
             }
             for effort in ("low", "medium", "high"):
@@ -138,6 +158,7 @@ class HostedRuntimeConfigTests(unittest.TestCase):
                 "TOMO_DAYTONA_SNAPSHOT": "tomo-snapshot",
                 "TOMO_DAYTONA_SANDBOX_DATA_DIR": "/var/lib/tomo",
                 "TOMO_SUPERGROK_OAUTH_JSON_B64": base64.b64encode(b"{}").decode("ascii"),
+                "TOMO_CONTROL_PUBLIC_URL": "https://control.example.test",
                 "TOMO_ROUTER_WORKERS": "0",
             }
             with self.assertRaisesRegex(ValueError, "TOMO_ROUTER_WORKERS"):

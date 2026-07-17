@@ -65,7 +65,7 @@ def _validate_control_timestamps(control: MemoryWriteControl) -> None:
 _SCHEMA = """
 CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
 CREATE TABLE sessions(id TEXT PRIMARY KEY,owner_id TEXT NOT NULL,session_key TEXT NOT NULL,connector TEXT NOT NULL,actor_id TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,current_generation_id TEXT,current_revision INTEGER,UNIQUE(owner_id,session_key));
-CREATE TABLE messages(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,role TEXT NOT NULL CHECK(role IN ('user','assistant')),content TEXT NOT NULL,timestamp TEXT NOT NULL,ordinal INTEGER,connector_message_id TEXT,update_id INTEGER,burst_id TEXT,generation_id TEXT,generation_status TEXT CHECK(generation_status IS NULL OR generation_status IN ('provisional','accepted')),metadata_json TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL);
+CREATE TABLE messages(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,role TEXT NOT NULL CHECK(role IN ('user','assistant','automation')),content TEXT NOT NULL,timestamp TEXT NOT NULL,ordinal INTEGER,connector_message_id TEXT,update_id INTEGER,burst_id TEXT,generation_id TEXT,generation_status TEXT CHECK(generation_status IS NULL OR generation_status IN ('provisional','accepted')),metadata_json TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL);
 CREATE UNIQUE INDEX messages_user_delivery_identity ON messages(session_id,burst_id,update_id) WHERE role='user' AND burst_id IS NOT NULL AND update_id IS NOT NULL;
 CREATE UNIQUE INDEX messages_assistant_generation_identity ON messages(session_id,generation_id) WHERE role='assistant' AND generation_id IS NOT NULL;
 CREATE TABLE accepted_generations(session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,generation_id TEXT NOT NULL,accepted_at TEXT NOT NULL,PRIMARY KEY(session_id,generation_id));
@@ -134,7 +134,7 @@ class SqlitePersonalDataRepository:
             try:
                 con.execute("BEGIN IMMEDIATE")
                 version = con.execute("SELECT max(version) FROM schema_migrations").fetchone()[0] if self._exists(con, "schema_migrations") else None
-                if version not in (None, 1, 2, 3): raise StorageCapabilityError("unsupported_schema_version")
+                if version not in (None, 1, 2, 3, 4): raise StorageCapabilityError("unsupported_schema_version")
                 if version is None:
                     for statement in _schema_statements():
                         con.execute(statement)
@@ -155,6 +155,23 @@ class SqlitePersonalDataRepository:
                     if "current_revision" not in columns:
                         con.execute("ALTER TABLE sessions ADD COLUMN current_revision INTEGER")
                     con.execute("INSERT INTO schema_migrations VALUES(3,?)", (utc_now_iso(),))
+                    version = 3
+                if version == 3:
+                    con.execute("DROP TRIGGER messages_ai")
+                    con.execute("DROP TRIGGER messages_ad")
+                    con.execute("DROP TRIGGER messages_au")
+                    con.execute("DROP INDEX messages_user_delivery_identity")
+                    con.execute("DROP INDEX messages_assistant_generation_identity")
+                    con.execute("ALTER TABLE messages RENAME TO messages_v3")
+                    con.execute("CREATE TABLE messages(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,role TEXT NOT NULL CHECK(role IN ('user','assistant','automation')),content TEXT NOT NULL,timestamp TEXT NOT NULL,ordinal INTEGER,connector_message_id TEXT,update_id INTEGER,burst_id TEXT,generation_id TEXT,generation_status TEXT CHECK(generation_status IS NULL OR generation_status IN ('provisional','accepted')),metadata_json TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL)")
+                    con.execute("INSERT INTO messages SELECT * FROM messages_v3")
+                    con.execute("DROP TABLE messages_v3")
+                    con.execute("CREATE UNIQUE INDEX messages_user_delivery_identity ON messages(session_id,burst_id,update_id) WHERE role='user' AND burst_id IS NOT NULL AND update_id IS NOT NULL")
+                    con.execute("CREATE UNIQUE INDEX messages_assistant_generation_identity ON messages(session_id,generation_id) WHERE role='assistant' AND generation_id IS NOT NULL")
+                    con.execute("CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN INSERT INTO messages_fts(record_id,owner_id,content) SELECT new.id,s.owner_id,new.content FROM sessions s WHERE s.id=new.session_id; END")
+                    con.execute("CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN DELETE FROM messages_fts WHERE record_id=old.id; END")
+                    con.execute("CREATE TRIGGER messages_au AFTER UPDATE OF content ON messages BEGIN DELETE FROM messages_fts WHERE record_id=old.id; INSERT INTO messages_fts(record_id,owner_id,content) SELECT new.id,s.owner_id,new.content FROM sessions s WHERE s.id=new.session_id; END")
+                    con.execute("INSERT INTO schema_migrations VALUES(4,?)", (utc_now_iso(),))
                 con.commit()
             except sqlite3.OperationalError as error:
                 con.rollback()
@@ -431,7 +448,7 @@ class SqlitePersonalDataRepository:
                 for pos,m in enumerate(session.messages):
                     d=m.metadata; role=m.role; gen=d.get("generation_id"); burst=d.get("burst_id"); update=d.get("update_id")
                     identity_metadata = {key: value for key, value in d.items() if key not in {"ordinal", "connector_message_id", "update_id", "burst_id", "generation_id", "generation_status", "message_id"}}
-                    mid=d.get("legacy_message_id") or (_id("message",s["id"],role, burst,update) if role=="user" and update is not None else _id("message",s["id"],role,gen) if role=="assistant" and gen else _id("message",s["id"],role,m.content,m.timestamp,json.dumps(identity_metadata,sort_keys=True,default=str)))
+                    mid=d.get("legacy_message_id") or (_id("message",s["id"],role, burst,update) if role=="user" and update is not None else _id("message",s["id"],role,d.get("run_id")) if role=="automation" and d.get("run_id") else _id("message",s["id"],role,gen) if role=="assistant" and gen else _id("message",s["id"],role,m.content,m.timestamp,json.dumps(identity_metadata,sort_keys=True,default=str)))
                     status="accepted" if role=="assistant" and gen in session.accepted_generation_ids else d.get("generation_status")
                     if role == "assistant" and gen:
                         con.execute("INSERT INTO messages VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET content=excluded.content,timestamp=excluded.timestamp,ordinal=excluded.ordinal,generation_status=excluded.generation_status,metadata_json=excluded.metadata_json",(mid,s["id"],role,m.content,m.timestamp,d.get("ordinal",pos),d.get("message_id"),update,burst,gen,status,json.dumps(d,sort_keys=True,default=str),now))
@@ -592,9 +609,9 @@ class SqlitePersonalDataRepository:
         limit=max(1,min(q.limit,20)); before=max(0,min(q.context_before,10)); after=max(0,min(q.context_after,10)); remaining=4000
         try:
             with self._connection() as c:
-                rows=c.execute("SELECT m.*,s.session_key,s.connector,-bm25(messages_fts) score FROM messages_fts JOIN messages m ON m.id=messages_fts.record_id JOIN sessions s ON s.id=m.session_id WHERE messages_fts MATCH ? AND s.owner_id=? AND m.role IN (%s) AND (m.role='user' OR m.generation_status='accepted') ORDER BY score DESC LIMIT ?" % ",".join("?"*len(q.roles)),(_fts(q.text),q.owner_id,*q.roles,limit)).fetchall(); out=[]
+                rows=c.execute("SELECT m.*,s.session_key,s.connector,-bm25(messages_fts) score FROM messages_fts JOIN messages m ON m.id=messages_fts.record_id JOIN sessions s ON s.id=m.session_id WHERE messages_fts MATCH ? AND s.owner_id=? AND m.role IN (%s) AND (m.role IN ('user','automation') OR m.generation_status='accepted') ORDER BY score DESC LIMIT ?" % ",".join("?"*len(q.roles)),(_fts(q.text),q.owner_id,*q.roles,limit)).fetchall(); out=[]
                 for r in rows:
-                    context=c.execute("SELECT * FROM messages WHERE session_id=? AND ordinal BETWEEN ? AND ? AND (role='user' OR generation_status='accepted') ORDER BY ordinal,id",(r["session_id"],(r["ordinal"] or 0)-before,(r["ordinal"] or 0)+after)).fetchall()
+                    context=c.execute("SELECT * FROM messages WHERE session_id=? AND ordinal BETWEEN ? AND ? AND (role IN ('user','automation') OR generation_status='accepted') ORDER BY ordinal,id",(r["session_id"],(r["ordinal"] or 0)-before,(r["ordinal"] or 0)+after)).fetchall()
                     texts=[r["content"], *(x["content"] for x in context)]
                     size=sum(len(text) for text in texts)
                     if size > remaining:

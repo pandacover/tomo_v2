@@ -7,7 +7,7 @@ from tomo_core import RuntimeConfig
 from tomo_core.providers import StaticProvider
 from tomo_core.runtime import PersonalAgentRuntime
 from tomo_core.telegram import TelegramDeliverySink, TelegramSendReceipt
-from tomo_core.telegram_bot import TelegramBotApiClient, TelegramPollingBot, TelegramReactionError, envelope_from_update
+from tomo_core.telegram_bot import TelegramBotApiClient, TelegramBotApiError, TelegramDeliveryError, TelegramPollingBot, TelegramReactionError, envelope_from_update
 
 
 class FakeBotApiClient:
@@ -121,6 +121,52 @@ class TelegramBotTests(unittest.TestCase):
         self.assertEqual(receipt, TelegramSendReceipt("123"))
         payload = post.call_args.kwargs["json"]
         self.assertEqual(payload["reply_parameters"], {"message_id": 7})
+
+    def test_bot_api_classifies_transport_failures_without_exposing_details(self):
+        import httpx
+        client = TelegramBotApiClient("secret-token")
+        with patch("httpx.post", side_effect=httpx.ReadTimeout("payload secret")):
+            with self.assertRaises(TelegramDeliveryError) as error:
+                client.send_message("chat", "hello")
+        self.assertTrue(error.exception.uncertain)
+        self.assertEqual(str(error.exception), "telegram_sendMessage_timeout")
+
+    def test_bot_api_keeps_known_rejection_definite(self):
+        class Response:
+            def raise_for_status(self):
+                pass
+            def json(self):
+                return {"ok": False, "description": "private payload"}
+        with patch("httpx.post", return_value=Response()):
+            with self.assertRaises(TelegramDeliveryError) as error:
+                TelegramBotApiClient("secret-token").send_message("chat", "hello")
+        self.assertFalse(error.exception.uncertain)
+        self.assertEqual(str(error.exception), "telegram_sendMessage_rejected")
+
+    def test_bot_api_missing_message_receipt_is_uncertain(self):
+        class Response:
+            def raise_for_status(self):
+                pass
+            def json(self):
+                return {"ok": True, "result": {}}
+        with patch("httpx.post", return_value=Response()):
+            with self.assertRaises(TelegramDeliveryError) as error:
+                TelegramBotApiClient("secret-token").send_message("chat", "hello")
+        self.assertTrue(error.exception.uncertain)
+        self.assertEqual(str(error.exception), "telegram_sendMessage_missing_receipt")
+
+    def test_bot_api_request_keeps_transport_errors_generic_for_polling(self):
+        import httpx
+        with patch("httpx.post", side_effect=httpx.ReadTimeout("upstream secret body")):
+            with self.assertRaises(httpx.ReadTimeout):
+                TelegramBotApiClient("secret-token").get_updates()
+
+    def test_bot_api_reaction_timeout_remains_retryable(self):
+        import httpx
+        with patch("httpx.post", side_effect=httpx.ReadTimeout("upstream secret body")):
+            with self.assertRaises(TelegramReactionError) as error:
+                TelegramBotApiClient("secret-token").set_message_reaction("chat", "7", "👍")
+        self.assertTrue(error.exception.retryable)
 
     def test_bot_api_typing_uses_a_short_best_effort_timeout(self):
         client = TelegramBotApiClient("token")

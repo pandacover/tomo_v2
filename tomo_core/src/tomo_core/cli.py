@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import os
 import re
 import signal
@@ -31,6 +32,9 @@ from .shared_gateway import InProcessTelegramRuntimeDispatch, SharedTelegramGate
 from .sandbox_dispatch import SandboxDispatch
 from .sandbox_registry import SandboxRegistry
 from .sandbox_protocol import RESULT_MARKER, decode_inbound, encode_result
+from .cron_service import CronSchedulerService
+from .cron_store import CronStore
+from .cron_capability import load_or_create_key
 from .personal_data_transfer import export_owner
 from .sqlite_personal_data import SqlitePersonalDataRepository
 
@@ -44,6 +48,40 @@ def _log_shared_gateway_error(error: Exception) -> None:
         file=sys.stderr,
         flush=True,
     )
+
+
+def _cron_job_payload(job) -> dict:
+    return {
+        "job_id": job.job_id,
+        "owner_id": job.owner_id,
+        "intent": {"text": job.intent.text, "constraints": list(job.intent.constraints)},
+        "schedule": {
+            "kind": job.schedule.kind,
+            "at": None if job.schedule.at is None else job.schedule.at.isoformat(),
+            "every_seconds": None if job.schedule.every is None else job.schedule.every.total_seconds(),
+            "expression": job.schedule.expression,
+            "timezone_name": job.schedule.timezone_name,
+            "starts_at": None if job.schedule.starts_at is None else job.schedule.starts_at.isoformat(),
+        },
+        "lifecycle": {
+            "ends_at": None if job.lifecycle.ends_at is None else job.lifecycle.ends_at.isoformat(),
+            "max_successful_runs": job.lifecycle.max_successful_runs,
+        },
+        "destination": job.destination,
+        "status": job.status,
+        "revision": job.revision,
+    }
+
+
+def _cron_run_payload(run) -> dict:
+    return {
+        "run_id": run.run_id,
+        "job_id": run.job_id,
+        "status": run.status,
+        "trigger": run.trigger,
+        "scheduled_for": run.scheduled_for.isoformat(),
+        "revision": run.revision,
+    }
 
 
 def build_provider(args: argparse.Namespace, oauth: OAuthManager):
@@ -187,14 +225,21 @@ def run_shared_gateway_foreground(args: argparse.Namespace, config: HostedRuntim
     try:
         client = TelegramBotApiClient(token=config.bot_token)
         store = TelegramOnboardingStore(config.data_dir, input_debounce_seconds=config.telegram_input_debounce_seconds)
+        capability_key = load_or_create_key(config.data_dir)
+        cron_store = CronStore(config.data_dir)
         if config.runtime == "local":
             provider_factory = lambda _: StaticProvider(args.static_response) if args.static_response else build_provider(args, build_oauth_manager(args))
             instances = RuntimeInstanceRegistry(config.data_dir, provider_factory, client, soul_path=args.soul)
             gateway = SharedTelegramGateway(
                 client=client,
                 store=store,
-                dispatch=InProcessTelegramRuntimeDispatch(instances),
+                dispatch=InProcessTelegramRuntimeDispatch(
+                    instances,
+                    control_url=config.control_public_url,
+                    capability_key=capability_key,
+                ),
                 pace_seconds=config.telegram_delivery_pace_seconds,
+                cron_store=cron_store,
             )
         else:
             auth = HostedSuperGrokTokenBroker(config.data_dir, os.getenv("TOMO_SUPERGROK_OAUTH_JSON_B64"))
@@ -217,24 +262,44 @@ def run_shared_gateway_foreground(args: argparse.Namespace, config: HostedRuntim
                 data_dir=config.daytona_sandbox_data_dir,
                 xai_model=config.xai_model,
                 xai_reasoning_effort=config.xai_reasoning_effort,
+                control_url=config.control_public_url,
+                capability_key=capability_key,
             )
             gateway = SharedTelegramGateway(
                 client=client,
                 store=store,
                 dispatch=dispatch,
                 pace_seconds=config.telegram_delivery_pace_seconds,
+                cron_store=cron_store,
             )
+        cron_service = CronSchedulerService(
+            cron_store,
+            gateway.execute_cron_claim,
+            gateway.send_cron_delivery,
+            delivery_pace_seconds=config.telegram_delivery_pace_seconds,
+        )
         print("shared telegram gateway polling started. press ctrl+c to stop.")
-        TelegramUpdateRouter(
-            client=client,
-            store=store,
-            process_update=gateway.process_update,
-            cancel_generation=getattr(gateway.dispatch, "cancel_generation", None),
-            poll_timeout=config.poll_timeout,
-            worker_count=config.worker_count,
-            on_error=_log_shared_gateway_error,
-        ).run_forever()
+
+        def stop_on_sigterm(_signum: int, _frame: object) -> None:
+            raise KeyboardInterrupt
+
+        previous_sigterm = signal.signal(signal.SIGTERM, stop_on_sigterm)
+        try:
+            cron_service.start()
+            TelegramUpdateRouter(
+                client=client,
+                store=store,
+                process_update=gateway.process_update,
+                cancel_generation=getattr(gateway.dispatch, "cancel_generation", None),
+                poll_timeout=config.poll_timeout,
+                worker_count=config.worker_count,
+                on_error=_log_shared_gateway_error,
+            ).run_forever()
+        finally:
+            signal.signal(signal.SIGTERM, previous_sigterm)
     finally:
+        if "cron_service" in locals():
+            cron_service.stop()
         if _read_pid(pid_path) == os.getpid():
             pid_path.unlink(missing_ok=True)
 
@@ -268,6 +333,15 @@ def main(argv: list[str] | None = None) -> int:
     control_start.add_argument("--host", default=os.getenv("TOMO_CONTROL_HOST", "127.0.0.1"))
     control_start.add_argument("--port", type=int, default=int(os.getenv("TOMO_CONTROL_PORT", "8787")))
     control_start.add_argument("--reload", action="store_true")
+
+    cron = sub.add_parser("cron", help="operator cron inspection commands")
+    cron_sub = cron.add_subparsers(dest="cron_command", required=True)
+    for name, help_text in (("inspect", "inspect one owner-scoped cron job"), ("run-once", "request one immediate owner-scoped run")):
+        command = cron_sub.add_parser(name, help=help_text)
+        command.add_argument("--data-dir", default=os.getenv("TOMO_CORE_DATA_DIR", ".tomo_core"))
+        command.add_argument("--owner", required=True)
+        command.add_argument("--job-id", required=True)
+    cron_sub.choices["run-once"].add_argument("--expected-revision", type=int)
 
     shared = sub.add_parser("telegram-shared", help="shared hosted telegram gateway")
     shared_sub = shared.add_subparsers(dest="shared_command", required=True)
@@ -323,6 +397,21 @@ def main(argv: list[str] | None = None) -> int:
     settings.add_argument("--capture-enabled", choices=("true", "false")); settings.add_argument("--retrieval-enabled", choices=("true", "false")); settings.add_argument("--reactions-enabled", choices=("true", "false"))
 
     args = parser.parse_args(argv)
+    if args.command == "cron":
+        store = CronStore(args.data_dir)
+        if args.cron_command == "inspect":
+            job = store.get(args.owner, args.job_id)
+            if job is None:
+                print("cron job not found", file=sys.stderr)
+                return 1
+            print(json.dumps(_cron_job_payload(job), ensure_ascii=True, separators=(",", ":")))
+            return 0
+        run = store.request_manual_run(args.owner, args.job_id, args.expected_revision)
+        if run is None:
+            print("cron run not requested", file=sys.stderr)
+            return 1
+        print(json.dumps(_cron_run_payload(run), ensure_ascii=True, separators=(",", ":")))
+        return 0
     if args.command == "personal-data":
         repository = SqlitePersonalDataRepository(Path(args.data_dir) / "tomo.sqlite3")
         if args.personal_data_command == "rebuild-index":
@@ -386,7 +475,7 @@ def main(argv: list[str] | None = None) -> int:
             sys.stdout.write(f"{RESULT_MARKER}{encode_result('health-1', [OutboundBubble('healthy')])}\n")
             sys.stdout.flush()
             return 0
-        payload = os.getenv("TOMO_INBOUND_JSON")
+        payload = os.getenv("TOMO_AUTOMATION_JSON") or os.getenv("TOMO_INBOUND_JSON")
         if payload is None:
             emit_failure(sys.stdout, "missing_inbound")
             return 1
@@ -417,7 +506,7 @@ def main(argv: list[str] | None = None) -> int:
                     owner_id=owner_id,
                 ),
                 provider=provider,
-                secret_values=(access_token,),
+                secret_values=tuple(value for value in (access_token, os.getenv("TOMO_CRON_CAPABILITY")) if value),
             )
         except SandboxInboundError:
             return 1

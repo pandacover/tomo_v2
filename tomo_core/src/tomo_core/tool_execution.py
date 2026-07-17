@@ -35,6 +35,7 @@ class _PreparedToolCall:
     call: ToolCall
     invoke: Callable[[dict[str, object]], object]
     arguments: dict[str, object]
+    serial: bool
 
 
 _INVOCATION_FAILED = object()
@@ -128,9 +129,16 @@ class ToolExecutor:
                 tool = self._registry.resolve(provider_call.name)
             except ToolRegistryError as error:
                 raise ToolBatchValidationError(error.code) from error
-            if not tool.spec.read_only or not tool.spec.parallel_safe:
-                raise ToolBatchValidationError("unsupported_tool")
-            prepared.append(_PreparedToolCall(ToolCall(provider_call.call_id, provider_call.name, arguments), tool.invoke, copy.deepcopy(arguments)))
+            prepared.append(
+                _PreparedToolCall(
+                    ToolCall(provider_call.call_id, provider_call.name, arguments),
+                    tool.invoke,
+                    copy.deepcopy(arguments),
+                    not tool.spec.read_only or not tool.spec.parallel_safe,
+                )
+            )
+        if any(call.serial for call in prepared) and len(prepared) != 1:
+            raise ToolBatchValidationError("incompatible_tool_batch")
         return tuple(prepared)
 
     def execute_batch(
@@ -157,14 +165,20 @@ class ToolExecutor:
 
         if not is_active():
             raise ToolBatchCancelled()
-        with ThreadPoolExecutor(max_workers=len(parsed)) as workers:
-            futures = [workers.submit(prepared_call.invoke, prepared_call.arguments) for prepared_call in parsed]
-            results = []
-            for future in futures:
-                try:
-                    results.append(future.result())
-                except Exception:
-                    results.append(_INVOCATION_FAILED)
+        if len(parsed) == 1:
+            try:
+                results = [parsed[0].invoke(parsed[0].arguments)]
+            except Exception:
+                results = [_INVOCATION_FAILED]
+        else:
+            with ThreadPoolExecutor(max_workers=len(parsed)) as workers:
+                futures = [workers.submit(prepared_call.invoke, prepared_call.arguments) for prepared_call in parsed]
+                results = []
+                for future in futures:
+                    try:
+                        results.append(future.result())
+                    except Exception:
+                        results.append(_INVOCATION_FAILED)
 
         if not is_active():
             raise ToolBatchCancelled()

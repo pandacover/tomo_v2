@@ -4,7 +4,7 @@ import json
 from collections.abc import Mapping, Sequence
 
 from ..context import ContextSnapshot
-from ..models import InboundEnvelope, InputBurst
+from ..models import AutomationTurn, InboundEnvelope, InputBurst
 from ..skills import render_capability_skill_index
 from .contract import render_first_segment_contract, render_later_segment_contract
 from .models import ConversationMove, ConversationRequest, MovePlan, TurnBudget
@@ -122,6 +122,7 @@ def _first_segment_system(soul: str, budget: TurnBudget, tool_schemas: tuple[dic
     return (
         "you are tomo. follow the supplied SOUL completely.\n"
         "memory_control records are optional and internal. follow the indexed memory skill when emitting them.\n"
+        "follow the indexed cron-jobs skill for scheduled work.\n"
         "use reactions very sparsely; use null for commands, auth, errors, routine acknowledgements, ambiguity, corrections, opt-outs, serious, sensitive, or distressing content. never mention reactions to the user. moves are turn-level purposes, never frame or bubble sections; MovePlan does not determine frame count.\n"
         "never use markdown, internal labels, em dashes, or en dashes in frame text. never claim an action happened without a supplied observation.\n"
         f"{tool_guidance}\n"
@@ -149,6 +150,7 @@ def _later_segment_system(soul: str, budget: TurnBudget, plan: MovePlan, tool_sc
     return (
         "you are tomo. follow the supplied SOUL completely.\n"
         "memory_control records are optional and internal. follow the indexed memory skill when emitting them.\n"
+        "follow the indexed cron-jobs skill for scheduled work.\n"
         f"{completion_guidance}\n"
         "original request and conversation history remain valid context for final frames. claims about tool outcomes or actions must be grounded in supplied tool observations.\n"
         "never use markdown, internal labels, em dashes, or en dashes in frame text. never claim an action happened without a supplied observation.\n"
@@ -213,7 +215,9 @@ def _visible_context(inbound: InboundEnvelope | InputBurst) -> list[dict[str, st
     return []
 
 
-def _user_payload(inbound: InboundEnvelope | InputBurst) -> str:
+def _user_payload(inbound: InboundEnvelope | InputBurst | AutomationTurn) -> str:
+    if isinstance(inbound, AutomationTurn):
+        return inbound.event_text
     if isinstance(inbound, InboundEnvelope):
         if inbound.attachments:
             return json.dumps(

@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import json
+from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, Header, HTTPException, Request
+from pydantic import BaseModel, Field, field_validator
 
+from .cron_capability import CronCapability, CronCapabilityError, load_or_create_key, verify_capability
+from .cron_models import CronJob, JobIntent, LifecyclePolicy, ScheduleSpec
+from .cron_store import CronStore
 from .onboarding_store import TelegramOnboardingStore
 
 
@@ -20,11 +26,53 @@ class InstallLinkResponse(BaseModel):
     expires_at: int = Field(alias="expiresAt")
 
 
+class CronScheduleRequest(BaseModel):
+    kind: str
+    at: str | None = Field(default=None, max_length=64)
+    every_seconds: float | None = Field(default=None, alias="everySeconds")
+    expression: str | None = Field(default=None, max_length=128)
+    timezone_name: str = Field(default="UTC", alias="timezoneName", max_length=128)
+    starts_at: str | None = Field(default=None, alias="startsAt", max_length=64)
+    model_config = {"extra": "forbid"}
+
+
+class CronLifecycleRequest(BaseModel):
+    ends_at: str | None = Field(default=None, alias="endsAt", max_length=64)
+    max_successful_runs: int | None = Field(default=None, alias="maxSuccessfulRuns")
+    model_config = {"extra": "forbid"}
+
+
+class CronJobRequest(BaseModel):
+    intent: str = Field(min_length=1, max_length=4000)
+    constraints: list[str] = Field(default_factory=list, max_length=32)
+    schedule: CronScheduleRequest
+    lifecycle: CronLifecycleRequest = Field(default_factory=CronLifecycleRequest)
+    revision: int | None = Field(default=None, ge=1)
+    model_config = {"extra": "forbid"}
+
+    @field_validator("constraints")
+    @classmethod
+    def validate_constraint_budget(cls, values: list[str]) -> list[str]:
+        constraints = [value.strip() for value in values]
+        if any(not value or len(value) > 1000 for value in constraints):
+            raise ValueError("constraints must contain non-blank strings of at most 1000 characters")
+        if sum(len(value) for value in constraints) > 8000:
+            raise ValueError("constraints cannot exceed 8000 characters")
+        return constraints
+
+
+class CronRevisionRequest(BaseModel):
+    revision: int = Field(ge=1)
+    model_config = {"extra": "forbid"}
+
+
 def create_app(data_dir: str | Path | None = None, api_key: str | None = None, bot_username: str | None = None) -> FastAPI:
     resolved_data_dir = Path(data_dir or os.getenv("TOMO_CORE_DATA_DIR", ".tomo_core"))
     resolved_api_key = api_key if api_key is not None else os.getenv("TOMO_CONTROL_API_KEY")
     resolved_bot_username = bot_username or os.getenv("TOMO_TELEGRAM_GLOBAL_BOT_USERNAME")
     store: TelegramOnboardingStore | None = None
+    cron_store: CronStore | None = None
+    cron_key: bytes | None = None
     app = FastAPI(title="tomo core control api")
 
     def onboarding_store() -> TelegramOnboardingStore:
@@ -32,6 +80,33 @@ def create_app(data_dir: str | Path | None = None, api_key: str | None = None, b
         if store is None:
             store = TelegramOnboardingStore(resolved_data_dir)
         return store
+
+    def jobs() -> CronStore:
+        nonlocal cron_store
+        if cron_store is None:
+            cron_store = CronStore(resolved_data_dir)
+        return cron_store
+
+    def cron_capability(request: Request, operation: str) -> CronCapability:
+        nonlocal cron_key
+        authorization = request.headers.get("authorization", "")
+        if not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="invalid capability")
+        if cron_key is None:
+            cron_key = load_or_create_key(resolved_data_dir)
+        try:
+            capability = verify_capability(cron_key, authorization[7:], operation=operation)
+        except CronCapabilityError:
+            raise HTTPException(status_code=401, detail="invalid capability") from None
+        context = (
+            request.headers.get("x-tomo-owner-id"),
+            request.headers.get("x-tomo-actor-id"),
+            request.headers.get("x-tomo-destination"),
+            request.headers.get("x-tomo-session-id"),
+        )
+        if context != (capability.owner_id, capability.actor_id, capability.destination, capability.session_id):
+            raise HTTPException(status_code=401, detail="invalid capability")
+        return capability
 
     @app.get("/v1/health")
     def health() -> dict[str, str]:
@@ -46,7 +121,125 @@ def create_app(data_dir: str | Path | None = None, api_key: str | None = None, b
         link = onboarding_store().create_install_link(user_id=body.user_id, bot_username=resolved_bot_username)
         return InstallLinkResponse(dmUrl=link.dm_url, browserUrl=link.browser_url, expiresAt=link.expires_at)
 
+    @app.post("/v1/cron/jobs")
+    def create_cron_job(body: CronJobRequest, request: Request, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, object]:
+        capability = cron_capability(request, "create")
+        if not idempotency_key or len(idempotency_key) > 256:
+            raise HTTPException(status_code=400, detail="missing idempotency key")
+        job_id = hashlib.sha256(f"{capability.owner_id}\ncreate\n{idempotency_key}".encode("utf-8")).hexdigest()[:32]
+        try:
+            job = CronJob(job_id, capability.owner_id, capability.destination, JobIntent(body.intent, tuple(body.constraints)), _schedule(body.schedule), _lifecycle(body.lifecycle))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="invalid cron job") from None
+        try:
+            created, _ = jobs().mutate_idempotently(capability.owner_id, "create", idempotency_key, _canonical(body), job=job)
+        except ValueError as error:
+            if str(error) == "idempotency conflict":
+                raise HTTPException(status_code=409, detail="cron idempotency conflict") from None
+            raise
+        return {"ok": True, "job": _job(created)}
+
+    @app.get("/v1/cron/jobs")
+    def list_cron_jobs(request: Request) -> dict[str, object]:
+        capability = cron_capability(request, "list")
+        return {"ok": True, "jobs": [_job(job) for job in jobs().list(capability.owner_id)]}
+
+    @app.get("/v1/cron/jobs/{job_id}")
+    def inspect_cron_job(job_id: str, request: Request) -> dict[str, object]:
+        capability = cron_capability(request, "inspect")
+        return {"ok": True, "job": _required_job(capability.owner_id, job_id)}
+
+    @app.patch("/v1/cron/jobs/{job_id}")
+    def update_cron_job(job_id: str, body: CronJobRequest, request: Request, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, object]:
+        capability = cron_capability(request, "update")
+        _idempotency_key(idempotency_key)
+        current = jobs().get(capability.owner_id, job_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail="cron job not found")
+        try:
+            replacement = CronJob(job_id, capability.owner_id, capability.destination, JobIntent(body.intent, tuple(body.constraints)), _schedule(body.schedule), _lifecycle(body.lifecycle))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="invalid cron job") from None
+        if body.revision is None:
+            raise HTTPException(status_code=422, detail="missing cron revision")
+        try:
+            updated, _ = jobs().mutate_idempotently(capability.owner_id, "update", idempotency_key, _canonical({"jobId": job_id, **body.model_dump(by_alias=True)}), job=replacement, revision=body.revision)
+        except ValueError as error:
+            if str(error) == "idempotency conflict": raise HTTPException(status_code=409, detail="cron idempotency conflict") from None
+            raise
+        if updated is None:
+            raise HTTPException(status_code=409, detail="cron revision conflict")
+        return {"ok": True, "job": _job(updated)}
+
+    def action(job_id: str, body: CronRevisionRequest, request: Request, operation: str, idempotency_key: str | None) -> dict[str, object]:
+        capability = cron_capability(request, operation)
+        _idempotency_key(idempotency_key)
+        if jobs().get(capability.owner_id, job_id) is None:
+            raise HTTPException(status_code=404, detail="cron job not found")
+        try:
+            changed, _ = jobs().mutate_idempotently(capability.owner_id, operation, idempotency_key, _canonical({"jobId": job_id, **body.model_dump(by_alias=True)}), job_id=job_id, revision=body.revision)
+        except ValueError as error:
+            if str(error) == "idempotency conflict": raise HTTPException(status_code=409, detail="cron idempotency conflict") from None
+            raise
+        if changed is None:
+            raise HTTPException(status_code=409, detail="cron revision conflict")
+        return {"ok": True, "job": _job(changed)}
+
+    @app.post("/v1/cron/jobs/{job_id}/pause")
+    def pause_cron_job(job_id: str, body: CronRevisionRequest, request: Request, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, object]: return action(job_id, body, request, "pause", idempotency_key)
+    @app.post("/v1/cron/jobs/{job_id}/resume")
+    def resume_cron_job(job_id: str, body: CronRevisionRequest, request: Request, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, object]: return action(job_id, body, request, "resume", idempotency_key)
+    @app.post("/v1/cron/jobs/{job_id}/run-now")
+    def run_cron_job(job_id: str, body: CronRevisionRequest, request: Request, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, object]: return action(job_id, body, request, "run_now", idempotency_key)
+    @app.post("/v1/cron/jobs/{job_id}/delete")
+    def delete_cron_job(job_id: str, body: CronRevisionRequest, request: Request, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, object]: return action(job_id, body, request, "delete", idempotency_key)
+
+    @app.get("/v1/cron/jobs/{job_id}/history")
+    def cron_history(job_id: str, request: Request) -> dict[str, object]:
+        capability = cron_capability(request, "history")
+        _required_job(capability.owner_id, job_id)
+        return {"ok": True, "history": list(jobs().history(capability.owner_id, job_id))}
+
+    def _required_job(owner_id: str, job_id: str):
+        job = jobs().get(owner_id, job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="cron job not found")
+        return job
+
     return app
 
 
 app = create_app()
+
+
+def _timestamp(value: str | None) -> datetime | None:
+    return None if value is None else datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _idempotency_key(value: str | None) -> str:
+    if not value or len(value) > 256:
+        raise HTTPException(status_code=400, detail="missing idempotency key")
+    return value
+
+
+def _canonical(value: object) -> str:
+    if isinstance(value, BaseModel):
+        value = value.model_dump(by_alias=True)
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _schedule(value: CronScheduleRequest) -> ScheduleSpec:
+    if value.kind == "once": return ScheduleSpec.once(_timestamp(value.at))  # type: ignore[arg-type]
+    if value.kind == "interval": return ScheduleSpec.interval(value.every_seconds, starts_at=_timestamp(value.starts_at))  # type: ignore[arg-type]
+    if value.kind == "cron": return ScheduleSpec.cron(value.expression or "", value.timezone_name)
+    raise ValueError("invalid schedule")
+
+
+def _lifecycle(value: CronLifecycleRequest) -> LifecyclePolicy:
+    return LifecyclePolicy(_timestamp(value.ends_at), value.max_successful_runs)
+
+
+def _job(job: CronJob) -> dict[str, object]:
+    schedule = {"kind": job.schedule.kind, "at": job.schedule.at.isoformat() if job.schedule.at else None, "everySeconds": job.schedule.every.total_seconds() if job.schedule.every else None, "expression": job.schedule.expression, "timezoneName": job.schedule.timezone_name, "startsAt": job.schedule.starts_at.isoformat() if job.schedule.starts_at else None}
+    lifecycle = {"endsAt": job.lifecycle.ends_at.isoformat() if job.lifecycle.ends_at else None, "maxSuccessfulRuns": job.lifecycle.max_successful_runs}
+    return {"jobId": job.job_id, "intent": job.intent.text, "constraints": list(job.intent.constraints), "schedule": schedule, "lifecycle": lifecycle, "status": job.status.value, "revision": job.revision}

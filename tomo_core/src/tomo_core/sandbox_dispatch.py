@@ -15,10 +15,11 @@ from typing import Callable, Iterator, Protocol
 from .daytona_client import DaytonaClient, DaytonaClientError, SessionCommandHandle
 from .daytona_supervisor import DaytonaSupervisor
 from .conversation import TurnBudget
-from .models import InboundEnvelope, InboundMessage, InputBurst, MessageAttachment, OutboundBubble, RuntimeConfig
+from .models import AutomationTurn, InboundEnvelope, InboundMessage, InputBurst, MessageAttachment, OutboundBubble, RuntimeConfig
 from .onboarding_store import InterruptedGeneration, TelegramGenerationInput, TelegramGenerationWork, TelegramInstallation
-from .sandbox_protocol import SandboxCompletedEvent, SandboxErrorEvent, SandboxEvent, SandboxFrameEvent, SandboxProtocolError, encode_inbound, iter_event_markers, parse_result_marker
+from .sandbox_protocol import SandboxCompletedEvent, SandboxErrorEvent, SandboxEvent, SandboxFrameEvent, SandboxProtocolError, encode_automation, encode_inbound, iter_event_markers, parse_result_marker
 from . import latency_trace
+from .cron_capability import CronCapability, issue_capability
 
 
 _COMMAND = "/opt/tomo/.venv/bin/tomo-core sandbox-inbound"
@@ -58,6 +59,8 @@ class SandboxDispatch:
         xai_model: str,
         xai_reasoning_effort: str,
         budget: TurnBudget | None = None,
+        control_url: str | None = None,
+        capability_key: bytes | None = None,
     ) -> None:
         self.supervisor = supervisor
         self.client = client
@@ -66,6 +69,8 @@ class SandboxDispatch:
         self.xai_model = xai_model
         self.xai_reasoning_effort = xai_reasoning_effort
         self.budget = budget or RuntimeConfig().tool_turn_budget
+        self.control_url = control_url
+        self.capability_key = capability_key
 
     def ensure_worker(self, installation: TelegramInstallation) -> None:
         self.supervisor.reconcile(installation.tomo_id)
@@ -90,6 +95,13 @@ class SandboxDispatch:
             return bubbles
 
     def iter_telegram_events(
+        self, installation: TelegramInstallation, work: TelegramGenerationWork, is_active: Callable[[], bool] | None = None
+    ) -> Iterator[SandboxEvent]:
+        # Scheduled turns share this owner lock, so a sandbox never has two session turns racing.
+        with self._locks[installation.tomo_id]:
+            yield from self._iter_telegram_events(installation, work, is_active)
+
+    def _iter_telegram_events(
         self, installation: TelegramInstallation, work: TelegramGenerationWork, is_active: Callable[[], bool] | None = None
     ) -> Iterator[SandboxEvent]:
         is_active = is_active or (lambda: True)
@@ -132,6 +144,7 @@ class SandboxDispatch:
                         "TOMO_CORE_SOUL": "/opt/tomo/SOUL.md",
                         "TOMO_XAI_MODEL": os.getenv("TOMO_XAI_MODEL", self.xai_model),
                         "TOMO_XAI_REASONING_EFFORT": os.getenv("TOMO_XAI_REASONING_EFFORT", self.xai_reasoning_effort),
+                        **self._interactive_cron_env(installation),
                         **_latency_env(),
                     },
                     timeout=_EXEC_TIMEOUT_SECONDS,
@@ -208,6 +221,84 @@ class SandboxDispatch:
                         pass
         raise SandboxDispatchError("auth_expired")
 
+    def _interactive_cron_env(self, installation: TelegramInstallation) -> dict[str, str]:
+        if self.control_url is None or self.capability_key is None:
+            return {}
+        now = int(time.time())
+        capability = CronCapability(installation.tomo_id, installation.actor_id, f"telegram:{installation.chat_id}", f"telegram:actor:{installation.actor_id}", now, now + 300)
+        return {
+            "TOMO_CRON_CONTROL_URL": self.control_url,
+            "TOMO_CRON_CAPABILITY": issue_capability(self.capability_key, capability),
+            "TOMO_CRON_OWNER_ID": installation.tomo_id,
+            "TOMO_CRON_ACTOR_ID": installation.actor_id,
+            "TOMO_CRON_DESTINATION": f"telegram:{installation.chat_id}",
+            "TOMO_CRON_SESSION_ID": f"telegram:actor:{installation.actor_id}",
+        }
+
+    def iter_automation_events(
+        self, installation: TelegramInstallation, turn: AutomationTurn, generation_id: str, session_id: str,
+        is_active: Callable[[], bool] | None = None,
+    ) -> Iterator[SandboxEvent]:
+        """Run an automation turn through the same sandbox/auth/parser boundary."""
+        if generation_id != turn.generation_id or turn.actor_id != installation.actor_id or turn.chat_id != installation.chat_id:
+            raise SandboxDispatchError("invalid_result")
+        is_active = is_active or (lambda: True)
+        request_id = _request_id(generation_id)
+        with self._locks[installation.tomo_id]:
+            try:
+                record = self.supervisor.reconcile(installation.tomo_id)
+                if not record.sandbox_id:
+                    raise SandboxDispatchError("sandbox_not_ready")
+                sandbox = self.client.get(record.sandbox_id)
+            except DaytonaClientError as error:
+                raise SandboxDispatchError("sandbox_exec_failed") from error
+            for attempt in range(2):
+                command = None
+                try:
+                    if not is_active():
+                        return
+                    token = self.auth_broker.access_token(force_refresh=attempt == 1)
+                    command = self.client.start_session_command(sandbox, session_id, _COMMAND, env={
+                        "TOMO_AUTOMATION_JSON": encode_automation(request_id, turn),
+                        "TOMO_CORE_DATA_DIR": self.data_dir,
+                        "TOMO_INSTANCE_ID": installation.tomo_id,
+                        "TOMO_SUPERGROK_ACCESS_TOKEN": token,
+                        "TOMO_CORE_SOUL": "/opt/tomo/SOUL.md",
+                        "TOMO_XAI_MODEL": os.getenv("TOMO_XAI_MODEL", self.xai_model),
+                        "TOMO_XAI_REASONING_EFFORT": os.getenv("TOMO_XAI_REASONING_EFFORT", self.xai_reasoning_effort),
+                        **_latency_env(),
+                    }, timeout=_EXEC_TIMEOUT_SECONDS)
+                    yielded = 0
+                    for event in iter_event_markers(self.client.iter_session_logs(sandbox, command), request_id, generation_id, budget=self.budget):
+                        if isinstance(event, SandboxErrorEvent):
+                            if event.code == "auth_expired" and yielded == 0 and attempt == 0:
+                                break
+                            raise SandboxDispatchError(event.code)
+                        yielded += 1
+                        if not is_active():
+                            return
+                        yield event
+                    else:
+                        exit_code = self.client.session_command_exit_code(sandbox, command)
+                        if exit_code:
+                            raise SandboxDispatchError("sandbox_timeout" if exit_code == 124 else "sandbox_exec_failed")
+                        return
+                except (DaytonaClientError, TimeoutError) as error:
+                    raise SandboxDispatchError("sandbox_timeout" if isinstance(error, TimeoutError) else "sandbox_exec_failed") from error
+                except ValueError as error:
+                    raise SandboxDispatchError("invalid_result") from error
+                except SandboxDispatchError:
+                    raise
+                except Exception as error:
+                    raise SandboxDispatchError("access_token_failed") from error
+                finally:
+                    if command is not None:
+                        try:
+                            self.client.delete_session(sandbox, session_id)
+                        except DaytonaClientError:
+                            pass
+        raise SandboxDispatchError("auth_expired")
+
     def cancel_generation(self, interrupted: InterruptedGeneration) -> None:
         try:
             record = self.supervisor.reconcile(interrupted.tomo_id)
@@ -234,8 +325,9 @@ class SandboxDispatch:
                     "TOMO_SUPERGROK_ACCESS_TOKEN": token,
                     "TOMO_CORE_SOUL": "/opt/tomo/SOUL.md",
                     "TOMO_XAI_MODEL": os.getenv("TOMO_XAI_MODEL", self.xai_model),
-                "TOMO_XAI_REASONING_EFFORT": os.getenv("TOMO_XAI_REASONING_EFFORT", self.xai_reasoning_effort),
-                **_latency_env(),
+                    "TOMO_XAI_REASONING_EFFORT": os.getenv("TOMO_XAI_REASONING_EFFORT", self.xai_reasoning_effort),
+                    **self._interactive_cron_env(TelegramInstallation("", tomo_id, str(envelope.native_metadata.get("delivery_chat_id", "")), envelope.actor_id, 0)),
+                    **_latency_env(),
                 },
                 timeout=_EXEC_TIMEOUT_SECONDS,
             )

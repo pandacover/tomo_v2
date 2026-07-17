@@ -46,6 +46,7 @@ class ToolSpec:
     read_only: bool = True
     parallel_safe: bool = True
     internal_context: bool = False
+    unattended_safe: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str):
@@ -57,7 +58,7 @@ class ToolSpec:
             raise ValueError("tool description is required")
         if not isinstance(self.parameters, Mapping):
             raise ValueError("tool parameters must be a mapping")
-        for flag in (self.read_only, self.parallel_safe, self.internal_context):
+        for flag in (self.read_only, self.parallel_safe, self.internal_context, self.unattended_safe):
             if not isinstance(flag, bool):
                 raise ValueError("tool flags must be booleans")
         parameters = _freeze_json(self.parameters)
@@ -97,17 +98,20 @@ class ToolRegistryError(RuntimeError):
 
 
 class ToolRegistry:
-    def __init__(self, tools: tuple[BoundTool, ...] = ()) -> None:
+    def __init__(self, tools: tuple[BoundTool, ...] = (), *, blocked: frozenset[str] = frozenset()) -> None:
         tools = tuple(tools)
         if any(not isinstance(tool, BoundTool) for tool in tools):
             raise ValueError("registry tools must be BoundTools")
         names = [tool.spec.name for tool in tools]
         if len(set(names)) != len(names):
             raise ValueError("tool names must be unique")
-        if any(not tool.spec.read_only or not tool.spec.parallel_safe for tool in tools):
-            raise ValueError("v1 tools must be read-only and parallel-safe")
+        if not isinstance(blocked, frozenset) or any(not isinstance(name, str) or not name for name in blocked):
+            raise ValueError("blocked tool names must be non-empty strings")
+        if blocked & set(names):
+            raise ValueError("blocked tool cannot be exposed")
         self._tools = tools
         self._by_name = {tool.spec.name: tool for tool in tools}
+        self._blocked = blocked
 
     def schemas(self) -> tuple[dict[str, object], ...]:
         return tuple(
@@ -125,10 +129,19 @@ class ToolRegistry:
     def resolve(self, name: str) -> BoundTool:
         tool = self._by_name.get(name)
         if tool is None:
-            raise ToolRegistryError("unknown_tool")
+            raise ToolRegistryError("approval_needed" if name in self._blocked else "unknown_tool")
         return tool
+
+    def is_blocked(self, name: str) -> bool:
+        return name in self._blocked
 
     def extend(self, other: "ToolRegistry") -> "ToolRegistry":
         if not isinstance(other, ToolRegistry):
             raise ValueError("other must be a ToolRegistry")
-        return ToolRegistry((*self._tools, *other._tools))
+        return ToolRegistry((*self._tools, *other._tools), blocked=self._blocked | other._blocked)
+
+    def unattended(self) -> "ToolRegistry":
+        return ToolRegistry(
+            tuple(tool for tool in self._tools if tool.spec.unattended_safe),
+            blocked=self._blocked | frozenset(tool.spec.name for tool in self._tools if not tool.spec.unattended_safe),
+        )

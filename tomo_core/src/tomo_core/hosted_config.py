@@ -5,6 +5,7 @@ import json
 import math
 import os
 import tempfile
+from urllib.parse import urlparse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
@@ -39,6 +40,7 @@ class HostedRuntimeConfig:
     telegram_delivery_pace_seconds: float
     xai_model: str
     xai_reasoning_effort: str
+    control_public_url: str | None
 
     @classmethod
     def from_env(
@@ -89,6 +91,15 @@ class HostedRuntimeConfig:
                 raise ValueError("invalid TOMO_SUPERGROK_OAUTH_JSON_B64") from None
             if not isinstance(oauth_payload, dict):
                 raise ValueError("invalid TOMO_SUPERGROK_OAUTH_JSON_B64")
+        control_public_url = values.get("TOMO_CONTROL_PUBLIC_URL")
+        if not control_public_url and values.get("RAILWAY_PUBLIC_DOMAIN"):
+            control_public_url = f"https://{values['RAILWAY_PUBLIC_DOMAIN']}"
+        if runtime == "local" and not control_public_url:
+            control_public_url = "http://127.0.0.1:8787"
+        if runtime == "daytona" and not _is_https_url(control_public_url):
+            raise ValueError("missing or invalid TOMO_CONTROL_PUBLIC_URL")
+        if runtime == "local" and control_public_url is not None and not _is_http_url(control_public_url):
+            raise ValueError("invalid TOMO_CONTROL_PUBLIC_URL")
 
         resolved_poll_timeout = poll_timeout if poll_timeout is not None else _parse_positive(
             values.get("TOMO_TELEGRAM_POLL_TIMEOUT", "30"), "TOMO_TELEGRAM_POLL_TIMEOUT", _MAX_POLL_TIMEOUT
@@ -124,6 +135,7 @@ class HostedRuntimeConfig:
             telegram_delivery_pace_seconds=delivery_pace_seconds,
             xai_model=values.get("TOMO_XAI_MODEL", _DEFAULT_XAI_MODEL),
             xai_reasoning_effort=values.get("TOMO_XAI_REASONING_EFFORT", _DEFAULT_XAI_REASONING_EFFORT),
+            control_public_url=control_public_url,
         )
 
 
@@ -149,3 +161,14 @@ def _parse_non_negative_float(value: str, name: str) -> float:
 
 def _is_absolute_posix_path(value: str) -> bool:
     return value.startswith("/") and value.strip() == value
+
+
+def _is_http_url(value: str | None) -> bool:
+    if not value or value.strip() != value:
+        return False
+    parsed = urlparse(value)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc) and not parsed.username and not parsed.password
+
+
+def _is_https_url(value: str | None) -> bool:
+    return _is_http_url(value) and urlparse(value).scheme == "https"

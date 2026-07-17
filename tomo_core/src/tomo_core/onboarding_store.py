@@ -89,6 +89,15 @@ class InterruptedGeneration:
     session_id: str
 
 
+@dataclass(frozen=True)
+class AutomationGenerationReservation:
+    generation_id: str
+    chat_id: str
+    tomo_id: str
+    revision: int
+    session_id: str
+
+
 class TelegramOnboardingStore:
     def __init__(self, data_dir: str | Path, *, input_debounce_seconds: float = 0.7) -> None:
         if input_debounce_seconds < 0:
@@ -204,6 +213,12 @@ class TelegramOnboardingStore:
             superseded_generation_id = None
             superseded_session_id = None
             turn = db.execute("select * from telegram_chat_turns where chat_id = ?", (chat_id,)).fetchone()
+            if turn is not None and turn["active_generation_id"]:
+                active_generation_id = turn["active_generation_id"]
+                generation = db.execute("select session_id from telegram_generations where generation_id=? and status='active'", (active_generation_id,)).fetchone()
+                db.execute("update telegram_generations set status='superseded',updated_at=? where generation_id=? and status='active'", (now, active_generation_id))
+                superseded_generation_id = active_generation_id
+                superseded_session_id = generation["session_id"] if generation is not None else None
             if turn is None or turn["burst_id"] is None:
                 burst_id = f"{chat_id}:{update_id}"
                 persisted_revision = int(
@@ -227,7 +242,7 @@ class TelegramOnboardingStore:
                 burst_id = turn["burst_id"]
                 revision = int(turn["revision"]) + 1
                 active_generation_id = turn["active_generation_id"]
-                if active_generation_id:
+                if active_generation_id and superseded_generation_id is None:
                     generation = db.execute(
                         "select session_id from telegram_generations where generation_id = ? and status = 'active'",
                         (active_generation_id,),
@@ -249,6 +264,27 @@ class TelegramOnboardingStore:
             db.execute("update telegram_inbox set burst_id = ? where update_id = ?", (burst_id, update_id))
             db.commit()
             return EnqueueResult(True, burst_id, revision, superseded_generation_id, superseded_session_id)
+        finally:
+            db.close()
+
+    def reserve_automation_generation(self, chat_id: str, tomo_id: str, run_id: str, *, now: float | None = None) -> AutomationGenerationReservation | None:
+        """Reserve the chat revision for an automation turn without inventing inbox input."""
+        now = time.time() if now is None else now
+        db = self._connect()
+        try:
+            db.execute("begin immediate")
+            turn = db.execute("select * from telegram_chat_turns where chat_id=?", (chat_id,)).fetchone()
+            if turn is not None and (turn["burst_id"] is not None or turn["active_generation_id"] is not None):
+                db.commit()
+                return None
+            persisted = int(db.execute("select coalesce(max(revision),0) from telegram_generations where chat_id=?", (chat_id,)).fetchone()[0])
+            revision = max(persisted, int(turn["revision"]) if turn is not None else 0) + 1
+            generation_id = f"automation:{run_id}:r{revision}"
+            session_id = self._session_id(generation_id)
+            db.execute("insert into telegram_generations(generation_id,burst_id,chat_id,tomo_id,revision,session_id,status,error_code,created_at,updated_at) values(?,?,?,?,?,?,'active',null,?,?)", (generation_id, generation_id, chat_id, tomo_id, revision, session_id, now, now))
+            db.execute("insert into telegram_chat_turns(chat_id,burst_id,revision,quiet_until,active_generation_id,updated_at) values(?,null,?,?,?,?) on conflict(chat_id) do update set burst_id=null,revision=excluded.revision,active_generation_id=excluded.active_generation_id,updated_at=excluded.updated_at", (chat_id, revision, now, generation_id, now))
+            db.commit()
+            return AutomationGenerationReservation(generation_id, chat_id, tomo_id, revision, session_id)
         finally:
             db.close()
 

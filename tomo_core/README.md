@@ -29,6 +29,7 @@ what is included:
 - no tool execution message bubbles
 - owner-scoped SQLite sessions, provenance-bearing autonomous memory, and canonical JSONL export
 - sparse, allowlisted Telegram reactions delivered as best-effort side effects
+- durable owner-scoped one-time, interval, and cron agent jobs with separate execution, Telegram delivery retries, and terminal uncertain-send handling
 
 what is intentionally not included yet:
 - google calendar event tools
@@ -46,6 +47,26 @@ PYTHONPATH=src python -m unittest discover -s tests -v
 ## hosted operations
 
 For the shared Telegram gateway on Railway and per-user Daytona sandboxes, see [../docs/daytona-railway.md](../docs/daytona-railway.md). User onboarding and local hosted-mode setup are in [../docs/onboarding-telegram.md](../docs/onboarding-telegram.md).
+
+Scheduled agency is owned by the control host, not a Daytona sandbox. Jobs,
+runs, leases, outcomes, and delivery receipts are stored in
+`<TOMO_CORE_DATA_DIR>/cron.sqlite3`; the signing key used for short-lived
+owner capabilities is `<TOMO_CORE_DATA_DIR>/cron-capability.key`. Hosted
+Daytona mode requires an HTTPS `TOMO_CONTROL_PUBLIC_URL` (or derives one from
+`RAILWAY_PUBLIC_DOMAIN`). Local mode uses `http://127.0.0.1:8787` unless the
+URL is explicitly configured. Keep the control API and shared Telegram
+gateway on the same absolute `TOMO_CORE_DATA_DIR`.
+
+See [docs/adr/0003-control-host-durable-agent-cron.md](docs/adr/0003-control-host-durable-agent-cron.md)
+for lifecycle, retries, revision fencing, capabilities, and deferred scope.
+
+Operators can inspect or enqueue an immediate run without exposing bearer
+tokens:
+
+```bash
+uv run tomo-core cron inspect --data-dir /data --owner <tomo-id> --job-id <job-id>
+uv run tomo-core cron run-once --data-dir /data --owner <tomo-id> --job-id <job-id> --expected-revision <revision>
+```
 
 ## personal data operations
 

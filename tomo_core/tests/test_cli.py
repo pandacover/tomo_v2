@@ -1,14 +1,44 @@
 import io
+import json
+import signal
 import tempfile
 import unittest
+from types import SimpleNamespace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 from tomo_core.cli import _log_shared_gateway_error, main
+from tomo_core.cron_models import CronJob, JobIntent, ScheduleSpec
+from tomo_core.cron_store import CronStore
 from tomo_core.telegram_router import RetryableTelegramUpdateError
 
 
 class CliTests(unittest.TestCase):
+    def test_cron_operator_inspect_and_run_once_are_owner_scoped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job = CronJob(
+                "job-1",
+                "owner-1",
+                "telegram:1",
+                JobIntent("check something current"),
+                ScheduleSpec.once(datetime.now(timezone.utc) + timedelta(hours=1)),
+            )
+            CronStore(tmp).create(job)
+            with patch("sys.stdout", io.StringIO()) as stdout:
+                self.assertEqual(main(["cron", "inspect", "--data-dir", tmp, "--owner", "owner-1", "--job-id", "job-1"]), 0)
+                inspected = json.loads(stdout.getvalue())
+            self.assertEqual(inspected["intent"]["text"], "check something current")
+            self.assertNotIn("capability", inspected)
+
+            with patch("sys.stdout", io.StringIO()) as stdout:
+                self.assertEqual(main(["cron", "run-once", "--data-dir", tmp, "--owner", "owner-1", "--job-id", "job-1", "--expected-revision", "1"]), 0)
+                requested = json.loads(stdout.getvalue())
+            self.assertEqual((requested["job_id"], requested["trigger"], requested["revision"]), ("job-1", "manual", 1))
+
+            with patch("sys.stderr", io.StringIO()):
+                self.assertEqual(main(["cron", "inspect", "--data-dir", tmp, "--owner", "other", "--job-id", "job-1"]), 1)
+
     def test_shared_gateway_error_log_excludes_exception_messages(self):
         error = RetryableTelegramUpdateError("storage_operation_failed")
         error.__cause__ = RuntimeError("token=sensitive-value")
@@ -55,6 +85,46 @@ class CliTests(unittest.TestCase):
     def test_telegram_shared_production_mode_fails_closed_without_hosted_dependencies(self):
         with patch.dict("os.environ", {}, clear=True):
             self.assertEqual(main(["telegram-shared", "start", "--token", "token"]), 2)
+
+    def test_shared_gateway_sigterm_stops_cron_scheduler(self):
+        handlers = {}
+        config = SimpleNamespace(
+            bot_token="token",
+            data_dir="unused",
+            runtime="local",
+            control_public_url=None,
+            telegram_delivery_pace_seconds=0,
+            telegram_input_debounce_seconds=0,
+            poll_timeout=30,
+            worker_count=1,
+        )
+
+        def register_signal(signum, handler):
+            handlers[signum] = handler
+
+        def run_forever():
+            handlers[signal.SIGTERM](signal.SIGTERM, None)
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch("tomo_core.cli.HostedRuntimeConfig.from_env", return_value=config),
+            patch("tomo_core.cli.TelegramBotApiClient"),
+            patch("tomo_core.cli.TelegramOnboardingStore"),
+            patch("tomo_core.cli.load_or_create_key", return_value=b"k" * 32),
+            patch("tomo_core.cli.CronStore"),
+            patch("tomo_core.cli.RuntimeInstanceRegistry"),
+            patch("tomo_core.cli.SharedTelegramGateway") as gateway,
+            patch("tomo_core.cli.CronSchedulerService") as scheduler,
+            patch("tomo_core.cli.TelegramUpdateRouter") as router,
+            patch("tomo_core.cli.signal.signal", side_effect=register_signal),
+        ):
+            gateway.return_value.dispatch.cancel_generation = None
+            router.return_value.run_forever.side_effect = run_forever
+            with self.assertRaises(KeyboardInterrupt):
+                main(["telegram-shared", "start", "--token", "token", "--data-dir", tmp, "--static-response", "test"])
+
+        scheduler.return_value.start.assert_called_once()
+        scheduler.return_value.stop.assert_called_once()
 
     def test_telegram_shared_ignores_static_response_environment_without_explicit_flag(self):
         with patch.dict("os.environ", {"TOMO_CORE_STATIC_RESPONSE": "test"}, clear=True):

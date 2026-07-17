@@ -36,5 +36,5 @@ class ContextHydrator:
             history.append({"role": role, "content": content})
         return ContextSnapshot(
             history=tuple(history),
-            visible_frames=tuple(request.burst.visible_assistant_utterances),
+            visible_frames=tuple(getattr(request.burst, "visible_assistant_utterances", ())),
         )

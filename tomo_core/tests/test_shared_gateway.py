@@ -2,8 +2,12 @@ import tempfile
 import time
 import unittest
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from unittest.mock import Mock, patch
 
+from tomo_core.cron_capability import verify_capability
+from tomo_core.cron_models import CronJob, DeliveryAttempt, JobIntent, RunOutcome, ScheduleSpec
+from tomo_core.cron_store import CronStore
 from tomo_core.instances import RuntimeInstanceRegistry
 from tomo_core.models import InboundEnvelope, OutboundBubble
 from tomo_core.onboarding_store import TelegramOnboardingStore
@@ -13,6 +17,8 @@ from tomo_core.sandbox_dispatch import SandboxDispatchError
 from tomo_core.sandbox_protocol import SandboxCompletedEvent, SandboxFrameEvent, SandboxReactionEvent, SandboxStaleEvent
 from tomo_core.telegram import FakeTelegramClient
 from tomo_core.telegram_router import RetryableTelegramUpdateError, StaleRevisionTelegramUpdateError, TelegramUpdateRouter
+from tomo_core.tool_execution import ToolExecutor
+from tomo_core.tools import BoundTool, ToolRegistry, ToolSpec
 
 
 def private_update(text, chat_id="123", from_id="123", message_id=1):
@@ -52,6 +58,11 @@ class FakeRuntimeDispatch:
         yield SandboxFrameEvent(1, 0, 1, "second.")
         yield SandboxCompletedEvent(2, {"logical_text": "first. second."})
 
+    def iter_automation_events(self, installation, turn, generation_id, session_id, is_active=None):
+        self.calls.append(("automation", installation, turn, generation_id, session_id))
+        yield SandboxFrameEvent(0, 0, 0, "scheduled result")
+        yield SandboxCompletedEvent(1, {"status": "completed", "logical_text": "scheduled result"})
+
 
 class RecordingTypingLease:
     instances = []
@@ -81,6 +92,67 @@ class RecordingTypingLease:
 class SharedGatewayTests(unittest.TestCase):
     def setUp(self):
         RecordingTypingLease.instances = []
+
+    def test_automation_completed_partial_persists_a_partial_outcome(self):
+        with self._store() as store:
+            installation = self._installation(store, chat_id="123", actor_id="999")
+
+            class PartialDispatch(FakeRuntimeDispatch):
+                def iter_automation_events(self, installation, turn, generation_id, session_id, is_active=None):
+                    yield SandboxFrameEvent(0, 0, 0, "partial result")
+                    yield SandboxCompletedEvent(1, {"status": "completed_partial"})
+
+            now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+            cron = CronStore(store.data_dir)
+            cron.create(CronJob("partial", installation.tomo_id, "telegram:123", JobIntent("Check status"), ScheduleSpec.once(now)))
+            claim = cron.claim_due_run(now=now)
+            gateway = SharedTelegramGateway(client=FakeTelegramClient(), store=store, dispatch=PartialDispatch(), cron_store=cron)
+
+            outcome, frames = gateway.execute_cron_claim(claim)
+
+            self.assertEqual(outcome, RunOutcome.PARTIAL)
+            self.assertEqual(frames, ("partial result",))
+
+    def test_automation_approval_needed_does_not_expose_blocked_tool_details(self):
+        with self._store() as store:
+            installation = self._installation(store, chat_id="123", actor_id="999")
+
+            class ApprovalDispatch(FakeRuntimeDispatch):
+                def iter_automation_events(self, installation, turn, generation_id, session_id, is_active=None):
+                    yield SandboxCompletedEvent(0, {"status": "approval_needed"})
+
+            now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+            cron = CronStore(store.data_dir)
+            cron.create(CronJob("approval", installation.tomo_id, "telegram:123", JobIntent("Check status"), ScheduleSpec.once(now)))
+            claim = cron.claim_due_run(now=now)
+            outcome, frames = SharedTelegramGateway(client=FakeTelegramClient(), store=store, dispatch=ApprovalDispatch(), cron_store=cron).execute_cron_claim(claim)
+
+            self.assertEqual(outcome, RunOutcome.APPROVAL_NEEDED)
+            self.assertEqual(frames, ())
+
+    def test_reclaimed_cron_claim_fences_the_active_automation_stream(self):
+        with self._store() as store:
+            installation = self._installation(store, chat_id="123", actor_id="999")
+            now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+            cron = CronStore(store.data_dir)
+            cron.create(CronJob("reclaimed", installation.tomo_id, "telegram:123", JobIntent("Check status"), ScheduleSpec.once(now)))
+            claim = cron.claim_due_run(now=now, lease_seconds=1)
+            self.assertTrue(cron.begin_run(claim.run.run_id, claim.lease_token, now=now, lease_seconds=1))
+            test = self
+
+            class ReclaimingDispatch(FakeRuntimeDispatch):
+                def iter_automation_events(self, installation, turn, generation_id, session_id, is_active=None):
+                    reclaimed_store = CronStore(store.data_dir)
+                    test.assertEqual(reclaimed_store.recover_expired_leases(now=now.replace(second=2)), 1)
+                    reclaimed = reclaimed_store.claim_due_run(now=now.replace(second=2))
+                    test.assertTrue(reclaimed_store.begin_run(reclaimed.run.run_id, reclaimed.lease_token, now=now.replace(second=2)))
+                    test.assertFalse(is_active())
+                    yield SandboxFrameEvent(0, 0, 0, "stale")
+
+            gateway = SharedTelegramGateway(client=FakeTelegramClient(), store=store, dispatch=ReclaimingDispatch(), cron_store=cron)
+            with self.assertRaisesRegex(RuntimeError, "cron_run_invalidated"):
+                gateway.execute_cron_claim(claim)
+            self.assertFalse(cron.complete_run(claim.run.run_id, claim.lease_token, RunOutcome.SUCCEEDED, "stale", now=now.replace(second=2)))
 
     def test_start_binds_sends_setup_ensures_worker_then_connected(self):
         with self._store() as store:
@@ -314,7 +386,7 @@ class SharedGatewayTests(unittest.TestCase):
             self.assertEqual(lease.actor_id, "123")
             self.assertEqual(lease.calls, ["start", "pause", "close", "close"])
 
-    def test_generation_typing_lease_resumes_after_failed_first_bubble_while_active(self):
+    def test_generation_marks_failed_telegram_send_unknown_without_retrying(self):
         with self._store() as store:
             installation = self._installation(store, chat_id="123", actor_id="999")
             work = self._generation_work(store, installation.tomo_id)
@@ -338,10 +410,10 @@ class SharedGatewayTests(unittest.TestCase):
                 typing_lease_factory=RecordingTypingLease,
             )
 
-            with self.assertRaises(RetryableTelegramUpdateError) as raised:
-                gateway.process_update(work)
+            self.assertTrue(gateway.process_update(work))
 
-            self.assertEqual(raised.exception.error_code, "delivery_uncertain")
+            self.assertEqual(store.delivery_status(work.generation_id, 0), "unknown")
+            self.assertFalse(store.is_generation_active(work.generation_id, work.revision))
             self.assertEqual(RecordingTypingLease.instances[0].calls, ["start", "pause", "resume", "pause", "close", "close"])
 
     def test_generation_work_emits_first_delivery_without_message_content(self):
@@ -356,7 +428,7 @@ class SharedGatewayTests(unittest.TestCase):
             self.assertEqual(emit.call_args_list[2].args[0], work.burst_id)
             self.assertNotIn("first.", repr(emit.call_args_list))
 
-    def test_later_bubble_failure_is_not_labeled_first_delivery(self):
+    def test_later_bubble_failure_is_not_labeled_first_delivery_or_retried(self):
         with self._store() as store:
             installation = self._installation(store, chat_id="123", actor_id="999")
             work = self._generation_work(store, installation.tomo_id)
@@ -370,12 +442,15 @@ class SharedGatewayTests(unittest.TestCase):
 
             client.send_message = fail_second
             with patch("tomo_core.shared_gateway.latency_trace.emit") as emit:
-                with self.assertRaises(RetryableTelegramUpdateError):
+                self.assertTrue(
                     SharedTelegramGateway(client=client, store=store, dispatch=FakeRuntimeDispatch(), pace_seconds=0).process_update(work)
+                )
 
             self.assertFalse(any(call.kwargs.get("outcome") == "error" for call in emit.call_args_list))
+            self.assertEqual(store.delivery_status(work.generation_id, 1), "unknown")
+            self.assertFalse(store.is_generation_active(work.generation_id, work.revision))
 
-    def test_only_first_bubble_failure_is_labeled_first_delivery_attempt(self):
+    def test_first_bubble_failure_is_labeled_first_delivery_and_not_retried(self):
         with self._store() as store:
             installation = self._installation(store, chat_id="123", actor_id="999")
             work = self._generation_work(store, installation.tomo_id)
@@ -383,11 +458,14 @@ class SharedGatewayTests(unittest.TestCase):
             client.send_message = Mock(side_effect=RuntimeError("send failed"))
 
             with patch("tomo_core.shared_gateway.latency_trace.emit") as emit:
-                with self.assertRaises(RetryableTelegramUpdateError):
+                self.assertTrue(
                     SharedTelegramGateway(client=client, store=store, dispatch=FakeRuntimeDispatch(), pace_seconds=0).process_update(work)
+                )
 
             first_delivery_errors = [call for call in emit.call_args_list if call.args[1] == "telegram_first_delivery" and call.kwargs.get("outcome") == "error"]
             self.assertEqual(len(first_delivery_errors), 1)
+            self.assertEqual(store.delivery_status(work.generation_id, 0), "unknown")
+            self.assertFalse(store.is_generation_active(work.generation_id, work.revision))
 
     def test_generation_work_delivers_one_reaction_before_frames_and_ignores_replay(self):
         with self._store() as store:
@@ -526,18 +604,16 @@ class SharedGatewayTests(unittest.TestCase):
             gateway = SharedTelegramGateway(client=client, store=store, dispatch=FakeRuntimeDispatch(), pace_seconds=0)
 
             with patch("tomo_core.shared_gateway.latency_trace.emit") as emit:
-                with self.assertRaises(RetryableTelegramUpdateError) as raised:
-                    gateway.process_update(work)
+                self.assertTrue(gateway.process_update(work))
 
-            self.assertEqual(raised.exception.error_code, "delivery_uncertain")
             self.assertEqual([message["text"] for message in client.sent_messages], ["first.", "second."])
             first_delivery_outcomes = [call.kwargs.get("outcome") for call in emit.call_args_list if call.args[1] == "telegram_first_delivery"]
             self.assertEqual(first_delivery_outcomes, ["send_complete", "origin_to_delivery"])
             self.assertEqual(store.delivery_status(work.generation_id, 0), "unknown")
-            self.assertTrue(store.is_generation_active(work.generation_id, work.revision))
+            self.assertFalse(store.is_generation_active(work.generation_id, work.revision))
             store.mark_delivery_sent = original_mark_sent
 
-    def test_router_retries_generation_when_delivery_acknowledgement_is_uncertain(self):
+    def test_router_does_not_retry_generation_when_delivery_acknowledgement_is_uncertain(self):
         with self._store() as store:
             installation = self._installation(store, chat_id="123", actor_id="999")
             store.enqueue_update(1, "123", '{"update_id":1}', now=1.0, update_kind="message", message_id="1", tomo_id=installation.tomo_id)
@@ -554,8 +630,8 @@ class SharedGatewayTests(unittest.TestCase):
                 row = db.execute("select status, error_code from telegram_generations order by created_at").fetchone()
             finally:
                 db.close()
-            self.assertEqual((row["status"], row["error_code"]), ("failed", "delivery_uncertain"))
-            self.assertIsNotNone(store.claim_next_work(now=3))
+            self.assertEqual((row["status"], row["error_code"]), ("completed", None))
+            self.assertIsNone(store.claim_next_work(now=3))
             store.mark_delivery_sent = original_mark_sent
 
     def test_in_process_dispatch_passes_active_predicate_to_runtime(self):
@@ -570,6 +646,77 @@ class SharedGatewayTests(unittest.TestCase):
             list(InProcessTelegramRuntimeDispatch(instances).iter_telegram_events(installation, work, is_active=lambda: False))
 
             self.assertIs(runtime.handle_telegram_burst_iter.call_args.kwargs["is_active"](), False)
+
+    def test_in_process_interactive_turn_gets_fresh_owner_scoped_cron_tools_then_restores_registry(self):
+        with self._store() as store:
+            installation = self._installation(store, chat_id="123", actor_id="999")
+            work = self._generation_work(store, installation.tomo_id)
+            base_registry = ToolRegistry()
+            runtime = Mock()
+            runtime.provider.supports_tool_calls = True
+            runtime.tool_registry = base_registry
+            runtime.conversation.tool_registry = base_registry
+            runtime.conversation.tool_executor = ToolExecutor(base_registry)
+            visible_names = []
+
+            def handle(_burst, **_kwargs):
+                visible_names.extend(item["function"]["name"] for item in runtime.conversation.tool_registry.schemas())
+                return iter(())
+
+            runtime.handle_telegram_burst_iter.side_effect = handle
+            instances = Mock()
+            instances.get.return_value = runtime
+            key = b"k" * 32
+            captured = {}
+
+            def fake_registry(client, generation_id):
+                captured.update(capability=client.capability, generation_id=generation_id, context=(client.owner_id, client.actor_id, client.destination, client.session_id))
+                tool = BoundTool(ToolSpec("cron_list", "list jobs", {"type": "object", "properties": {}}), lambda _arguments: ())
+                return ToolRegistry((tool,))
+
+            dispatch = InProcessTelegramRuntimeDispatch(instances, "http://127.0.0.1:8787", key, clock=lambda: 100.0)
+            with patch("tomo_core.shared_gateway.cron_registry", side_effect=fake_registry):
+                list(dispatch.iter_telegram_events(installation, work))
+
+            claims = verify_capability(key, captured["capability"], now=100)
+            self.assertEqual((claims.owner_id, claims.actor_id, claims.destination, claims.session_id), (installation.tomo_id, installation.actor_id, "telegram:123", f"telegram:actor:{installation.actor_id}"))
+            self.assertEqual(captured["context"], (claims.owner_id, claims.actor_id, claims.destination, claims.session_id))
+            self.assertEqual(captured["generation_id"], work.generation_id)
+            self.assertIn("cron_list", visible_names)
+            self.assertIs(runtime.tool_registry, base_registry)
+            self.assertIs(runtime.conversation.tool_registry, base_registry)
+
+    def test_cron_claim_executes_in_owner_bound_automation_lane_then_delivers_without_reply(self):
+        with self._store() as store:
+            installation = self._installation(store, chat_id="123", actor_id="999")
+            cron = CronStore(store.data_dir)
+            now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+            cron.create(CronJob("job", installation.tomo_id, "telegram:123", JobIntent("check status", ("be concise",)), ScheduleSpec.once(now)))
+            claim = cron.claim_due_run(now=now)
+            dispatch = FakeRuntimeDispatch()
+            client = FakeTelegramClient()
+            gateway = SharedTelegramGateway(client=client, store=store, dispatch=dispatch)
+
+            outcome, frames = gateway.execute_cron_claim(claim)
+            receipt = gateway.send_cron_delivery(DeliveryAttempt("delivery", "run", 1, "lease", "leased", 0, "telegram:123", frames[0], 1, installation.tomo_id, "job"))
+
+            self.assertEqual((outcome.value, frames), ("succeeded", ("scheduled result",)))
+            turn = dispatch.calls[-1][2]
+            self.assertEqual((turn.actor_id, turn.chat_id, turn.intent, turn.constraints), ("999", "123", "check status", ("be concise",)))
+            self.assertEqual(receipt, "1")
+            self.assertEqual(client.sent_messages, [{"actor_id": "123", "text": "scheduled result", "reply_to_message_id": None}])
+
+    def test_cron_delivery_rejects_rebound_installation_before_telegram_send(self):
+        with self._store() as store:
+            installation = self._installation(store, chat_id="123", actor_id="999")
+            client = FakeTelegramClient()
+            gateway = SharedTelegramGateway(client=client, store=store, dispatch=FakeRuntimeDispatch())
+            attempt = DeliveryAttempt("delivery", "run", 1, "lease", "leased", 0, "telegram:123", "result", 1, f"other-{installation.tomo_id}", "job")
+
+            with self.assertRaisesRegex(RuntimeError, "installation_unavailable"):
+                gateway.send_cron_delivery(attempt)
+
+            self.assertEqual(client.sent_messages, [])
 
     @staticmethod
     @contextmanager

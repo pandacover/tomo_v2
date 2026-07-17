@@ -6,7 +6,7 @@ from math import isfinite
 from types import MappingProxyType
 from typing import Mapping, Sequence, TypeAlias
 
-from ..models import InboundEnvelope, InboundMessage, InputBurst
+from ..models import AutomationTurn, InboundEnvelope, InboundMessage, InputBurst
 from ..personal_data import MemoryControl, MemoryGovernanceControl, MemoryWriteControl, OwnerSettingControl, PendingMemoryActionControl
 
 
@@ -41,6 +41,7 @@ class TurnRunStatus(str, Enum):
     COMPLETED_PARTIAL = "completed_partial"
     CANCELLED = "cancelled"
     FAILED = "failed"
+    APPROVAL_NEEDED = "approval_needed"
 
 
 REACTION_EMOJI_OPTIONS = ("👍", "❤️", "😂", "🔥", "🥰", "👏", "🤔", "👀", "🙏", "🫡")
@@ -279,6 +280,8 @@ class TurnRunResult:
                 raise ValueError("a partial turn run requires visible frames and a partial boundary")
         if status is TurnRunStatus.FAILED and segments[-1].finish is not SegmentFinish.FAILED:
             raise ValueError("a failed turn run must end with a failed segment")
+        if status is TurnRunStatus.APPROVAL_NEEDED and segments[-1].finish is not SegmentFinish.FAILED:
+            raise ValueError("an approval-needed turn run must end with a failed segment")
         object.__setattr__(self, "segments", segments)
         object.__setattr__(self, "frames", frames)
         object.__setattr__(self, "status", status)
@@ -338,13 +341,14 @@ class TurnRunCompleted:
 
 @dataclass(frozen=True)
 class ConversationRequest:
-    burst: InputBurst
+    burst: InputBurst | AutomationTurn
     soul: str
     history: tuple[dict[str, str], ...]
 
     @property
-    def envelope(self) -> InboundEnvelope:
-        return self.burst.latest
+    def envelope(self) -> InboundEnvelope | None:
+        """Inbound provenance exists only for user-authored requests."""
+        return self.burst.latest if isinstance(self.burst, InputBurst) else None
 
     @classmethod
     def from_history(cls, *, envelope: InboundEnvelope, soul: str, history: Sequence[dict[str, str]]) -> "ConversationRequest":

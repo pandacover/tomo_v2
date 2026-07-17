@@ -47,15 +47,15 @@ class ToolContractTests(unittest.TestCase):
             with self.subTest(parameters=parameters), self.assertRaises(ValueError):
                 ToolSpec("lookup", "Finds a record.", parameters)
 
-    def test_registry_rejects_duplicates_and_non_v1_tools(self):
+    def test_registry_rejects_duplicates_but_accepts_mutating_and_serial_tools(self):
         lookup = BoundTool(ToolSpec("lookup", "Finds a record.", _parameters()), lambda arguments: arguments)
-        for tools in (
-            (lookup, lookup),
-            (BoundTool(ToolSpec("write", "Writes a record.", _parameters(), read_only=False), lambda _: None),),
-            (BoundTool(ToolSpec("serial", "Serial access.", _parameters(), parallel_safe=False), lambda _: None),),
-        ):
-            with self.subTest(tools=tools), self.assertRaises(ValueError):
-                ToolRegistry(tools)
+        with self.assertRaises(ValueError):
+            ToolRegistry((lookup, lookup))
+        registry = ToolRegistry((
+            BoundTool(ToolSpec("write", "Writes a record.", _parameters(), read_only=False), lambda _: None),
+            BoundTool(ToolSpec("serial", "Serial access.", _parameters(), parallel_safe=False), lambda _: None),
+        ))
+        self.assertEqual(tuple(schema["function"]["name"] for schema in registry.schemas()), ("write", "serial"))
 
     def test_registry_exposes_deterministic_defensive_openai_schemas_and_exact_resolution(self):
         registry = ToolRegistry((BoundTool(ToolSpec("lookup", "Finds a record.", _parameters()), lambda _: "ok"),))
@@ -69,3 +69,16 @@ class ToolContractTests(unittest.TestCase):
             registry.resolve("LOOKUP")
         self.assertEqual(raised.exception.code, "unknown_tool")
         self.assertEqual(ToolRegistry().schemas(), ())
+
+    def test_unattended_view_exposes_only_explicitly_safe_tools_and_marks_blocked_calls(self):
+        registry = ToolRegistry((
+            BoundTool(ToolSpec("lookup", "Finds a record.", _parameters(), unattended_safe=True), lambda _: "ok"),
+            BoundTool(ToolSpec("write", "Writes a record.", _parameters(), read_only=False), lambda _: "ok"),
+        ))
+
+        unattended = registry.unattended()
+
+        self.assertEqual(tuple(schema["function"]["name"] for schema in unattended.schemas()), ("lookup",))
+        with self.assertRaises(ToolRegistryError) as raised:
+            unattended.resolve("write")
+        self.assertEqual(raised.exception.code, "approval_needed")

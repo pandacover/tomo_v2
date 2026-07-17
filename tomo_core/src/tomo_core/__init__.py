@@ -4,13 +4,14 @@ telegram-first conversational agent runtime with provider adapters and delivery 
 """
 
 from .conversation import ConversationEngine, ConversationMove, ConversationRequest, MovePlan
-from .models import InboundEnvelope, InboundMessage, InputBurst, MessageAttachment, OutboundBubble, ResponseContract, RuntimeConfig
+from .models import AutomationTurn, InboundEnvelope, InboundMessage, InputBurst, MessageAttachment, OutboundBubble, ResponseContract, RuntimeConfig
 from .runtime import PersonalAgentRuntime
 
 __all__ = [
     "ConversationEngine",
     "ConversationMove",
     "ConversationRequest",
+    "AutomationTurn",
     "InboundEnvelope",
     "InboundMessage",
     "InputBurst",

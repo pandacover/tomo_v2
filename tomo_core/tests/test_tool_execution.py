@@ -116,6 +116,25 @@ class ToolExecutionTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "tool_budget_exceeded")
         self.assertEqual(invoked, [])
 
+    def test_mutating_or_serial_tool_must_be_the_only_call_in_a_batch(self):
+        invoked = []
+        executor = ToolExecutor(_registry(
+            _tool("read", lambda _: invoked.append("read")),
+            _tool("write", lambda _: invoked.append("write"), read_only=False),
+            _tool("serial", lambda _: invoked.append("serial"), parallel_safe=False),
+        ))
+        for name in ("write", "serial"):
+            with self.subTest(name=name), self.assertRaises(ToolBatchValidationError) as raised:
+                executor.execute_batch(
+                    (ProviderToolCallReady("one", "read", "{}"), ProviderToolCallReady("two", name, "{}")), 2, lambda: True
+                )
+            self.assertEqual(raised.exception.code, "incompatible_tool_batch")
+            self.assertEqual(invoked, [])
+
+        executor.execute_batch((ProviderToolCallReady("one", "write", "{}"),), 1, lambda: True)
+        executor.execute_batch((ProviderToolCallReady("two", "serial", "{}"),), 1, lambda: True)
+        self.assertEqual(invoked, ["write", "serial"])
+
     def test_tool_argument_mutation_does_not_change_retained_tool_call(self):
         def mutate(arguments: dict[str, object]) -> str:
             arguments["nested"]["items"].append("mutated")  # type: ignore[index]
@@ -127,8 +146,8 @@ class ToolExecutionTests(unittest.TestCase):
 
         self.assertEqual(result.tool_calls[0].arguments, {"nested": {"items": ["original"]}})
 
-    def test_cancellation_before_submission_and_after_work_returns_nothing(self):
-        executor = ToolExecutor(_registry(_tool("known", lambda _: "finished")))
+    def test_cancellation_before_and_after_a_serial_side_effect_returns_nothing(self):
+        executor = ToolExecutor(_registry(_tool("known", lambda _: "finished", read_only=False)))
         calls = (ProviderToolCallReady("id", "known", "{}"),)
         with self.assertRaises(ToolBatchCancelled) as before:
             executor.execute_batch(calls, 1, lambda: False)
@@ -139,6 +158,6 @@ class ToolExecutionTests(unittest.TestCase):
             active[0] = False
             return "finished"
 
-        executor = ToolExecutor(_registry(_tool("known", finish_then_cancel)))
+        executor = ToolExecutor(_registry(_tool("known", finish_then_cancel, read_only=False)))
         with self.assertRaises(ToolBatchCancelled):
             executor.execute_batch(calls, 1, lambda: active[0])

@@ -451,3 +451,16 @@ class TelegramOnboardingStoreTests(unittest.TestCase):
             replacement = store.claim_next_work(now=2)
 
             self.assertEqual(replacement.visible_assistant_utterances, ())
+
+    def test_automation_reservation_uses_revision_and_is_superseded_by_user_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TelegramOnboardingStore(tmp)
+            reservation = store.reserve_automation_generation("chat-a", "tomo-1", "run-1", now=1)
+            self.assertIsNotNone(reservation)
+            self.assertIsNone(store.reserve_automation_generation("chat-a", "tomo-1", "run-2", now=2))
+
+            result = store.enqueue_update(7, "chat-a", "user", now=3, update_kind="message", message_id="m7", tomo_id="tomo-1")
+            self.assertEqual(result.superseded_generation_id, reservation.generation_id)
+            self.assertEqual(result.superseded_session_id, reservation.session_id)
+            work = store.claim_next_work(now=4)
+            self.assertGreater(work.revision, reservation.revision)

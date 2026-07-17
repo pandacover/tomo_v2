@@ -51,12 +51,12 @@ def personal_search_registry(repository: PersonalDataRepository, owner_id: str) 
                 "query": {"type": "string", "maxLength": 500},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 8},
             }, "additionalProperties": False,
-        }), search_memories),
+        }, unattended_safe=True), search_memories),
         BoundTool(ToolSpec("search_sessions", "Search this owner's accepted conversation history.", {
             "type": "object", "properties": {
                 "query": {"type": "string", "minLength": 1, "maxLength": 500},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 5},
             }, "required": ["query"], "additionalProperties": False,
-        }), search_sessions),
+        }, unattended_safe=True), search_sessions),
     )
     return ToolRegistry(schemas)

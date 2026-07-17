@@ -53,6 +53,7 @@ class RailwayCoreStartTests(unittest.TestCase):
             "TOMO_DAYTONA_SNAPSHOT": "snapshot",
             "TOMO_DAYTONA_SANDBOX_DATA_DIR": "/var/lib/tomo",
             "TOMO_SUPERGROK_OAUTH_JSON_B64": "e30=",
+            "TOMO_CONTROL_PUBLIC_URL": "https://core.example.test",
         }
 
     def test_child_failure_terminates_sibling_and_returns_failure(self):

@@ -3,9 +3,9 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Literal
 
-from .models import InboundMessage, MessageAttachment, utc_now_iso
+from .models import AutomationTurn, InboundMessage, MessageAttachment, utc_now_iso
 
-Role = Literal["user", "assistant"]
+Role = Literal["user", "assistant", "automation"]
 
 
 @dataclass(frozen=True)
@@ -53,6 +53,20 @@ class ConversationSession:
         )
         return True
 
+    def append_automation_once(self, turn: AutomationTurn) -> bool:
+        if not isinstance(turn, AutomationTurn):
+            raise TypeError("turn must be an AutomationTurn")
+        if any(message.role == "automation" and message.metadata.get("run_id") == turn.run_id for message in self.messages):
+            return False
+        self.messages.append(StoredMessage("automation", turn.event_text, timestamp=turn.scheduled_for, metadata={
+            "source": "automation", "connector": turn.connector, "actor_id": turn.actor_id,
+            "job_id": turn.job_id, "run_id": turn.run_id,
+            "generation_id": turn.generation_id, "revision": turn.revision,
+            "burst_id": turn.run_id, "chat_id": turn.chat_id, "trigger": turn.trigger,
+            "will_end_after_run": turn.will_end_after_run,
+        }))
+        return True
+
     def accept_generations(self, generation_ids: tuple[str, ...]) -> None:
         accepted = set(self.accepted_generation_ids)
         for generation_id in generation_ids:
@@ -63,7 +77,7 @@ class ConversationSession:
 
     def model_history(self, limit: int = 20) -> list[dict[str, str]]:
         return [
-            {"role": message.role, "content": message.content}
+            _model_message(message)
             for message in self.messages[-limit:]
         ]
 
@@ -72,14 +86,20 @@ class ConversationSession:
         visible: list[StoredMessage] = []
         for message in self.messages:
             metadata = message.metadata
-            if message.role == "user" and metadata.get("burst_id") == burst_id:
+            if metadata.get("burst_id") == burst_id:
                 continue
             if metadata.get("generation_status") == "provisional" and metadata.get("generation_id") not in accepted:
                 continue
             visible.append(message)
-        return [{"role": message.role, "content": message.content} for message in visible[-limit:]]
+        return [_model_message(message) for message in visible[-limit:]]
 
 
 def _attachment_metadata(attachment: MessageAttachment) -> dict:
     payload = asdict(attachment)
     return {key: value for key, value in payload.items() if value is not None}
+
+
+def _model_message(message: StoredMessage) -> dict[str, str]:
+    if message.role == "automation":
+        return {"role": "user", "content": message.content}
+    return {"role": message.role, "content": message.content}

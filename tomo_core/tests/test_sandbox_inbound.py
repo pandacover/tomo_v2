@@ -36,7 +36,7 @@ class SandboxInboundTests(unittest.TestCase):
         burst = self._burst()
         with patch("tomo_core.sandbox_inbound.build_runtime", return_value=runtime) as build_runtime:
             self.assertEqual(run_once(io.StringIO(encode_inbound("request-1", burst)), stdout, config=config, provider=provider), 0)
-        build_runtime.assert_called_once_with(provider, config)
+        build_runtime.assert_called_once_with(provider, config, generation_id="gen-1")
         runtime.handle_telegram_burst_iter.assert_called_once_with(burst)
         events = list(iter_event_markers(stdout.getvalue().splitlines(keepends=True), "request-1", "gen-1"))
         self.assertEqual(events[0], SandboxFrameEvent(0, 0, 0, "hello back."))

@@ -9,11 +9,12 @@ from typing import Any, Callable, Iterable, Iterator, TypeAlias
 
 from .conversation import ConversationMove, FrameReady, MoveConfidence, MovePlan, ReactionIntent, SegmentFinish, TurnBudget, TurnRunCompleted, TurnRunStatus, TurnUsage
 from .conversation.parsing import _validate_strict_frame_text, parse_utterance, parse_utterances
-from .models import InboundEnvelope, InboundMessage, InputBurst, MessageAttachment, OutboundBubble, ResponseContract, RuntimeConfig
+from .models import AutomationTurn, InboundEnvelope, InboundMessage, InputBurst, MessageAttachment, OutboundBubble, ResponseContract, RuntimeConfig
 from .runtime import RuntimeCompleted, RuntimeFrameReady, RuntimeReactionReady
 from .latency_trace import SANDBOX_LATENCY_MARKER
 
 INBOUND_PROTOCOL_VERSION = 2
+AUTOMATION_PROTOCOL_VERSION = 6
 PROTOCOL_VERSION = 5
 LEGACY_EVENT_PROTOCOL_VERSION = 2
 LEGACY_V3_EVENT_PROTOCOL_VERSION = 3
@@ -138,6 +139,28 @@ def decode_inbound(payload: str) -> tuple[str, InputBurst]:
     if not isinstance(message.get("burst"), dict):
         raise ValueError("inbound burst must be an object")
     return message["request_id"], _burst_from_dict(message["burst"])
+
+
+def encode_automation(request_id: str, turn: AutomationTurn) -> str:
+    _validate_request_id(request_id)
+    if not isinstance(turn, AutomationTurn):
+        raise TypeError("turn must be an AutomationTurn")
+    return _encode({"version": AUTOMATION_PROTOCOL_VERSION, "type": "automation", "request_id": request_id, "turn": asdict(turn)})
+
+
+def decode_automation(payload: str) -> tuple[str, AutomationTurn]:
+    message = _decode(payload, "automation", {AUTOMATION_PROTOCOL_VERSION})
+    if set(message) != {"version", "type", "request_id", "turn"} or not isinstance(message["turn"], dict):
+        raise ValueError("automation payload contains unsupported fields")
+    try:
+        return message["request_id"], AutomationTurn(**message["turn"])
+    except (TypeError, ValueError) as error:
+        raise ValueError("invalid automation turn") from error
+
+
+def decode_turn(payload: str) -> tuple[str, InputBurst | AutomationTurn]:
+    message = _json_object(payload)
+    return decode_automation(payload) if message.get("type") == "automation" else decode_inbound(payload)
 
 
 def encode_event(request_id: str, generation_id: str, sequence: int, event: object, *, expected_reaction_binding: tuple[str, str, str, str, str, int] | None = None) -> str:
@@ -426,7 +449,7 @@ def _v3_result_parts(result: dict[str, Any], budget: TurnBudget) -> tuple[tuple[
     for item in probe:
         _validate_stream_frame(item, probe[:item.sequence], budget)
     _validate_plan(result["plan"])
-    if result.get("status") not in {TurnRunStatus.COMPLETED.value, TurnRunStatus.COMPLETED_PARTIAL.value}:
+    if result.get("status") not in {TurnRunStatus.COMPLETED.value, TurnRunStatus.COMPLETED_PARTIAL.value, TurnRunStatus.APPROVAL_NEEDED.value}:
         raise ValueError("completed result status is invalid")
     expected_segments = list(range(len(segments)))
     if [segment.get("index") if isinstance(segment, dict) else None for segment in segments] != expected_segments:
@@ -462,6 +485,10 @@ def _v3_result_parts(result: dict[str, Any], budget: TurnBudget) -> tuple[tuple[
         not tuples or not segments or segments[-1]["finish"] not in {SegmentFinish.PARTIAL.value, SegmentFinish.FAILED.value, SegmentFinish.TOOL_BATCH.value} or any(segment["finish"] != SegmentFinish.TOOL_BATCH.value for segment in segments[:-1])
     ):
         raise ValueError("partial completed result has an invalid terminal segment")
+    if result["status"] == TurnRunStatus.APPROVAL_NEEDED.value and (
+        tuples or not segments or segments[-1]["finish"] != SegmentFinish.FAILED.value or any(segment["finish"] != SegmentFinish.TOOL_BATCH.value for segment in segments[:-1])
+    ):
+        raise ValueError("approval-needed result has an invalid terminal segment")
     expected_usage = {"model_segments": len(segments), "tool_rounds": tool_rounds, "tool_calls": tool_calls, "visible_segments": visible}
     if set(usage) != {"model_segments", "tool_rounds", "tool_calls", "visible_segments", "contract_repairs", "input_tokens", "output_tokens"}:
         raise ValueError("completed usage contains unsupported fields")

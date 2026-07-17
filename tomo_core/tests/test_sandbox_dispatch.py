@@ -1,9 +1,11 @@
 import tempfile
+import time
 import unittest
 from unittest.mock import Mock, patch
 
 from tomo_core.daytona_client import DaytonaClientError, ExecResult, SandboxHandle, SessionCommandHandle
 from tomo_core.models import InboundEnvelope
+from tomo_core.models import AutomationTurn
 from tomo_core.onboarding_store import InterruptedGeneration, TelegramGenerationInput, TelegramGenerationWork
 from tomo_core.sandbox_dispatch import SandboxDispatch, SandboxDispatchError
 from tomo_core.sandbox_registry import SandboxRegistry
@@ -12,6 +14,7 @@ from tomo_core.conversation.models import ConversationMove, Frame, FrameReady, M
 from tomo_core.runtime import RuntimeCompleted, RuntimeFrameReady
 from tomo_core.models import OutboundBubble
 from tomo_core.onboarding_store import TelegramInstallation
+from tomo_core.cron_capability import verify_capability
 
 
 def legacy_event(request_id, generation_id, sequence, event_type, **fields):
@@ -167,6 +170,32 @@ class SandboxDispatchTests(unittest.TestCase):
         self.daytona.iter_session_logs.assert_called_once_with(sandbox, SessionCommandHandle("telegram-burst-one-r1", "cmd-1"))
         self.daytona.delete_session.assert_called_once_with(sandbox, "persisted-session")
 
+    def test_interactive_turn_gets_short_owner_bound_cron_capability_but_automation_does_not(self):
+        capability_key = b"k" * 32
+        self.dispatch.control_url = "https://control.example.test"
+        self.dispatch.capability_key = capability_key
+        work = self._work()
+        self.daytona.start_session_command.return_value = SessionCommandHandle("telegram-burst-one-r1", "cmd-1")
+        self.daytona.iter_session_logs.return_value = iter(v3_markers("telegram-generation-burst-one-r1", work.generation_id, "hello."))
+        self.daytona.session_command_exit_code.return_value = 0
+
+        list(self.dispatch.iter_telegram_events(self.installation, work))
+
+        interactive_env = self.daytona.start_session_command.call_args.kwargs["env"]
+        claim = verify_capability(capability_key, interactive_env["TOMO_CRON_CAPABILITY"], now=int(time.time()), operation="create")
+        self.assertEqual((interactive_env["TOMO_CRON_CONTROL_URL"], claim.owner_id, claim.actor_id, claim.destination, claim.session_id), ("https://control.example.test", "tomo-a", "user", "telegram:chat", "telegram:actor:user"))
+        self.assertEqual((interactive_env["TOMO_CRON_OWNER_ID"], interactive_env["TOMO_CRON_ACTOR_ID"], interactive_env["TOMO_CRON_DESTINATION"], interactive_env["TOMO_CRON_SESSION_ID"]), (claim.owner_id, claim.actor_id, claim.destination, claim.session_id))
+
+        turn = AutomationTurn("cron/r1", 1, "job", "run", "user", "chat", "check", "2026-01-01T00:00:00+00:00")
+        self.daytona.start_session_command.reset_mock()
+        self.daytona.iter_session_logs.return_value = iter(v3_markers("telegram-generation-cron-r1", turn.generation_id, "hello."))
+
+        list(self.dispatch.iter_automation_events(self.installation, turn, turn.generation_id, "cron-session"))
+
+        automation_env = self.daytona.start_session_command.call_args.kwargs["env"]
+        self.assertNotIn("TOMO_CRON_CONTROL_URL", automation_env)
+        self.assertNotIn("TOMO_CRON_CAPABILITY", automation_env)
+
     def test_iter_telegram_events_streams_v3_frame_coordinates(self):
         work = self._work()
         self.daytona.start_session_command.return_value = SessionCommandHandle("telegram-burst-one-r1", "cmd-1")
@@ -305,6 +334,15 @@ class SandboxDispatchTests(unittest.TestCase):
             list(self.dispatch.iter_telegram_events(self.installation, work))
 
         self.assertEqual(raised.exception.code, "invalid_result")
+
+    def test_automation_rejects_foreign_generation_or_installation_before_sandbox_io(self):
+        turn = AutomationTurn("generation", 1, "job", "run", "other-user", "other-chat", "Check status", "2026-01-01T00:00:00+00:00")
+        with self.assertRaises(SandboxDispatchError) as raised:
+            list(self.dispatch.iter_automation_events(self.installation, turn, "different-generation", "session"))
+        self.assertEqual(raised.exception.code, "invalid_result")
+        self.supervisor.reconcile.assert_not_called()
+        self.daytona.get.assert_not_called()
+        self.daytona.start_session_command.assert_not_called()
 
     def test_cancel_generation_deletes_only_the_process_session(self):
         self.dispatch.cancel_generation(InterruptedGeneration("gen:1", "chat", "tomo-a", 1, "session-from-store"))

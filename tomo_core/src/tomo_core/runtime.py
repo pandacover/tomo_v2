@@ -9,7 +9,7 @@ from typing import Callable, Iterator, Literal, TypeAlias
 from .conversation import ConversationEngine, ConversationRequest, FrameReady, MemoryControlReady, ReactionIntent, ReactionWindowReady, TurnRunCompleted, TurnRunStarted
 from .delivery import sanitize_style, strip_markdown
 from .graph import build_langgraph_or_linear
-from .models import InboundEnvelope, InputBurst, OutboundBubble, RuntimeConfig
+from .models import AutomationTurn, InboundEnvelope, InputBurst, OutboundBubble, RuntimeConfig
 from .providers import ProviderAdapter
 from .reaction_service import ReactionDeliveryKey, ReactionService
 from .memory_governance import MemoryGovernanceService
@@ -21,6 +21,7 @@ from .sqlite_personal_data import SqlitePersonalDataRepository
 from .sessions import StoredMessage
 from .soul import load_soul
 from .telegram import TelegramDeliverySink
+from .tool_execution import ToolExecutor
 from .tools import ToolRegistry
 from . import latency_trace
 
@@ -140,23 +141,56 @@ class PersonalAgentRuntime:
         *,
         is_active: Callable[[], bool] | None = None,
     ) -> Iterator[RuntimeEvent]:
-        if burst.latest.connector != "telegram":
+        yield from self._handle_turn_iter(burst, is_active=is_active)
+
+    def handle_automation_turn_iter(
+        self,
+        turn: AutomationTurn,
+        *,
+        is_active: Callable[[], bool] | None = None,
+    ) -> Iterator[RuntimeEvent]:
+        if not isinstance(turn, AutomationTurn):
+            raise TypeError("turn must be an AutomationTurn")
+        original_registry = self.conversation.tool_registry
+        original_executor = self.conversation.tool_executor
+        unattended = self.tool_registry.unattended()
+        self.conversation.tool_registry = unattended
+        self.conversation.tool_executor = ToolExecutor(unattended)
+        try:
+            yield from self._handle_turn_iter(turn, is_active=is_active)
+        finally:
+            self.conversation.tool_registry = original_registry
+            self.conversation.tool_executor = original_executor
+
+    def _handle_turn_iter(
+        self,
+        burst: InputBurst | AutomationTurn,
+        *,
+        is_active: Callable[[], bool] | None = None,
+    ) -> Iterator[RuntimeEvent]:
+        automation = isinstance(burst, AutomationTurn)
+        if not automation and burst.latest.connector != "telegram":
             raise ValueError("runtime only supports telegram bursts")
         is_active = is_active or (lambda: True)
-        self.telegram.start_typing(burst.latest.actor_id)
+        actor_id = burst.actor_id if automation else burst.latest.actor_id
+        session_key = burst.session_key if automation else burst.latest.session_key
+        self.telegram.start_typing(actor_id)
         session_load_started_at = time.monotonic()
-        session = self.personal_data.load_session(self.owner_id, burst.latest.session_key)
+        session = self.personal_data.load_session(self.owner_id, session_key)
         if is_active():
             latency_trace.emit_sandbox("sandbox_session_load", elapsed_ms=max(0, int((time.monotonic() - session_load_started_at) * 1000)))
-        session.accept_generations(burst.accepted_generation_ids)
-        for message in burst.messages:
-            session.append_inbound_once(message, burst.burst_id)
+        if automation:
+            session.append_automation_once(burst)
+        else:
+            session.accept_generations(burst.accepted_generation_ids)
+            for message in burst.messages:
+                session.append_inbound_once(message, burst.burst_id)
         checkpoint_started_at = time.monotonic()
         saved = self.personal_data.save_session(self.owner_id, session, generation_id=burst.generation_id, revision=burst.revision)
         if is_active():
             latency_trace.emit_sandbox("sandbox_checkpoint_inbound", outcome="ok" if saved else "error", elapsed_ms=max(0, int((time.monotonic() - checkpoint_started_at) * 1000)))
         if not saved:
-            current_revision = self.personal_data.current_session_revision(self.owner_id, burst.latest.session_key)
+            current_revision = self.personal_data.current_session_revision(self.owner_id, session_key)
             if current_revision is None:
                 raise RuntimeError("stale_session_revision_unavailable")
             raise StaleSessionRevisionError(current_revision)
@@ -165,8 +199,9 @@ class PersonalAgentRuntime:
 
         memory_started_at = time.monotonic()
         try:
-            memories = self.personal_data.memory_context(MemoryContextQuery(self.owner_id, "\n".join(m.envelope.text for m in burst.messages)))
-            pending_actions = self.personal_data.pending_memory_actions(self.owner_id, burst.latest.session_key)
+            query_text = burst.intent if automation else "\n".join(m.envelope.text for m in burst.messages)
+            memories = self.personal_data.memory_context(MemoryContextQuery(self.owner_id, query_text))
+            pending_actions = self.personal_data.pending_memory_actions(self.owner_id, session_key)
         except (StorageBusyError, StorageSearchError, StorageCapabilityError):
             memories = ()
             pending_actions = ()
@@ -174,7 +209,7 @@ class PersonalAgentRuntime:
             latency_trace.emit_sandbox("sandbox_memory_hydration", elapsed_ms=max(0, int((time.monotonic() - memory_started_at) * 1000)))
         memory_block = _memory_data_block(memories, pending_actions)
         prompt_started_at = time.monotonic()
-        history = list(session.model_history_for_burst(burst.burst_id))
+        history = list(session.model_history_for_burst(burst.run_id if automation else burst.burst_id))
         if memory_block:
             history.append({"role": "user", "content": memory_block})
         request = ConversationRequest(
@@ -188,11 +223,11 @@ class PersonalAgentRuntime:
         conversation_events = self.conversation.respond_iter(request, is_active=is_active)
         delivered: list[OutboundBubble] = []
         reaction_emoji: str | None = None
-        chat_id = str(burst.latest.native_metadata.get("chat_id") or burst.latest.actor_id)
-        reaction_key = ReactionDeliveryKey(self.owner_id, chat_id, burst.generation_id, burst.revision, burst.latest.message_id)
+        chat_id = burst.chat_id if automation else str(burst.latest.native_metadata.get("chat_id") or burst.latest.actor_id)
+        reaction_key = None if automation else ReactionDeliveryKey(self.owner_id, chat_id, burst.generation_id, burst.revision, burst.latest.message_id)
 
         def emit_reaction() -> RuntimeReactionReady | None:
-            if reaction_emoji is None:
+            if automation or reaction_emoji is None:
                 return None
             try:
                 enabled = self.personal_data.memory_settings(self.owner_id).reactions_enabled
@@ -214,7 +249,9 @@ class PersonalAgentRuntime:
                 reaction_emoji = event.plan.reaction.emoji if event.plan.reaction is not None else None
                 continue
             if isinstance(event, MemoryControlReady):
-                if isinstance(event.control, MemoryWriteControl) and _safe_memory_control(event.control, burst, session, set(event.tool_observation_ids)):
+                if automation:
+                    self._record_memory_diagnostic("invalid_provenance")
+                elif isinstance(event.control, MemoryWriteControl) and _safe_memory_control(event.control, burst, session, set(event.tool_observation_ids)):
                     try:
                         if not self.personal_data.stage_memory_controls(self.owner_id, burst.latest.session_key, burst.generation_id, event.segment_index, governance_revision, (event.control,), revision=burst.revision):
                             self._record_memory_diagnostic("stale_governance_or_revision")
@@ -245,7 +282,7 @@ class PersonalAgentRuntime:
                     yield ready
                 if not is_active():
                     return
-                bubble = self._compose_progressive_bubble(event, burst.latest.message_id, bool(delivered))
+                bubble = self._compose_progressive_bubble(event, None if automation else burst.latest.message_id, bool(delivered))
                 if not is_active():
                     return
                 delivered.append(bubble)
@@ -371,7 +408,7 @@ class PersonalAgentRuntime:
     def _compose_result_bubbles(self, frames, reply_to_message_id: str) -> list[OutboundBubble]:
         return [self._compose_progressive_bubble(FrameReady(index, frame), reply_to_message_id, index > 0) for index, frame in enumerate(frames)]
 
-    def _compose_progressive_bubble(self, event: FrameReady, reply_to_message_id: str, has_prior_delivery: bool) -> OutboundBubble:
+    def _compose_progressive_bubble(self, event: FrameReady, reply_to_message_id: str | None, has_prior_delivery: bool) -> OutboundBubble:
         text = sanitize_style(strip_markdown(event.frame.text))
         if not text:
             raise ValueError("utterance cannot be empty after delivery cleanup")
@@ -380,7 +417,7 @@ class PersonalAgentRuntime:
     def _persist_completed_burst(
         self,
         session,
-        burst: InputBurst,
+        burst: InputBurst | AutomationTurn,
         event: TurnRunCompleted,
         delivered: list[OutboundBubble],
         is_active: Callable[[], bool],
@@ -388,7 +425,7 @@ class PersonalAgentRuntime:
         if not is_active():
             return False
         result = event.result
-        logical_parts = (*burst.visible_assistant_utterances, *(frame.text for frame in result.frames))
+        logical_parts = (*getattr(burst, "visible_assistant_utterances", ()), *(frame.text for frame in result.frames))
         session.append(
             StoredMessage(
                 role="assistant",
@@ -397,7 +434,7 @@ class PersonalAgentRuntime:
                     "provider": self.provider.name,
                     "generation_id": burst.generation_id,
                     "generation_status": "provisional",
-                    "burst_id": burst.burst_id,
+                    "burst_id": burst.run_id if isinstance(burst, AutomationTurn) else burst.burst_id,
                     "revision": burst.revision,
                     "conversation": self._compact_plan(result),
                     "turn_status": result.status.value,
@@ -414,13 +451,13 @@ class PersonalAgentRuntime:
             latency_trace.emit_sandbox("sandbox_checkpoint_complete", outcome="ok" if saved else "error", elapsed_ms=max(0, int((time.monotonic() - checkpoint_started_at) * 1000)))
         return saved
 
-    def _persist_provisional_frame(self, session, burst, event, delivered, is_active) -> bool:
+    def _persist_provisional_frame(self, session, burst: InputBurst | AutomationTurn, event, delivered, is_active) -> bool:
         if not is_active():
             return False
-        parts = (*burst.visible_assistant_utterances, *(bubble.text for bubble in delivered))
+        parts = (*getattr(burst, "visible_assistant_utterances", ()), *(bubble.text for bubble in delivered))
         metadata = {
             "provider": self.provider.name, "generation_id": burst.generation_id,
-            "generation_status": "provisional", "burst_id": burst.burst_id,
+            "generation_status": "provisional", "burst_id": burst.run_id if isinstance(burst, AutomationTurn) else burst.burst_id,
             "revision": burst.revision,
             "delivery_bubbles": [bubble.text for bubble in delivered],
         }

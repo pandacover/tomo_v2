@@ -2,16 +2,25 @@ from __future__ import annotations
 
 import json
 import time
+from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable, Protocol
+from threading import Lock
+from typing import Any, Callable, ClassVar, Iterator, Protocol
 
 from .daytona_supervisor import SandboxSupervisorError
+from .cron_capability import CronCapability, issue_capability
+from .cron_models import CronExecutionClaim, DeliveryAttempt, RunOutcome
+from .cron_service import CronExecutionDeferred
+from .cron_store import CronStore
+from .cron_tools import CronApiClient, cron_registry
 from . import latency_trace
 from .instances import RuntimeInstanceRegistry
-from .models import InboundEnvelope, OutboundBubble
+from .models import AutomationTurn, InboundEnvelope, OutboundBubble
 from .onboarding_store import TelegramGenerationWork, TelegramInstallation, TelegramOnboardingStore
 from .conversation.models import REACTION_EMOJI_ALLOWLIST
 from .runtime import RuntimeCompleted, RuntimeFrameReady, RuntimeReactionReady
+from .tool_execution import ToolExecutor
 from .sandbox_dispatch import TelegramRuntimeDispatchError, burst_from_work
 from .sandbox_protocol import SandboxCompletedEvent, SandboxErrorEvent, SandboxFrameEvent, SandboxReactionEvent, SandboxStaleEvent, encode_event
 from .telegram import TelegramClient, TelegramDeliverySink, TelegramSendReceipt
@@ -31,12 +40,19 @@ class TelegramRuntimeDispatch(Protocol):
     def iter_telegram_events(self, installation: TelegramInstallation, work: TelegramGenerationWork, is_active: Callable[[], bool] | None = None):
         ...
 
+    def iter_automation_events(self, installation: TelegramInstallation, turn: AutomationTurn, generation_id: str, session_id: str, is_active: Callable[[], bool] | None = None):
+        ...
+
 
 @dataclass
 class InProcessTelegramRuntimeDispatch:
     """Explicit local-mode adapter which returns bubbles without Telegram I/O."""
 
     instances: RuntimeInstanceRegistry
+    control_url: str | None = None
+    capability_key: bytes | None = None
+    clock: Callable[[], float] = time.time
+    _locks: ClassVar[defaultdict[str, Lock]] = defaultdict(Lock)
 
     def ensure_worker(self, installation: TelegramInstallation) -> None:
         self.instances.get(installation.tomo_id)
@@ -44,28 +60,68 @@ class InProcessTelegramRuntimeDispatch:
     def deliver_telegram(
         self, installation: TelegramInstallation, update_id: int, envelope: InboundEnvelope
     ) -> DirectTelegramDelivery:
-        runtime = self.instances.get(installation.tomo_id)
-        original_client = runtime.telegram.client
-        collector = _BubbleCollector()
-        runtime.telegram.client = collector
-        try:
-            runtime.handle_telegram_text(envelope)
-        finally:
-            runtime.telegram.client = original_client
+        with self._locks[installation.tomo_id]:
+            runtime = self.instances.get(installation.tomo_id)
+            original_client = runtime.telegram.client
+            collector = _BubbleCollector()
+            runtime.telegram.client = collector
+            try:
+                with self._interactive_tools(runtime, installation, f"telegram-update:{update_id}"):
+                    runtime.handle_telegram_text(envelope)
+            finally:
+                runtime.telegram.client = original_client
         return DirectTelegramDelivery(collector.bubbles, collector.reactions)
 
     def iter_telegram_events(self, installation: TelegramInstallation, work: TelegramGenerationWork, is_active: Callable[[], bool] | None = None):
-        runtime = self.instances.get(installation.tomo_id)
-        burst = burst_from_work(installation, work)
-        for sequence, event in enumerate(runtime.handle_telegram_burst_iter(burst, is_active=is_active)):
-            if isinstance(event, RuntimeReactionReady):
-                yield SandboxReactionEvent(sequence, event.owner_id, event.actor_id, event.chat_id, event.target_message_id, event.generation_id, event.revision, event.emoji)
-            elif isinstance(event, RuntimeFrameReady):
-                frame = event.event.frame
-                yield SandboxFrameEvent(sequence, frame.segment_index, frame.frame_index, event.bubble.text)
-            elif isinstance(event, RuntimeCompleted):
-                payload = json.loads(encode_event("local-runtime", work.generation_id, sequence, event))
-                yield SandboxCompletedEvent(sequence, payload["result"])
+        with self._locks[installation.tomo_id]:
+            runtime = self.instances.get(installation.tomo_id)
+            burst = burst_from_work(installation, work)
+            with self._interactive_tools(runtime, installation, work.generation_id):
+                for sequence, event in enumerate(runtime.handle_telegram_burst_iter(burst, is_active=is_active)):
+                    if isinstance(event, RuntimeReactionReady):
+                        yield SandboxReactionEvent(sequence, event.owner_id, event.actor_id, event.chat_id, event.target_message_id, event.generation_id, event.revision, event.emoji)
+                    elif isinstance(event, RuntimeFrameReady):
+                        frame = event.event.frame
+                        yield SandboxFrameEvent(sequence, frame.segment_index, frame.frame_index, event.bubble.text)
+                    elif isinstance(event, RuntimeCompleted):
+                        payload = json.loads(encode_event("local-runtime", work.generation_id, sequence, event))
+                        yield SandboxCompletedEvent(sequence, payload["result"])
+
+    def iter_automation_events(self, installation: TelegramInstallation, turn: AutomationTurn, generation_id: str, session_id: str, is_active: Callable[[], bool] | None = None):
+        with self._locks[installation.tomo_id]:
+            runtime = self.instances.get(installation.tomo_id)
+            for sequence, event in enumerate(runtime.handle_automation_turn_iter(turn, is_active=is_active)):
+                if isinstance(event, RuntimeFrameReady):
+                    frame = event.event.frame
+                    yield SandboxFrameEvent(sequence, frame.segment_index, frame.frame_index, event.bubble.text)
+                elif isinstance(event, RuntimeCompleted):
+                    payload = json.loads(encode_event("local-runtime", generation_id, sequence, event))
+                    yield SandboxCompletedEvent(sequence, payload["result"])
+
+    @contextmanager
+    def _interactive_tools(self, runtime: Any, installation: TelegramInstallation, generation_id: str) -> Iterator[None]:
+        if self.control_url is None or self.capability_key is None or not runtime.provider.supports_tool_calls:
+            yield
+            return
+        now = int(self.clock())
+        capability = issue_capability(
+            self.capability_key,
+            CronCapability(installation.tomo_id, installation.actor_id, f"telegram:{installation.chat_id}", f"telegram:actor:{installation.actor_id}", now, now + 300),
+        )
+        extra = cron_registry(CronApiClient(self.control_url, capability, installation.tomo_id, installation.actor_id, f"telegram:{installation.chat_id}", f"telegram:actor:{installation.actor_id}"), generation_id)
+        original_runtime_registry = runtime.tool_registry
+        original_engine_registry = runtime.conversation.tool_registry
+        original_executor = runtime.conversation.tool_executor
+        combined = original_runtime_registry.extend(extra)
+        runtime.tool_registry = combined
+        runtime.conversation.tool_registry = combined
+        runtime.conversation.tool_executor = ToolExecutor(combined)
+        try:
+            yield
+        finally:
+            runtime.tool_registry = original_runtime_registry
+            runtime.conversation.tool_registry = original_engine_registry
+            runtime.conversation.tool_executor = original_executor
 
 
 @dataclass(frozen=True)
@@ -101,12 +157,15 @@ class SharedTelegramGateway:
     pace_seconds: float = 1.5
     sleeper: Callable[[float], None] = time.sleep
     typing_lease_factory: Callable[..., TypingLease] = TypingLease
+    cron_store: CronStore | None = None
 
     def __post_init__(self) -> None:
         if self.dispatch is None:
             if self.instances is None:
                 raise ValueError("SharedTelegramGateway requires a TelegramRuntimeDispatch")
             self.dispatch = InProcessTelegramRuntimeDispatch(instances=self.instances)
+        if self.cron_store is None:
+            self.cron_store = CronStore(self.store.data_dir)
 
     def process_update(self, update: dict[str, Any] | TelegramGenerationWork) -> bool:
         if isinstance(update, TelegramGenerationWork):
@@ -286,7 +345,10 @@ class SharedTelegramGateway:
                     first_frame_delivered = True
                 elif isinstance(event, SandboxCompletedEvent):
                     if delivery_uncertain:
-                        raise RetryableTelegramUpdateError("delivery_uncertain")
+                        # A timeout can follow Telegram accepting the bubble. Replaying
+                        # this generation risks a duplicate, so retain the unknown record.
+                        self.store.complete_generation(work.generation_id, work.revision)
+                        return True
                     self.store.complete_generation(work.generation_id, work.revision)
                     return True
                 elif isinstance(event, SandboxErrorEvent):
@@ -298,6 +360,92 @@ class SharedTelegramGateway:
         finally:
             lease.close()
         return True
+
+    def execute_cron_claim(self, claim: CronExecutionClaim) -> tuple[RunOutcome, tuple[str, ...]]:
+        """Execute an owner-bound claim through the automation lane, never Telegram directly."""
+        prefix, separator, chat_id = claim.destination.partition(":")
+        if prefix != "telegram" or not separator or not chat_id or ":" in chat_id:
+            raise RuntimeError("invalid_destination")
+        installation = self.store.installation_for_chat(chat_id)
+        if installation is None or installation.tomo_id != claim.owner_id or installation.chat_id != chat_id:
+            raise RuntimeError("installation_unavailable")
+        reservation = self.store.reserve_automation_generation(chat_id, claim.owner_id, claim.run.run_id)
+        if reservation is None:
+            raise CronExecutionDeferred("chat_busy")
+        is_active = lambda: (
+            self.store.is_generation_active(reservation.generation_id, reservation.revision)
+            and self.cron_store is not None
+            and self.cron_store.run_is_current(claim.run.run_id, claim.run.revision, claim.lease_token)
+        )
+        turn = AutomationTurn(
+            reservation.generation_id, reservation.revision, claim.run.job_id, claim.run.run_id,
+            installation.actor_id, installation.chat_id, claim.intent.text, claim.run.scheduled_for.isoformat(),
+            None if claim.progress.previous_outcome is None else claim.progress.previous_outcome.value,
+            claim.run.trigger, claim.will_end_after_run, constraints=claim.intent.constraints,
+            successful_runs=claim.progress.successful_runs,
+        )
+        frames: list[str] = []
+        try:
+            for event in self.dispatch.iter_automation_events(installation, turn, reservation.generation_id, reservation.session_id, is_active=is_active):
+                if not is_active():
+                    if self.cron_store is not None and not self.cron_store.run_is_current(claim.run.run_id, claim.run.revision, claim.lease_token):
+                        raise RuntimeError("cron_run_invalidated")
+                    raise CronExecutionDeferred("superseded")
+                if isinstance(event, SandboxFrameEvent):
+                    frames.append(event.text)
+                    if len(frames) > 3:
+                        raise ValueError("automation emitted too many frames")
+                elif isinstance(event, SandboxStaleEvent):
+                    self.store.fail_generation(
+                        reservation.generation_id,
+                        "stale_revision",
+                        minimum_next_revision=event.current_revision + 1,
+                    )
+                    raise CronExecutionDeferred("stale_revision")
+                elif isinstance(event, SandboxErrorEvent):
+                    raise RuntimeError(event.code)
+                elif isinstance(event, SandboxCompletedEvent):
+                    status = event.result.get("status") if isinstance(event.result, dict) else None
+                    if status == "completed":
+                        if not frames:
+                            raise ValueError("automation completed without frames")
+                        outcome = RunOutcome.SUCCEEDED
+                    elif status == "completed_partial":
+                        if not frames:
+                            raise ValueError("automation completed without frames")
+                        outcome = RunOutcome.PARTIAL
+                    elif status == "approval_needed":
+                        outcome = RunOutcome.APPROVAL_NEEDED
+                    else:
+                        raise RuntimeError("invalid_completion_status")
+                    if not self.store.complete_generation(reservation.generation_id, reservation.revision):
+                        raise CronExecutionDeferred("superseded")
+                    return outcome, tuple(frames)
+            if not is_active():
+                if self.cron_store is not None and not self.cron_store.run_is_current(claim.run.run_id, claim.run.revision, claim.lease_token):
+                    raise RuntimeError("cron_run_invalidated")
+                raise CronExecutionDeferred("superseded")
+            raise RuntimeError("automation_missing_completion")
+        except CronExecutionDeferred:
+            # Stale session generations are released for the interactive lane;
+            # cron coordination retries without consuming its run attempt.
+            if self.store.is_generation_active(reservation.generation_id, reservation.revision):
+                self.store.fail_generation(reservation.generation_id, "superseded")
+            raise
+        except Exception:
+            self.store.fail_generation(reservation.generation_id, "automation_failed", max_attempts=1)
+            raise
+
+    def send_cron_delivery(self, attempt: DeliveryAttempt) -> str:
+        """Send a durably fenced cron frame only to its still-bound installation."""
+        prefix, separator, chat_id = (attempt.destination or "").partition(":")
+        if prefix != "telegram" or not separator or not chat_id or ":" in chat_id or not attempt.owner_id:
+            raise RuntimeError("invalid_delivery_destination")
+        installation = self.store.installation_for_chat(chat_id)
+        if installation is None or installation.tomo_id != attempt.owner_id or installation.chat_id != chat_id:
+            raise RuntimeError("installation_unavailable")
+        receipt = self.client.send_message(chat_id, attempt.payload or "", reply_to_message_id=None)
+        return receipt.message_id
 
     def _handle_start(self, text: str, chat_id: str, actor_id: str, message_id: str) -> bool:
         parts = text.split(maxsplit=1)

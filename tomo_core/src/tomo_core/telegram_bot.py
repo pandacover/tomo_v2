@@ -17,6 +17,13 @@ class TelegramBotApiError(RuntimeError):
     pass
 
 
+class TelegramDeliveryError(TelegramBotApiError):
+    def __init__(self, code: str, *, uncertain: bool) -> None:
+        self.code = code
+        self.uncertain = uncertain
+        super().__init__(code)
+
+
 class TelegramReactionError(RuntimeError):
     """Safe classification for a best-effort reaction failure."""
 
@@ -45,7 +52,7 @@ class TelegramBotApiClient:
         response.raise_for_status()
         data = response.json()
         if not data.get("ok"):
-            raise TelegramBotApiError(f"telegram {method} failed: {data}")
+            raise TelegramBotApiError(f"telegram_{method}_rejected")
         return data
 
     def get_updates(self, offset: int | None = None, timeout: int = 30) -> list[dict[str, Any]]:
@@ -69,9 +76,22 @@ class TelegramBotApiClient:
             payload["reply_parameters"] = {"message_id": int(reply_to_message_id)}
         if reply_markup:
             payload["reply_markup"] = reply_markup
-        data = self.request("sendMessage", payload)
+        try:
+            data = self.request("sendMessage", payload)
+        except (httpx.ConnectError, httpx.ConnectTimeout) as error:
+            raise TelegramDeliveryError("telegram_sendMessage_transport", uncertain=False) from error
+        except (httpx.HTTPStatusError, TelegramBotApiError) as error:
+            raise TelegramDeliveryError("telegram_sendMessage_rejected", uncertain=False) from error
+        except httpx.TimeoutException as error:
+            raise TelegramDeliveryError("telegram_sendMessage_timeout", uncertain=True) from error
+        except (httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError, httpx.ProtocolError, httpx.DecodingError, ValueError) as error:
+            raise TelegramDeliveryError("telegram_sendMessage_protocol", uncertain=True) from error
+        except Exception as error:
+            raise TelegramDeliveryError("telegram_sendMessage_uncertain", uncertain=True) from error
         result = data.get("result") if isinstance(data, dict) else None
         message_id = result.get("message_id") if isinstance(result, dict) else None
+        if message_id is None:
+            raise TelegramDeliveryError("telegram_sendMessage_missing_receipt", uncertain=True)
         return TelegramSendReceipt(str(message_id))
 
     def set_message_reaction(self, actor_id: str, message_id: str, emoji: str) -> None:
