@@ -109,6 +109,7 @@ class ConversationEngine:
             schemas = self.tool_registry.schemas() if allow_tools else ()
             replacement = False
             repair_code: str | None = None
+            execution_attempted = False
             while True:
                 remaining_frames = 3 - len(frames)
                 if remaining_frames < 1:
@@ -119,17 +120,18 @@ class ConversationEngine:
                 segment_budget = replace(self.budget, max_frames_per_segment=min(self.budget.max_frames_per_segment, remaining_frames))
                 parser = SegmentFrameParser(index, first_segment=plan is None, budget=segment_budget)
                 if replacement and plan is None:
+                    schemas = schemas if not execution_attempted else ()
                     messages = build_first_segment_repair_messages(
                         request,
                         context,
                         segment_budget,
                         repair_code or "replacement_required",
                         prior_messages=prior_messages,
+                        tools_available=schemas,
                     )
-                    schemas = ()
                 elif replacement and plan is not None:
-                    messages = build_segment_repair_messages(request, context, segment_budget, plan, repair_code or "replacement_required", prior_messages=prior_messages)
-                    schemas = ()
+                    schemas = schemas if not execution_attempted else ()
+                    messages = build_segment_repair_messages(request, context, segment_budget, plan, repair_code or "replacement_required", prior_messages=prior_messages, tools_available=schemas)
                 else:
                     messages = build_segment_messages(request, context, segment_budget, segment_index=index, plan=plan, prior_messages=prior_messages, tools_available=schemas)
                 raw: list[str] = []
@@ -411,6 +413,7 @@ class ConversationEngine:
                     emit_provider_attempt("ok")
                     try:
                         tool_started_at = self.monotonic_clock()
+                        execution_attempted = True
                         batch = self.tool_executor.execute_prepared_batch(prepared_calls, is_active)
                     except ToolBatchCancelled:
                         if is_active():

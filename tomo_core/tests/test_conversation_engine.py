@@ -529,6 +529,82 @@ class ConversationEngineTests(unittest.TestCase):
                 self.assertEqual(len(provider.calls), 2)
                 self.assertIn(repair_code, provider.calls[1][0][0]["content"])
 
+    def test_invalid_first_response_repairs_with_one_mutating_tool_call(self):
+        from tomo_core.tools import BoundTool, ToolRegistry, ToolSpec
+
+        executed = []
+        provider = ScriptedProvider([
+            [ProviderTextDelta("not json\n"), ProviderStreamCompleted("stop")],
+            [ProviderToolCallReady("call-1", "schedule_reminder", '{"when":"tomorrow"}'), ProviderStreamCompleted("tool_calls")],
+            [ProviderTextDelta('{"type":"frame","text":"Your reminder is scheduled for tomorrow."}\n'), ProviderStreamCompleted("stop")],
+        ])
+        registry = ToolRegistry((BoundTool(
+            ToolSpec("schedule_reminder", "Schedule a reminder", {"type": "object", "properties": {"when": {"type": "string"}}, "required": ["when"]}, read_only=False),
+            lambda arguments: executed.append(arguments) or "scheduled",
+        ),))
+
+        result = ConversationEngine(provider, tool_registry=registry).respond(self.request())
+
+        self.assertEqual(executed, [{"when": "tomorrow"}])
+        self.assertNotEqual(provider.calls[1][1], ())
+        self.assertEqual(provider.calls[1][1][0]["function"]["name"], "schedule_reminder")
+        self.assertEqual([segment.finish for segment in result.segments], [SegmentFinish.TOOL_BATCH, SegmentFinish.COMPLETE])
+        self.assertEqual([frame.text for frame in result.frames], ["Your reminder is scheduled for tomorrow."])
+        self.assertEqual(result.usage.contract_repairs, 1)
+
+    def test_failed_mutating_execution_repair_is_tool_free(self):
+        from tomo_core.tool_execution import ToolExecutor
+        from tomo_core.tools import BoundTool, ToolRegistry, ToolSpec
+
+        class FailingExecutor(ToolExecutor):
+            def execute_prepared_batch(self, *args, **kwargs):
+                raise RuntimeError("executor failure")
+
+        registry = ToolRegistry((BoundTool(
+            ToolSpec("schedule_reminder", "Schedule a reminder", {"type": "object", "properties": {}}, read_only=False),
+            lambda _: self.fail("the failed batch must not invoke the tool"),
+        ),))
+        provider = ScriptedProvider([
+            [ProviderToolCallReady("call-1", "schedule_reminder", "{}"), ProviderStreamCompleted("tool_calls")],
+            [ProviderTextDelta('{"type":"frame","text":"I could not schedule that."}\n'), ProviderStreamCompleted("stop")],
+        ])
+
+        result = ConversationEngine(provider, tool_registry=registry, tool_executor=FailingExecutor(registry)).respond(self.request())
+
+        self.assertEqual(provider.calls[1][1], ())
+        self.assertEqual([frame.text for frame in result.frames], ["I could not schedule that."])
+        self.assertEqual(result.usage.contract_repairs, 1)
+
+    def test_cancelled_mutating_execution_does_not_repair_or_retry(self):
+        from tomo_core.tool_execution import ToolBatchCancelled, ToolExecutor
+        from tomo_core.tools import BoundTool, ToolRegistry, ToolSpec
+
+        attempts = []
+
+        class CancellingExecutor(ToolExecutor):
+            def execute_prepared_batch(self, *args, **kwargs):
+                attempts.append(True)
+                raise ToolBatchCancelled
+
+        registry = ToolRegistry((BoundTool(
+            ToolSpec("schedule_reminder", "Schedule a reminder", {"type": "object", "properties": {}}, read_only=False),
+            lambda _: self.fail("the cancelled batch must not invoke the bound tool"),
+        ),))
+        provider = ScriptedProvider([
+            [ProviderToolCallReady("call-1", "schedule_reminder", "{}"), ProviderStreamCompleted("tool_calls")],
+            [ProviderToolCallReady("call-2", "schedule_reminder", "{}"), ProviderStreamCompleted("tool_calls")],
+        ])
+
+        events = list(ConversationEngine(
+            provider,
+            tool_registry=registry,
+            tool_executor=CancellingExecutor(registry),
+        ).respond_iter(self.request()))
+
+        self.assertEqual(attempts, [True])
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual([type(event) for event in events], [TurnRunStarted])
+
     def test_planless_native_tool_attempt_synthesizes_only_when_available(self):
         from tomo_core.tools import BoundTool, ToolRegistry, ToolSpec
 

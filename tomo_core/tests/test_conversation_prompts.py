@@ -166,6 +166,27 @@ class ConversationPromptTests(unittest.TestCase):
             max_frames=3, max_sentences=3, max_chars=800, native_tools_available=False,
         )))
 
+    def test_repair_prompts_retain_native_tool_contracts_when_supplied(self):
+        request = self._request_with_burst()
+        budget = TurnBudget(6, 5, 5, 3, 3, 3, 800)
+        schemas = ({"type": "function", "function": {"name": "schedule_reminder"}},)
+
+        fixed = build_segment_repair_messages(
+            request, ContextHydrator().hydrate(request), budget, MovePlan.direct_answer(), "missing_frame", tools_available=schemas,
+        )
+        no_plan = build_first_segment_repair_messages(
+            request, ContextHydrator().hydrate(request), budget, "missing_frame", tools_available=schemas,
+        )
+
+        for repair, contract in (
+            (fixed, render_later_segment_contract(max_frames=3, max_sentences=3, max_chars=800, native_tools_available=True)),
+            (no_plan, render_first_segment_contract(max_frames=3, max_sentences=3, max_chars=800, native_tools_available=True)),
+        ):
+            self.assertIn("missing_frame", repair[0]["content"])
+            self.assertIn('"name":"schedule_reminder"', repair[0]["content"])
+            self.assertIn("provider-native tool call", repair[0]["content"])
+            self.assertTrue(repair[0]["content"].endswith(contract))
+
     def test_segment_prompt_preserves_plain_and_structured_burst_user_payloads(self):
         plain_request = self._request_with_burst()
         plain_messages = build_segment_messages(

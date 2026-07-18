@@ -59,9 +59,11 @@ def build_segment_repair_messages(
     plan: MovePlan,
     safe_code: str,
     prior_messages: Sequence[dict[str, object]] = (),
+    tools_available: Sequence[dict[str, object]] = (),
 ) -> list[dict[str, object]]:
     """Build a replacement segment that retains an already validated turn plan."""
-    messages = build_segment_messages(request, context, budget, segment_index=1, plan=plan, prior_messages=prior_messages)
+    tool_schemas = _tool_schemas(tools_available)
+    messages = build_segment_messages(request, context, budget, segment_index=1, plan=plan, prior_messages=prior_messages, tools_available=tool_schemas)
     frame_count = _frame_count_phrase(budget.max_frames_per_segment)
     _prepend_repair_instruction(
         messages,
@@ -69,12 +71,16 @@ def build_segment_repair_messages(
             max_frames=budget.max_frames_per_segment,
             max_sentences=budget.max_sentences_per_frame,
             max_chars=budget.max_chars_per_frame,
-            native_tools_available=False,
+            native_tools_available=bool(tool_schemas),
         ),
         (
             f"the previous segment violated the JSONL contract: {safe_code}. "
             f"replace it with {frame_count} frame records only. preserve the fixed turn plan exactly. "
             "do not emit a turn_plan or native tool call."
+            if not tool_schemas
+            else f"the previous segment violated the JSONL contract: {safe_code}. "
+            f"replace it with {frame_count} frame records or a provider-native tool call. preserve the fixed turn plan exactly. "
+            "do not emit a turn_plan."
         ),
     )
     return messages
@@ -86,15 +92,17 @@ def build_first_segment_repair_messages(
     budget: TurnBudget,
     safe_code: str,
     prior_messages: Sequence[dict[str, object]] = (),
+    tools_available: Sequence[dict[str, object]] = (),
 ) -> list[dict[str, object]]:
-    """Build a tool-free replacement when no valid turn plan was produced."""
+    """Build a replacement when no valid turn plan was produced."""
+    tool_schemas = _tool_schemas(tools_available)
     messages = build_segment_messages(
         request,
         context,
         budget,
         segment_index=0,
         prior_messages=prior_messages,
-        tools_available=(),
+        tools_available=tool_schemas,
     )
     _prepend_repair_instruction(
         messages,
@@ -102,12 +110,15 @@ def build_first_segment_repair_messages(
             max_frames=budget.max_frames_per_segment,
             max_sentences=budget.max_sentences_per_frame,
             max_chars=budget.max_chars_per_frame,
-            native_tools_available=False,
+            native_tools_available=bool(tool_schemas),
         ),
         (
             f"the previous segment violated the JSONL contract: {safe_code}. "
             "replace the entire segment with a canonical turn_plan plus mandatory frame records. "
             "native tools are disabled for this repair."
+            if not tool_schemas
+            else f"the previous segment violated the JSONL contract: {safe_code}. "
+            "replace the entire segment with a canonical turn_plan plus mandatory frame records or a provider-native tool call."
         ),
     )
     return messages
