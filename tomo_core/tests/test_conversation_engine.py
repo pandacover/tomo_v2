@@ -86,6 +86,17 @@ class ConversationEngineTests(unittest.TestCase):
         self.assertEqual(completed.result.segments[0].finish, SegmentFinish.COMPLETE)
         self.assertTrue(provider.iterators[0].closed)
 
+    def test_no_tools_three_frame_reply_completes_with_exactly_three_frames(self):
+        provider = ScriptedProvider([[
+            ProviderTextDelta(PLAN + '{"type":"frame","text":"First."}\n{"type":"frame","text":"Second."}\n{"type":"frame","text":"Third."}\n'),
+            ProviderStreamCompleted("stop"),
+        ]])
+
+        result = ConversationEngine(provider).respond(self.request())
+
+        self.assertEqual([frame.text for frame in result.frames], ["First.", "Second.", "Third."])
+        self.assertEqual(result.status, TurnRunStatus.COMPLETED)
+
     def test_frame_only_first_attempt_synthesizes_plan_without_repair(self):
         provider = ScriptedProvider([[ProviderTextDelta('{"type":"frame","text":"Fast answer."}\n'), ProviderStreamCompleted("stop")]])
 
@@ -387,6 +398,29 @@ class ConversationEngineTests(unittest.TestCase):
         self.assertEqual(first_attempt.kwargs["elapsed_ms"], first_attempt.kwargs["active_ms"] + first_attempt.kwargs["suspended_ms"])
         self.assertEqual([call.kwargs["elapsed_ms"] for call in emit.call_args_list if call.args[0] == "sandbox_tool_batch"], [10000])
         self.assertNotIn("result", repr(emit.call_args_list))
+
+    def test_cancellation_after_tool_plan_suppresses_reaction_window_and_execution(self):
+        from tomo_core.tools import BoundTool, ToolRegistry, ToolSpec
+
+        active = [True]
+        invoked = []
+
+        class SupersedingRegistry(ToolRegistry):
+            def is_mutating(self, name: str) -> bool:
+                active[0] = False
+                return super().is_mutating(name)
+
+        reaction_plan = PLAN.rstrip("\n")[:-1] + ',"reaction":"👍"}\n'
+        provider = ScriptedProvider([[
+            ProviderTextDelta(reaction_plan + '{"type":"frame","text":"Searching."}\n'), ProviderToolCallReady("call-1", "search", "{}"), ProviderStreamCompleted("tool_calls"),
+        ]])
+        registry = SupersedingRegistry((BoundTool(ToolSpec("search", "search", {"type": "object", "properties": {}}), lambda _: invoked.append(True)),))
+        iterator = ConversationEngine(provider, tool_registry=registry).respond_iter(self.request(), is_active=lambda: active[0])
+
+        events = list(iterator)
+
+        self.assertEqual([type(event) for event in events], [TurnRunStarted])
+        self.assertEqual(invoked, [])
 
     def test_tool_executor_failure_keeps_provider_ok_and_marks_tool_error(self):
         from tomo_core.tool_execution import ToolExecutor

@@ -3,11 +3,14 @@ from __future__ import annotations
 import os
 import hashlib
 import json
+import math
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Annotated, Callable, Literal
 
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 from .cron_capability import CronCapability, CronCapabilityError, load_or_create_key, verify_capability
@@ -27,15 +30,50 @@ class InstallLinkResponse(BaseModel):
     expires_at: int = Field(alias="expiresAt")
 
 
-class CronScheduleRequest(BaseModel):
-    kind: str
-    at: str | None = Field(default=None, max_length=64)
-    every_seconds: float | None = Field(default=None, alias="everySeconds")
-    expression: str | None = Field(default=None, max_length=128)
-    timezone_name: str = Field(default="UTC", alias="timezoneName", max_length=128)
-    starts_at: str | None = Field(default=None, alias="startsAt", max_length=64)
-    after_seconds: float | None = Field(default=None, alias="afterSeconds", gt=0, le=31536000)
+class CronOnceScheduleRequest(BaseModel):
+    kind: Literal["once"]
+    at: str = Field(max_length=64)
     model_config = {"extra": "forbid"}
+
+
+class CronIntervalScheduleRequest(BaseModel):
+    kind: Literal["interval"]
+    every_seconds: float = Field(alias="everySeconds", gt=0)
+    starts_at: str | None = Field(default=None, alias="startsAt", max_length=64)
+    model_config = {"extra": "forbid"}
+
+    @field_validator("every_seconds", mode="before")
+    @classmethod
+    def validate_every_seconds(cls, value: object) -> object:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ValueError("everySeconds must be a finite number")
+        return value
+
+
+class CronExpressionScheduleRequest(BaseModel):
+    kind: Literal["cron"]
+    expression: str = Field(max_length=128)
+    timezone_name: str = Field(default="UTC", alias="timezoneName", max_length=128)
+    model_config = {"extra": "forbid"}
+
+
+class CronDelayScheduleRequest(BaseModel):
+    kind: Literal["delay"]
+    after_seconds: float = Field(alias="afterSeconds", gt=0, le=31536000)
+    model_config = {"extra": "forbid"}
+
+    @field_validator("after_seconds", mode="before")
+    @classmethod
+    def validate_after_seconds(cls, value: object) -> object:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ValueError("afterSeconds must be a finite number")
+        return value
+
+
+CronScheduleRequest = Annotated[
+    CronOnceScheduleRequest | CronIntervalScheduleRequest | CronExpressionScheduleRequest | CronDelayScheduleRequest,
+    Field(discriminator="kind"),
+]
 
 
 class CronLifecycleRequest(BaseModel):
@@ -77,6 +115,11 @@ def create_app(data_dir: str | Path | None = None, api_key: str | None = None, b
     cron_key: bytes | None = None
     clock = now or (lambda: datetime.now(timezone.utc))
     app = FastAPI(title="tomo core control api")
+
+    @app.exception_handler(RequestValidationError)
+    async def request_validation_error(_: Request, error: RequestValidationError) -> JSONResponse:
+        # Never reflect non-finite invalid input through JSON serialization.
+        return JSONResponse(status_code=422, content={"detail": [{key: item[key] for key in ("type", "loc", "msg")} for item in error.errors()]})
 
     def onboarding_store() -> TelegramOnboardingStore:
         nonlocal store

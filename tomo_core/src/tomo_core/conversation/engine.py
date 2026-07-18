@@ -221,7 +221,7 @@ class ConversationEngine:
                             return
                         yield from yield_provider_event(MemoryControlReady(index, record, tuple(sorted(tool_observation_ids))))
                     else:
-                        if len(frames) + len(segment_frames) >= 3:
+                        if len(frames) + len(segment_frames) - emitted_frame_count >= 3:
                             raise ConversationOutputError("frame_limit")
                         if (not segment_frames and sum(bool(s.frames) for s in segments) >= self.budget.max_visible_segments):
                             raise ConversationOutputError("visible_segment_limit")
@@ -351,7 +351,7 @@ class ConversationEngine:
                     except ConversationOutputError as error:
                         failure = error
                 tool_finish = terminal is not None and terminal.finish_reason == "tool_calls"
-                mutating_tool_segment = tool_finish and any(self.tool_registry.is_mutating(native_call.name) for native_call in native_calls)
+                mutating_tool_segment = any(self.tool_registry.is_mutating(native_call.name) for native_call in native_calls)
                 if failure is None and tool_finish and native_calls and all(self.tool_registry.is_blocked(call.name) for call in native_calls):
                     if plan is None:
                         resolution = synthesized_tool_plan()
@@ -389,6 +389,8 @@ class ConversationEngine:
                             return
                         yield from yield_provider_event(TurnRunStarted(plan))
                     if index == 0 and plan is not None and plan.reaction is not None and not reaction_window_emitted:
+                        if not is_active():
+                            return
                         reaction_window_emitted = True
                         yield from yield_provider_event(ReactionWindowReady())
                     if not is_active():

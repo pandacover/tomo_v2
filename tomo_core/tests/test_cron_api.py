@@ -41,6 +41,40 @@ class CronApiTests(unittest.IsolatedAsyncioTestCase):
                 excessive = await client.post("/v1/cron/jobs", json={"intent": "Remind me", "schedule": {"kind": "delay", "afterSeconds": 31536001}}, headers=headers)
             self.assertEqual((zero.status_code, excessive.status_code), (422, 422))
 
+    async def test_schedule_kinds_reject_cross_kind_fields_and_non_strict_delay_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            key = load_or_create_key(tmp); now = int(time.time())
+            token = issue_capability(key, CronCapability("owner", "actor", "telegram:chat", "telegram:actor:actor", now, now + 60))
+            headers = {"Authorization": f"Bearer {token}", "X-Tomo-Owner-Id": "owner", "X-Tomo-Actor-Id": "actor", "X-Tomo-Destination": "telegram:chat", "X-Tomo-Session-Id": "telegram:actor:actor", "Idempotency-Key": "strict-schedules"}
+            transport = httpx.ASGITransport(app=create_app(data_dir=tmp))
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                cross_kind = await client.post("/v1/cron/jobs", json={"intent": "Check", "schedule": {"kind": "once", "at": "2026-01-01T00:00:00Z", "afterSeconds": 60}}, headers=headers)
+                boolean_delay = await client.post("/v1/cron/jobs", json={"intent": "Check", "schedule": {"kind": "delay", "afterSeconds": True}}, headers=headers)
+                string_delay = await client.post("/v1/cron/jobs", json={"intent": "Check", "schedule": {"kind": "delay", "afterSeconds": "60"}}, headers=headers)
+                boolean_interval = await client.post("/v1/cron/jobs", json={"intent": "Check", "schedule": {"kind": "interval", "everySeconds": True}}, headers={**headers, "Idempotency-Key": "strict-boolean-interval"})
+                string_interval = await client.post("/v1/cron/jobs", json={"intent": "Check", "schedule": {"kind": "interval", "everySeconds": "60"}}, headers={**headers, "Idempotency-Key": "strict-string-interval"})
+                infinite_delay = await client.post("/v1/cron/jobs", content=b'{"intent":"Check","schedule":{"kind":"delay","afterSeconds":NaN}}', headers={**headers, "Content-Type": "application/json"})
+
+            self.assertEqual((cross_kind.status_code, boolean_delay.status_code, string_delay.status_code, boolean_interval.status_code, string_interval.status_code, infinite_delay.status_code), (422, 422, 422, 422, 422, 422))
+
+    async def test_sub_minute_delay_with_seconds_is_due_at_its_exact_future_instant(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            now = datetime(2026, 1, 1, 12, 0, 45, tzinfo=timezone.utc)
+            key = load_or_create_key(tmp)
+            issued_at = int(time.time())
+            token = issue_capability(key, CronCapability("owner", "actor", "telegram:chat", "telegram:actor:actor", issued_at, issued_at + 60))
+            headers = {"Authorization": f"Bearer {token}", "X-Tomo-Owner-Id": "owner", "X-Tomo-Actor-Id": "actor", "X-Tomo-Destination": "telegram:chat", "X-Tomo-Session-Id": "telegram:actor:actor", "Idempotency-Key": "same-minute-delay"}
+            transport = httpx.ASGITransport(app=create_app(data_dir=tmp, now=lambda: now))
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                response = await client.post("/v1/cron/jobs", json={"intent": "Remind me", "schedule": {"kind": "delay", "afterSeconds": 10}}, headers=headers)
+
+            due_at = now + timedelta(seconds=10)
+            self.assertEqual(response.status_code, 200)
+            store = CronStore(tmp)
+            self.assertIsNone(store.claim_due_run(now=now))
+            self.assertIsNone(store.claim_due_run(now=due_at - timedelta(microseconds=1)))
+            self.assertEqual(store.claim_due_run(now=due_at).run.scheduled_for, due_at)
+
     async def test_update_delay_resolves_from_update_request_time(self):
         with tempfile.TemporaryDirectory() as tmp:
             clock = [datetime(2026, 1, 1, 12, tzinfo=timezone.utc)]

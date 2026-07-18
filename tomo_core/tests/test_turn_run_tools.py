@@ -95,6 +95,32 @@ class TurnRunToolTests(unittest.TestCase):
         self.assertEqual([frame.text for frame in result.frames], visible)
         self.assertEqual(invoked, [])
 
+    def test_mutating_tool_with_stop_completion_never_surfaces_or_invokes_before_repair(self):
+        invoked = []
+        provider = ScriptedProvider([
+            [ProviderTextDelta(PLAN + '{"type":"frame","text":"Created."}\n'), ProviderToolCallReady("create-1", "cron_create", "{}"), ProviderStreamCompleted("stop")],
+            [ProviderTextDelta('{"type":"frame","text":"I could not create that reminder."}\n'), ProviderStreamCompleted("stop")],
+        ])
+        mutation = BoundTool(ToolSpec("cron_create", "create", {"type": "object", "properties": {}}, read_only=False, parallel_safe=False), lambda _: invoked.append(True))
+
+        result = ConversationEngine(provider, tool_registry=registry(mutation)).respond(self.request())
+
+        self.assertEqual([frame.text for frame in result.frames], ["I could not create that reminder."])
+        self.assertEqual(invoked, [])
+
+    def test_mutating_tool_without_completion_never_surfaces_or_invokes_before_repair(self):
+        invoked = []
+        provider = ScriptedProvider([
+            [ProviderTextDelta(PLAN + '{"type":"frame","text":"Created."}\n'), ProviderToolCallReady("create-1", "cron_create", "{}")],
+            [ProviderTextDelta('{"type":"frame","text":"I could not create that reminder."}\n'), ProviderStreamCompleted("stop")],
+        ])
+        mutation = BoundTool(ToolSpec("cron_create", "create", {"type": "object", "properties": {}}, read_only=False, parallel_safe=False), lambda _: invoked.append(True))
+
+        result = ConversationEngine(provider, tool_registry=registry(mutation)).respond(self.request())
+
+        self.assertEqual([frame.text for frame in result.frames], ["I could not create that reminder."])
+        self.assertEqual(invoked, [])
+
     def test_memory_control_after_tool_batch_receives_only_that_turns_observation_id(self):
         control = json.dumps({
             "type": "memory_control", "action": "add", "authority": "autonomous", "user_intent_excerpt": None,
