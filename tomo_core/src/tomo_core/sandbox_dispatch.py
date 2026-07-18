@@ -15,7 +15,8 @@ from typing import Callable, Iterator, Protocol
 from .daytona_client import DaytonaClient, DaytonaClientError, SessionCommandHandle
 from .daytona_supervisor import DaytonaSupervisor
 from .conversation import TurnBudget
-from .models import AutomationTurn, InboundEnvelope, InboundMessage, InputBurst, MessageAttachment, OutboundBubble, RuntimeConfig
+from .models import AutomationTurn, InboundEnvelope, InboundMessage, InputBurst, OutboundBubble, RuntimeConfig
+from .telegram import photo_attachments_from_message, reply_context_from_message
 from .onboarding_store import InterruptedGeneration, TelegramGenerationInput, TelegramGenerationWork, TelegramInstallation
 from .sandbox_protocol import SandboxCompletedEvent, SandboxErrorEvent, SandboxEvent, SandboxFrameEvent, SandboxProtocolError, encode_automation, encode_inbound, iter_event_markers, parse_result_marker
 from . import latency_trace
@@ -84,12 +85,12 @@ class SandboxDispatch:
             if not record.sandbox_id:
                 raise SandboxDispatchError("sandbox_not_ready")
             try:
-                bubbles = self._execute(record.sandbox_id, installation.tomo_id, request_id, envelope)
+                bubbles = self._execute(record.sandbox_id, installation, request_id, envelope)
             except SandboxProtocolError as error:
                 if error.code != "auth_expired":
                     raise SandboxDispatchError(error.code) from error
                 try:
-                    bubbles = self._execute(record.sandbox_id, installation.tomo_id, request_id, envelope, force_refresh=True)
+                    bubbles = self._execute(record.sandbox_id, installation, request_id, envelope, force_refresh=True)
                 except SandboxProtocolError as retry_error:
                     raise SandboxDispatchError(retry_error.code) from retry_error
             return bubbles
@@ -310,7 +311,7 @@ class SandboxDispatch:
             raise SandboxDispatchError("sandbox_exec_failed") from error
 
     def _execute(
-        self, sandbox_id: str, tomo_id: str, request_id: str, envelope: InboundEnvelope, *, force_refresh: bool = False
+        self, sandbox_id: str, installation: TelegramInstallation, request_id: str, envelope: InboundEnvelope, *, force_refresh: bool = False
     ) -> list[OutboundBubble]:
         try:
             sandbox = self.client.get(sandbox_id)
@@ -321,12 +322,12 @@ class SandboxDispatch:
                 env={
                     "TOMO_INBOUND_JSON": encode_inbound(request_id, envelope),
                     "TOMO_CORE_DATA_DIR": self.data_dir,
-                    "TOMO_INSTANCE_ID": tomo_id,
+                    "TOMO_INSTANCE_ID": installation.tomo_id,
                     "TOMO_SUPERGROK_ACCESS_TOKEN": token,
                     "TOMO_CORE_SOUL": "/opt/tomo/SOUL.md",
                     "TOMO_XAI_MODEL": os.getenv("TOMO_XAI_MODEL", self.xai_model),
                     "TOMO_XAI_REASONING_EFFORT": os.getenv("TOMO_XAI_REASONING_EFFORT", self.xai_reasoning_effort),
-                    **self._interactive_cron_env(TelegramInstallation("", tomo_id, str(envelope.native_metadata.get("delivery_chat_id", "")), envelope.actor_id, 0)),
+                    **self._interactive_cron_env(installation),
                     **_latency_env(),
                 },
                 timeout=_EXEC_TIMEOUT_SECONDS,
@@ -400,23 +401,7 @@ def _message_from_input(installation: TelegramInstallation, item: TelegramGenera
     if not isinstance(text, str):
         text = message.get("caption")
     text = text if isinstance(text, str) else ""
-    attachments: tuple[MessageAttachment, ...] = ()
-    photos = message.get("photo")
-    if isinstance(photos, list) and photos:
-        photo = max(
-            (item for item in photos if isinstance(item, dict) and isinstance(item.get("file_id"), str)),
-            key=lambda item: int(item.get("width") or 0) * int(item.get("height") or 0),
-            default=None,
-        )
-        if photo is not None:
-            attachments = (
-                MessageAttachment(
-                    kind="image",
-                    file_id=photo["file_id"],
-                    mime_type="image/jpeg",
-                    metadata={key: photo[key] for key in ("width", "height", "file_size", "file_unique_id") if key in photo},
-                ),
-            )
+    attachments = photo_attachments_from_message(message)
     if not text.strip() and not attachments:
         raise ValueError("generation input message must contain text or a supported attachment")
     envelope = InboundEnvelope(
@@ -431,5 +416,6 @@ def _message_from_input(installation: TelegramInstallation, item: TelegramGenera
             "from_id": str(sender.get("id") or installation.actor_id),
             "tomo_id": installation.tomo_id,
         },
+        reply_context=reply_context_from_message(message, chat.get("id")),
     )
     return InboundMessage(item.ordinal, item.update_id, envelope)

@@ -3,7 +3,39 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Protocol
 
-from .models import OutboundBubble
+from .models import MAX_REPLY_CONTEXT_TEXT_CHARS, MessageAttachment, OutboundBubble, ReplyContext
+
+
+def reply_context_from_message(message: dict, parent_chat_id: object) -> ReplyContext | None:
+    reply = message.get("reply_to_message")
+    if not isinstance(reply, dict) or reply.get("message_id") is None:
+        return None
+    reply_chat = reply.get("chat")
+    if not isinstance(reply_chat, dict) or str(reply_chat.get("id")) != str(parent_chat_id):
+        return None
+    sender = reply.get("from")
+    author_role = "assistant" if isinstance(sender, dict) and sender.get("is_bot") else "user" if isinstance(sender, dict) else "unknown"
+    text = reply.get("text") if isinstance(reply.get("text"), str) else reply.get("caption") if isinstance(reply.get("caption"), str) else None
+    truncated = bool(text and len(text) > MAX_REPLY_CONTEXT_TEXT_CHARS)
+    if text is not None:
+        text = text[:MAX_REPLY_CONTEXT_TEXT_CHARS]
+    attachments = photo_attachments_from_message(reply)
+    availability = "available" if text is not None or attachments else "unavailable"
+    return ReplyContext(
+        message_id=str(reply["message_id"]), author_role=author_role, text=text,
+        timestamp=str(reply["date"]) if reply.get("date") is not None else None,
+        attachments=attachments, availability=availability, truncated=truncated,
+    )
+
+
+def photo_attachments_from_message(message: dict) -> tuple[MessageAttachment, ...]:
+    photos = message.get("photo")
+    if not isinstance(photos, list):
+        return ()
+    photo = max((item for item in photos if isinstance(item, dict) and isinstance(item.get("file_id"), str)), key=lambda item: int(item.get("width") or 0) * int(item.get("height") or 0), default=None)
+    if photo is None:
+        return ()
+    return (MessageAttachment("image", file_id=photo["file_id"], mime_type="image/jpeg", metadata={key: photo[key] for key in ("width", "height", "file_size", "file_unique_id") if key in photo}),)
 
 
 @dataclass(frozen=True)

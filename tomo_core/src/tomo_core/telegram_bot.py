@@ -11,6 +11,7 @@ from .models import InboundEnvelope
 from .oauth import OAuthError, OAuthManager
 from .runtime import PersonalAgentRuntime
 from .telegram import TelegramSendReceipt
+from .telegram import reply_context_from_message
 
 
 class TelegramBotApiError(RuntimeError):
@@ -135,6 +136,7 @@ def envelope_from_update(update: dict[str, Any]) -> InboundEnvelope | None:
         message_id=message_id,
         text=text,
         native_metadata={"update_id": update.get("update_id"), "chat_id": chat.get("id")},
+        reply_context=reply_context_from_message(message, chat.get("id")),
     )
 
 

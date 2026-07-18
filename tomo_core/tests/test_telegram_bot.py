@@ -49,6 +49,33 @@ class TelegramBotTests(unittest.TestCase):
         self.assertEqual(envelope.message_id, "77")
         self.assertEqual(envelope.text, "hi tomo")
 
+    def test_envelope_captures_same_chat_reply_to_user_text(self):
+        envelope = envelope_from_update({"update_id": 10, "message": {"message_id": 77, "from": {"id": 123}, "chat": {"id": 123, "type": "private"}, "text": "what about this?", "reply_to_message": {"message_id": 76, "from": {"id": 123}, "chat": {"id": 123, "type": "private"}, "date": 100, "text": "the earlier idea"}}})
+
+        assert envelope is not None
+        self.assertEqual(envelope.reply_context.message_id, "76")
+        self.assertEqual(envelope.reply_context.author_role, "user")
+        self.assertEqual(envelope.reply_context.text, "the earlier idea")
+
+    def test_envelope_omits_cross_chat_reply_context(self):
+        envelope = envelope_from_update({"update_id": 10, "message": {"message_id": 77, "from": {"id": 123}, "chat": {"id": 123, "type": "private"}, "text": "what about this?", "reply_to_message": {"message_id": 76, "chat": {"id": 999, "type": "private"}, "text": "wrong chat"}}})
+
+        assert envelope is not None
+        self.assertIsNone(envelope.reply_context)
+
+    def test_envelope_captures_bot_caption_and_photo_reply_and_honest_unavailable_reply(self):
+        base = {"update_id": 10, "message": {"message_id": 77, "from": {"id": 123}, "chat": {"id": 123, "type": "private"}, "text": "what about this?"}}
+        base["message"]["reply_to_message"] = {"message_id": 76, "from": {"id": 1, "is_bot": True}, "chat": {"id": 123, "type": "private"}, "caption": "bot image", "photo": [{"file_id": "small", "width": 1}, {"file_id": "large", "width": 20, "height": 10}]}
+        envelope = envelope_from_update(base)
+
+        assert envelope is not None
+        self.assertEqual((envelope.reply_context.author_role, envelope.reply_context.text, envelope.reply_context.attachments[0].file_id), ("assistant", "bot image", "large"))
+        base["message"]["reply_to_message"] = {"message_id": 76, "chat": {"id": 123, "type": "private"}}
+        self.assertEqual(envelope_from_update(base).reply_context.availability, "unavailable")
+        base["message"]["reply_to_message"]["text"] = "x" * 5000
+        reply = envelope_from_update(base).reply_context
+        self.assertEqual((len(reply.text), reply.truncated), (4096, True))
+
     def test_group_updates_are_ignored_for_dm_only_slice(self):
         envelope = envelope_from_update(
             {

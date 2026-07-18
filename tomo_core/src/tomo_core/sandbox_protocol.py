@@ -9,7 +9,7 @@ from typing import Any, Callable, Iterable, Iterator, TypeAlias
 
 from .conversation import ConversationMove, FrameReady, MoveConfidence, MovePlan, ReactionIntent, SegmentFinish, TurnBudget, TurnRunCompleted, TurnRunStatus, TurnUsage
 from .conversation.parsing import _validate_strict_frame_text, parse_utterance, parse_utterances
-from .models import AutomationTurn, InboundEnvelope, InboundMessage, InputBurst, MessageAttachment, OutboundBubble, ResponseContract, RuntimeConfig
+from .models import AutomationTurn, InboundEnvelope, InboundMessage, InputBurst, MessageAttachment, OutboundBubble, ReplyContext, ResponseContract, RuntimeConfig
 from .runtime import RuntimeCompleted, RuntimeFrameReady, RuntimeReactionReady
 from .latency_trace import SANDBOX_LATENCY_MARKER
 
@@ -562,7 +562,15 @@ def _envelope_from_dict(raw: object) -> InboundEnvelope:
     try:
         attachments = raw.get("attachments", [])
         if not isinstance(attachments, list) or not all(isinstance(item, dict) for item in attachments): raise ValueError
-        return InboundEnvelope(raw["connector"], raw["actor_id"], raw["message_id"], raw["text"], raw.get("timestamp", ""), tuple(MessageAttachment(**item) for item in attachments), raw.get("location"), raw.get("native_metadata", {}))
+        reply = raw.get("reply_context")
+        if reply is not None and not isinstance(reply, dict):
+            raise ValueError
+        return InboundEnvelope(
+            connector=raw["connector"], actor_id=raw["actor_id"], message_id=raw["message_id"], text=raw["text"],
+            timestamp=raw.get("timestamp", ""), attachments=tuple(MessageAttachment(**item) for item in attachments),
+            location=raw.get("location"), native_metadata=raw.get("native_metadata", {}),
+            reply_context=ReplyContext(**reply) if reply is not None else None,
+        )
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("invalid inbound envelope") from error
 

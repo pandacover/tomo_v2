@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, dataclass, field
 from typing import Literal
 
@@ -48,6 +49,7 @@ class ConversationSession:
                     "ordinal": message.ordinal,
                     "burst_id": burst_id,
                     "attachments": [_attachment_metadata(attachment) for attachment in envelope.attachments],
+                    **({"reply_context": asdict(envelope.reply_context)} if envelope.reply_context else {}),
                 },
             )
         )
@@ -102,4 +104,33 @@ def _attachment_metadata(attachment: MessageAttachment) -> dict:
 def _model_message(message: StoredMessage) -> dict[str, str]:
     if message.role == "automation":
         return {"role": "user", "content": message.content}
+    if message.role == "user" and isinstance(message.metadata.get("reply_context"), dict):
+        reply = message.metadata["reply_context"]
+        payload = {"message_id": message.metadata.get("message_id"), "content": message.content, "reply_context": _history_reply_context(reply)}
+        return {"role": "user", "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":"))}
     return {"role": message.role, "content": message.content}
+
+
+def _history_reply_context(reply: dict) -> dict:
+    payload = {key: reply[key] for key in ("message_id", "author_role", "text", "timestamp", "availability", "truncated") if key in reply}
+    attachments = reply.get("attachments")
+    if isinstance(attachments, (list, tuple)):
+        payload["attachments"] = [
+            _history_attachment(attachment)
+            for attachment in attachments if isinstance(attachment, dict)
+        ]
+    return payload
+
+
+def _history_attachment(attachment: dict) -> dict:
+    payload = {key: attachment[key] for key in ("kind", "mime_type") if key in attachment}
+    metadata = attachment.get("metadata")
+    if isinstance(metadata, dict):
+        safe_metadata = {
+            key: value
+            for key, value in metadata.items()
+            if key in {"width", "height", "file_size"} and isinstance(value, (int, float, str))
+        }
+        if safe_metadata:
+            payload["metadata"] = safe_metadata
+    return payload

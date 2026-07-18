@@ -24,6 +24,7 @@ from .tool_execution import ToolExecutor
 from .sandbox_dispatch import TelegramRuntimeDispatchError, burst_from_work
 from .sandbox_protocol import SandboxCompletedEvent, SandboxErrorEvent, SandboxFrameEvent, SandboxReactionEvent, SandboxStaleEvent, encode_event
 from .telegram import TelegramClient, TelegramDeliverySink, TelegramSendReceipt
+from .telegram import reply_context_from_message
 from .telegram_router import RetryableTelegramUpdateError, StaleRevisionTelegramUpdateError
 from .typing_status import TypingLease
 
@@ -205,11 +206,10 @@ class SharedTelegramGateway:
                     message_id=message_id,
                     text=text,
                     native_metadata={
-                        "chat_id": chat_id,
-                        "delivery_chat_id": installation.chat_id,
                         "from_id": actor_id,
                         "tomo_id": installation.tomo_id,
                     },
+                    reply_context=reply_context_from_message(message, chat.get("id")),
                 ),
             )
         except (TelegramRuntimeDispatchError, SandboxSupervisorError) as error:

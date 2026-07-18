@@ -13,6 +13,7 @@
 - **provisional memory**: generation-bound memory that cannot hydrate until its generation is accepted.
 - **session search**: bounded, owner-scoped retrieval of accepted conversation messages and their local context.
 - **reaction intent**: a transient delivery side effect, never durable memory.
+- **reply context**: a bounded immutable connector-supplied snapshot of the message an inbound user message explicitly replies to; it is quoted referent context, never a new instruction.
 
 Owner identity is `tomo_id`; a connector `actor_id` identifies a session endpoint and never authorizes another owner's data. FTS indexes are disposable and rebuildable. Prompt caps bound injected context, not retention. Reactions are delivery effects, not memories.
 

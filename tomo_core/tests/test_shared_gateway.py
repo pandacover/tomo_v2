@@ -192,8 +192,8 @@ class SharedGatewayTests(unittest.TestCase):
             self.assertEqual(routed_installation, installation)
             self.assertEqual(update_id, 2)
             self.assertEqual(envelope.actor_id, "999")
-            self.assertEqual(envelope.native_metadata["chat_id"], "123")
-            self.assertEqual(envelope.native_metadata["delivery_chat_id"], "123")
+            self.assertNotIn("chat_id", envelope.native_metadata)
+            self.assertNotIn("delivery_chat_id", envelope.native_metadata)
 
     def test_groups_are_ignored(self):
         with self._store() as store:
@@ -286,6 +286,20 @@ class SharedGatewayTests(unittest.TestCase):
             self.assertEqual([message["actor_id"] for message in client.sent_messages], ["123", "123"])
             self.assertEqual([message["text"] for message in client.sent_messages], ["first", "second"])
             self.assertEqual([message["reply_to_message_id"] for message in client.sent_messages], ["2", "earlier"])
+
+    def test_direct_gateway_envelope_captures_reply_context_without_destination_chat_metadata(self):
+        with self._store() as store:
+            self._installation(store, chat_id="123", actor_id="999")
+            dispatch = FakeRuntimeDispatch()
+            update = private_update("hello", chat_id="123", from_id="999", message_id=2)
+            update["message"]["reply_to_message"] = {"message_id": 1, "from": {"id": 999}, "chat": {"id": 123, "type": "private"}, "text": "quoted"}
+
+            SharedTelegramGateway(client=FakeTelegramClient(), store=store, dispatch=dispatch).process_update(update)
+
+            envelope = dispatch.calls[-1][3]
+            self.assertEqual(envelope.reply_context.text, "quoted")
+            self.assertNotIn("chat_id", envelope.native_metadata)
+            self.assertNotIn("delivery_chat_id", envelope.native_metadata)
 
     def test_bound_dm_transient_delivery_failure_sends_one_retry_bubble_and_requests_router_retry(self):
         with self._store() as store:

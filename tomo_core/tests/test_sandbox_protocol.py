@@ -16,7 +16,7 @@ from tomo_core.conversation import (
     TurnRunStatus,
     TurnUsage,
 )
-from tomo_core.models import InboundEnvelope, InboundMessage, InputBurst, OutboundBubble, ResponseContract
+from tomo_core.models import InboundEnvelope, InboundMessage, InputBurst, MessageAttachment, OutboundBubble, ReplyContext, ResponseContract
 from tomo_core.runtime import RuntimeCompleted, RuntimeFrameReady, RuntimeReactionReady
 from tomo_core.sandbox_protocol import (
     EVENT_MARKER,
@@ -67,6 +67,20 @@ class SandboxProtocolTests(unittest.TestCase):
         ], "request-7", "gen-1"))
         self.assertEqual(events[0], SandboxFrameEvent(0, 0, 0, "hello back."))
         self.assertEqual(events[1].result["logical_text"], "hello back.")
+
+    def test_inbound_round_trips_reply_context_and_absent_field_remains_compatible(self):
+        reply = ReplyContext("reply-1", "assistant", "a caption", "2026-01-01T00:00:00+00:00", (MessageAttachment("image", file_id="private", mime_type="image/jpeg", metadata={"width": 10}),))
+        burst = InputBurst("burst-1", "gen-1", 1, (InboundMessage(1, 41, InboundEnvelope("telegram", "user-1", "message-1", "hello", reply_context=reply)),))
+        payload = json.loads(encode_inbound("request-7", burst))
+
+        self.assertEqual(decode_inbound(json.dumps(payload))[1], burst)
+        del payload["burst"]["messages"][0]["envelope"]["reply_context"]
+        self.assertIsNone(decode_inbound(json.dumps(payload))[1].latest.reply_context)
+
+        payload = json.loads(encode_inbound("request-7", burst))
+        payload["burst"]["messages"][0]["envelope"]["reply_context"] = []
+        with self.assertRaises(ValueError):
+            decode_inbound(json.dumps(payload))
 
     def test_v2_and_v3_inbound_and_v2_event_fixtures_remain_readable(self):
         burst = self._burst()

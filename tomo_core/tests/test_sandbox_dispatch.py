@@ -321,6 +321,16 @@ class SandboxDispatchTests(unittest.TestCase):
         self.assertIn('"attachments":[{"kind":"image","file_id":"large"', env["TOMO_INBOUND_JSON"])
         self.assertIn('"text":"look"', env["TOMO_INBOUND_JSON"])
 
+    def test_burst_from_work_captures_reply_context_from_the_queued_raw_update(self):
+        work = self._work()
+        payload = __import__("json").loads(work.inputs[0].payload)
+        payload["message"]["reply_to_message"] = {"message_id": 6, "from": {"id": 111}, "chat": {"id": 222, "type": "private"}, "text": "referent"}
+        work = __import__("dataclasses").replace(work, inputs=(__import__("dataclasses").replace(work.inputs[0], payload=__import__("json").dumps(payload)),))
+
+        burst = __import__("tomo_core.sandbox_dispatch", fromlist=["burst_from_work"]).burst_from_work(self.installation, work)
+
+        self.assertEqual((burst.latest.reply_context.message_id, burst.latest.reply_context.text), ("6", "referent"))
+
     def test_iter_telegram_events_rejects_wrong_generation_without_delivery(self):
         work = self._work()
         self.daytona.start_session_command.return_value = SessionCommandHandle("telegram-burst-one-r1", "cmd-1")

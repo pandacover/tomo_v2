@@ -1,8 +1,9 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
-from tomo_core import ConversationEngine, ConversationRequest, InboundEnvelope, InboundMessage, InputBurst, PersonalAgentRuntime, RuntimeConfig
+from tomo_core import ConversationEngine, ConversationRequest, InboundEnvelope, InboundMessage, InputBurst, MessageAttachment, PersonalAgentRuntime, ReplyContext, RuntimeConfig
 from tomo_core.conversation.parsing import ConversationOutputError
 from tomo_core.delivery import DeliveryPlanner, split_sentences
 from tomo_core.providers import StaticProvider
@@ -143,6 +144,31 @@ class MilestoneOneTests(unittest.TestCase):
 
             unaccepted_history = saved.model_history_for_burst("burst-2")
             self.assertNotIn("stale draft", [item["content"] for item in unaccepted_history])
+
+    def test_session_persists_reply_context_and_retains_it_in_history_without_changing_ordinary_messages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repository = SqlitePersonalDataRepository(Path(tmp) / "tomo.sqlite3")
+            session = ConversationSession("telegram:actor:u")
+            replied = InboundMessage(1, 41, InboundEnvelope("telegram", "u", "101", "answer this", reply_context=ReplyContext("100", "assistant", "quoted answer", attachments=(MessageAttachment("image", file_id="secret", metadata={"width": 20, "file_unique_id": "also-secret"}),), availability="available")))
+            ordinary = InboundMessage(1, 42, InboundEnvelope("telegram", "u", "102", "ordinary"))
+
+            session.append_inbound_once(replied, "old")
+            session.append_inbound_once(ordinary, "older")
+            in_memory_history = session.model_history_for_burst("new")
+            in_memory_reply = next(item for item in in_memory_history if item["content"] != "ordinary")
+            self.assertEqual(json.loads(in_memory_reply["content"])["reply_context"]["attachments"][0]["metadata"]["width"], 20)
+            repository.save_session("local", session)
+            saved = repository.load_session("local", "telegram:actor:u")
+
+            self.assertEqual(next(message for message in saved.messages if message.content == "answer this").metadata["reply_context"]["message_id"], "100")
+            history = saved.model_history_for_burst("new")
+            reply_history = next(item for item in history if item["content"] != "ordinary")
+            reply_payload = json.loads(reply_history["content"])["reply_context"]
+            self.assertEqual(reply_payload["text"], "quoted answer")
+            self.assertEqual(reply_payload["message_id"], "100")
+            self.assertNotIn("file_id", reply_history["content"])
+            self.assertNotIn("file_unique_id", reply_history["content"])
+            self.assertIn({"role": "user", "content": "ordinary"}, history)
 
 
 if __name__ == "__main__":

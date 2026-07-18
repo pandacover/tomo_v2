@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Any, Literal
 
 Connector = Literal["telegram"]
+MAX_REPLY_CONTEXT_TEXT_CHARS = 4096
 
 
 def utc_now_iso() -> str:
@@ -22,6 +23,36 @@ class MessageAttachment:
 
 
 @dataclass(frozen=True)
+class ReplyContext:
+    """Bounded connector-supplied snapshot of the message an inbound message replies to."""
+
+    message_id: str
+    author_role: Literal["user", "assistant", "unknown"]
+    text: str | None = None
+    timestamp: str | None = None
+    attachments: tuple[MessageAttachment, ...] = ()
+    availability: Literal["available", "unavailable"] = "available"
+    truncated: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.message_id, str) or not self.message_id.strip():
+            raise ValueError("reply context message_id is required")
+        if self.author_role not in {"user", "assistant", "unknown"}:
+            raise ValueError("reply context author_role is invalid")
+        if self.text is not None and (not isinstance(self.text, str) or len(self.text) > MAX_REPLY_CONTEXT_TEXT_CHARS):
+            raise ValueError("reply context text exceeds its bound")
+        if self.availability not in {"available", "unavailable"}:
+            raise ValueError("reply context availability is invalid")
+        if not isinstance(self.truncated, bool):
+            raise ValueError("reply context truncated must be boolean")
+        try:
+            attachments = tuple(item if isinstance(item, MessageAttachment) else MessageAttachment(**item) for item in self.attachments)
+        except (TypeError, ValueError) as error:
+            raise ValueError("reply context attachments are invalid") from error
+        object.__setattr__(self, "attachments", attachments)
+
+
+@dataclass(frozen=True)
 class InboundEnvelope:
     connector: Connector
     actor_id: str
@@ -31,6 +62,7 @@ class InboundEnvelope:
     attachments: tuple[MessageAttachment, ...] = ()
     location: dict[str, float] | None = None
     native_metadata: dict[str, Any] = field(default_factory=dict)
+    reply_context: ReplyContext | None = None
 
     @property
     def session_key(self) -> str:
