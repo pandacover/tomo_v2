@@ -84,6 +84,7 @@ class ConversationEngine:
         input_tokens: int | None = None
         output_tokens: int | None = None
         reaction_window_emitted = False
+        mutating_execution_attempted = False
 
         def expired() -> bool:
             return self.monotonic_clock() - started_at >= self.budget.max_elapsed_seconds
@@ -105,11 +106,10 @@ class ConversationEngine:
                     yield completed(TurnRunStatus.COMPLETED_PARTIAL)
                     return
                 raise ConversationOutputError("elapsed_budget_exhausted")
-            allow_tools = bool(self.tool_registry.schemas()) and index < self.budget.max_model_segments - 1 and sum(bool(s.frames) for s in segments) < self.budget.max_visible_segments - 1 and sum(s.finish is SegmentFinish.TOOL_BATCH for s in segments) < self.budget.max_tool_rounds and sum(len(s.tool_calls) for s in segments) < self.budget.max_tool_calls
+            allow_tools = not mutating_execution_attempted and bool(self.tool_registry.schemas()) and index < self.budget.max_model_segments - 1 and sum(bool(s.frames) for s in segments) < self.budget.max_visible_segments - 1 and sum(s.finish is SegmentFinish.TOOL_BATCH for s in segments) < self.budget.max_tool_rounds and sum(len(s.tool_calls) for s in segments) < self.budget.max_tool_calls
             schemas = self.tool_registry.schemas() if allow_tools else ()
             replacement = False
             repair_code: str | None = None
-            execution_attempted = False
             while True:
                 remaining_frames = 3 - len(frames)
                 if remaining_frames < 1:
@@ -120,7 +120,7 @@ class ConversationEngine:
                 segment_budget = replace(self.budget, max_frames_per_segment=min(self.budget.max_frames_per_segment, remaining_frames))
                 parser = SegmentFrameParser(index, first_segment=plan is None, budget=segment_budget)
                 if replacement and plan is None:
-                    schemas = schemas if not execution_attempted else ()
+                    schemas = schemas if not mutating_execution_attempted else ()
                     messages = build_first_segment_repair_messages(
                         request,
                         context,
@@ -130,7 +130,7 @@ class ConversationEngine:
                         tools_available=schemas,
                     )
                 elif replacement and plan is not None:
-                    schemas = schemas if not execution_attempted else ()
+                    schemas = schemas if not mutating_execution_attempted else ()
                     messages = build_segment_repair_messages(request, context, segment_budget, plan, repair_code or "replacement_required", prior_messages=prior_messages, tools_available=schemas)
                 else:
                     messages = build_segment_messages(request, context, segment_budget, segment_index=index, plan=plan, prior_messages=prior_messages, tools_available=schemas)
@@ -403,6 +403,8 @@ class ConversationEngine:
                         failure = ConversationOutputError("tool_frame_limit")
                 if failure is None and tool_finish:
                     if mutating_tool_segment:
+                        mutating_execution_attempted = True
+                    if mutating_tool_segment:
                         # Never persist or release an ungrounded mutating-tool announcement.
                         segment_frames.clear()
                     else:
@@ -413,7 +415,6 @@ class ConversationEngine:
                     emit_provider_attempt("ok")
                     try:
                         tool_started_at = self.monotonic_clock()
-                        execution_attempted = True
                         batch = self.tool_executor.execute_prepared_batch(prepared_calls, is_active)
                     except ToolBatchCancelled:
                         if is_active():

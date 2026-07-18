@@ -552,6 +552,68 @@ class ConversationEngineTests(unittest.TestCase):
         self.assertEqual([frame.text for frame in result.frames], ["Your reminder is scheduled for tomorrow."])
         self.assertEqual(result.usage.contract_repairs, 1)
 
+    def test_mutating_callback_failure_fences_tools_for_remaining_turn(self):
+        from tomo_core.tools import BoundTool, ToolRegistry, ToolSpec
+
+        mutations = []
+
+        class RetryWhileToolsProvider(ScriptedProvider):
+            def __init__(self):
+                super().__init__(())
+
+            def stream(self, messages, *, tools=(), actor_id=None):
+                self.calls.append((messages, tools, actor_id))
+                attempt = len(self.calls)
+                scripted = (
+                    [ProviderToolCallReady(f"call-{attempt}", "schedule_reminder", '{"when":"tomorrow"}'), ProviderStreamCompleted("tool_calls")]
+                    if attempt <= 2 and tools
+                    else [ProviderTextDelta('{"type":"frame","text":"I could not confirm the reminder status."}\n'), ProviderStreamCompleted("stop")]
+                )
+                iterator = ClosingIterator(scripted)
+                self.iterators.append(iterator)
+                return iterator
+
+        def mutate(arguments):
+            mutations.append(arguments)
+            raise RuntimeError("committed mutation failed to report")
+
+        provider = RetryWhileToolsProvider()
+        registry = ToolRegistry((BoundTool(
+            ToolSpec("schedule_reminder", "Schedule a reminder", {"type": "object", "properties": {"when": {"type": "string"}}, "required": ["when"]}, read_only=False),
+            mutate,
+        ),))
+
+        result = ConversationEngine(provider, tool_registry=registry).respond(self.request())
+
+        self.assertEqual(mutations, [{"when": "tomorrow"}])
+        self.assertNotEqual(provider.calls[0][1], ())
+        self.assertEqual(provider.calls[1][1], ())
+        self.assertEqual([frame.text for frame in result.frames], ["I could not confirm the reminder status."])
+
+    def test_fixed_plan_repair_can_execute_mutating_tool_before_fenced_continuation(self):
+        from tomo_core.tools import BoundTool, ToolRegistry, ToolSpec
+
+        mutations = []
+        provider = ScriptedProvider([
+            [ProviderTextDelta(CANONICAL_PLAN + "not json\n"), ProviderStreamCompleted("stop")],
+            [ProviderToolCallReady("call-1", "schedule_reminder", '{"when":"tomorrow"}'), ProviderStreamCompleted("tool_calls")],
+            [ProviderTextDelta('{"type":"frame","text":"Your reminder is scheduled for tomorrow."}\n'), ProviderStreamCompleted("stop")],
+        ])
+        registry = ToolRegistry((BoundTool(
+            ToolSpec("schedule_reminder", "Schedule a reminder", {"type": "object", "properties": {"when": {"type": "string"}}, "required": ["when"]}, read_only=False),
+            lambda arguments: mutations.append(arguments) or "scheduled",
+        ),))
+
+        events = list(ConversationEngine(provider, tool_registry=registry).respond_iter(self.request()))
+
+        self.assertEqual(events[0].plan.response_goal, "answer directly")
+        self.assertEqual(sum(isinstance(event, TurnRunStarted) for event in events), 1)
+        self.assertEqual(events[-1].result.plan, events[0].plan)
+        self.assertNotEqual(provider.calls[1][1], ())
+        self.assertEqual(provider.calls[2][1], ())
+        self.assertEqual(mutations, [{"when": "tomorrow"}])
+        self.assertEqual([frame.frame.text for frame in events if isinstance(frame, FrameReady)], ["Your reminder is scheduled for tomorrow."])
+
     def test_failed_mutating_execution_repair_is_tool_free(self):
         from tomo_core.tool_execution import ToolExecutor
         from tomo_core.tools import BoundTool, ToolRegistry, ToolSpec
