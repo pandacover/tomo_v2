@@ -1,6 +1,7 @@
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 
 import httpx
 
@@ -11,6 +12,56 @@ from tomo_core.cron_store import CronStore
 
 
 class CronApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_delay_schedule_resolves_at_control_host_time_and_is_not_due_early(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            now = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
+            key = load_or_create_key(tmp)
+            issued_at = int(time.time())
+            token = issue_capability(key, CronCapability("owner", "actor", "telegram:chat", "telegram:actor:actor", issued_at, issued_at + 60))
+            headers = {"Authorization": f"Bearer {token}", "X-Tomo-Owner-Id": "owner", "X-Tomo-Actor-Id": "actor", "X-Tomo-Destination": "telegram:chat", "X-Tomo-Session-Id": "telegram:actor:actor", "Idempotency-Key": "delay"}
+            transport = httpx.ASGITransport(app=create_app(data_dir=tmp, now=lambda: now))
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                response = await client.post("/v1/cron/jobs", json={"intent": "Remind me", "schedule": {"kind": "delay", "afterSeconds": 600}}, headers=headers)
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["job"]["schedule"], {"kind": "once", "at": (now + timedelta(seconds=600)).isoformat(), "everySeconds": None, "expression": None, "timezoneName": "UTC", "startsAt": None})
+            store = CronStore(tmp)
+            self.assertIsNone(store.claim_due_run(now=now + timedelta(seconds=599)))
+            due = store.claim_due_run(now=now + timedelta(seconds=600))
+            self.assertEqual(due.run.scheduled_for, now + timedelta(seconds=600))
+
+    async def test_delay_schedule_rejects_non_positive_and_excessive_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            key = load_or_create_key(tmp); now = int(time.time())
+            token = issue_capability(key, CronCapability("owner", "actor", "telegram:chat", "telegram:actor:actor", now, now + 60))
+            headers = {"Authorization": f"Bearer {token}", "X-Tomo-Owner-Id": "owner", "X-Tomo-Actor-Id": "actor", "X-Tomo-Destination": "telegram:chat", "X-Tomo-Session-Id": "telegram:actor:actor", "Idempotency-Key": "delay-bounds"}
+            transport = httpx.ASGITransport(app=create_app(data_dir=tmp))
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                zero = await client.post("/v1/cron/jobs", json={"intent": "Remind me", "schedule": {"kind": "delay", "afterSeconds": 0}}, headers=headers)
+                excessive = await client.post("/v1/cron/jobs", json={"intent": "Remind me", "schedule": {"kind": "delay", "afterSeconds": 31536001}}, headers=headers)
+            self.assertEqual((zero.status_code, excessive.status_code), (422, 422))
+
+    async def test_update_delay_resolves_from_update_request_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            clock = [datetime(2026, 1, 1, 12, tzinfo=timezone.utc)]
+            key = load_or_create_key(tmp)
+            issued_at = int(time.time())
+            token = issue_capability(key, CronCapability("owner", "actor", "telegram:chat", "telegram:actor:actor", issued_at, issued_at + 60))
+            headers = {"Authorization": f"Bearer {token}", "X-Tomo-Owner-Id": "owner", "X-Tomo-Actor-Id": "actor", "X-Tomo-Destination": "telegram:chat", "X-Tomo-Session-Id": "telegram:actor:actor"}
+            transport = httpx.ASGITransport(app=create_app(data_dir=tmp, now=lambda: clock[0]))
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                created = await client.post("/v1/cron/jobs", json={"intent": "Check", "schedule": {"kind": "interval", "everySeconds": 3600}}, headers={**headers, "Idempotency-Key": "create-delay-update"})
+                job_id = created.json()["job"]["jobId"]
+                clock[0] += timedelta(minutes=5)
+                updated = await client.patch(f"/v1/cron/jobs/{job_id}", json={"intent": "Remind me", "schedule": {"kind": "delay", "afterSeconds": 120}, "revision": 1}, headers={**headers, "Idempotency-Key": "update-delay"})
+
+            self.assertEqual(updated.status_code, 200)
+            due_at = clock[0] + timedelta(seconds=120)
+            self.assertEqual(updated.json()["job"]["schedule"]["at"], due_at.isoformat())
+            store = CronStore(tmp)
+            self.assertIsNone(store.claim_due_run(now=due_at - timedelta(seconds=1)))
+            self.assertEqual(store.claim_due_run(now=due_at).run.scheduled_for, due_at)
+
     async def test_capability_rejects_cross_actor_chat_and_session_request_context(self):
         with tempfile.TemporaryDirectory() as tmp:
             key = load_or_create_key(tmp)

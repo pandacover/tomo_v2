@@ -135,6 +135,10 @@ class ToolRegistry:
     def is_blocked(self, name: str) -> bool:
         return name in self._blocked
 
+    def is_mutating(self, name: str) -> bool:
+        tool = self._by_name.get(name)
+        return tool is not None and not tool.spec.read_only
+
     def extend(self, other: "ToolRegistry") -> "ToolRegistry":
         if not isinstance(other, ToolRegistry):
             raise ValueError("other must be a ToolRegistry")

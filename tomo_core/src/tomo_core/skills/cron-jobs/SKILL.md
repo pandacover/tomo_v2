@@ -17,9 +17,12 @@ Accept one of these forms:
 
 - once with an ISO timestamp in at.
 - interval with positive everySeconds and optional startsAt anchor.
+- delay with positive afterSeconds for a one-shot relative reminder.
 - standard five-field cron expression with an IANA timezone. When both day-of-month and day-of-week are restricted, standard OR semantics apply. Ambiguous local minutes fire once and nonexistent local minutes are skipped.
 
 Ask only for materially missing schedule, timezone, or lifecycle details. Resolve the user's local timezone whenever a civil time would otherwise be ambiguous. The timezone field belongs to cron schedules; once timestamps and interval anchors must be timezone-aware ISO timestamps. Never invent a default that changes the intended time.
+
+For "in N" one-shot reminders, MUST use delay and never infer wall-clock time. startsAt is itself the first interval occurrence. An interval without startsAt first fires one interval after creation.
 
 ## Intent And Lifecycle
 

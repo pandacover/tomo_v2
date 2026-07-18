@@ -3,8 +3,9 @@ from __future__ import annotations
 import os
 import hashlib
 import json
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Callable
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
@@ -33,6 +34,7 @@ class CronScheduleRequest(BaseModel):
     expression: str | None = Field(default=None, max_length=128)
     timezone_name: str = Field(default="UTC", alias="timezoneName", max_length=128)
     starts_at: str | None = Field(default=None, alias="startsAt", max_length=64)
+    after_seconds: float | None = Field(default=None, alias="afterSeconds", gt=0, le=31536000)
     model_config = {"extra": "forbid"}
 
 
@@ -66,13 +68,14 @@ class CronRevisionRequest(BaseModel):
     model_config = {"extra": "forbid"}
 
 
-def create_app(data_dir: str | Path | None = None, api_key: str | None = None, bot_username: str | None = None) -> FastAPI:
+def create_app(data_dir: str | Path | None = None, api_key: str | None = None, bot_username: str | None = None, now: Callable[[], datetime] | None = None) -> FastAPI:
     resolved_data_dir = Path(data_dir or os.getenv("TOMO_CORE_DATA_DIR", ".tomo_core"))
     resolved_api_key = api_key if api_key is not None else os.getenv("TOMO_CONTROL_API_KEY")
     resolved_bot_username = bot_username or os.getenv("TOMO_TELEGRAM_GLOBAL_BOT_USERNAME")
     store: TelegramOnboardingStore | None = None
     cron_store: CronStore | None = None
     cron_key: bytes | None = None
+    clock = now or (lambda: datetime.now(timezone.utc))
     app = FastAPI(title="tomo core control api")
 
     def onboarding_store() -> TelegramOnboardingStore:
@@ -128,7 +131,7 @@ def create_app(data_dir: str | Path | None = None, api_key: str | None = None, b
             raise HTTPException(status_code=400, detail="missing idempotency key")
         job_id = hashlib.sha256(f"{capability.owner_id}\ncreate\n{idempotency_key}".encode("utf-8")).hexdigest()[:32]
         try:
-            job = CronJob(job_id, capability.owner_id, capability.destination, JobIntent(body.intent, tuple(body.constraints)), _schedule(body.schedule), _lifecycle(body.lifecycle))
+            job = CronJob(job_id, capability.owner_id, capability.destination, JobIntent(body.intent, tuple(body.constraints)), _schedule(body.schedule, clock()), _lifecycle(body.lifecycle))
         except (TypeError, ValueError):
             raise HTTPException(status_code=422, detail="invalid cron job") from None
         try:
@@ -157,7 +160,7 @@ def create_app(data_dir: str | Path | None = None, api_key: str | None = None, b
         if current is None:
             raise HTTPException(status_code=404, detail="cron job not found")
         try:
-            replacement = CronJob(job_id, capability.owner_id, capability.destination, JobIntent(body.intent, tuple(body.constraints)), _schedule(body.schedule), _lifecycle(body.lifecycle))
+            replacement = CronJob(job_id, capability.owner_id, capability.destination, JobIntent(body.intent, tuple(body.constraints)), _schedule(body.schedule, clock()), _lifecycle(body.lifecycle))
         except (TypeError, ValueError):
             raise HTTPException(status_code=422, detail="invalid cron job") from None
         if body.revision is None:
@@ -228,10 +231,14 @@ def _canonical(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
-def _schedule(value: CronScheduleRequest) -> ScheduleSpec:
+def _schedule(value: CronScheduleRequest, now: datetime | None = None) -> ScheduleSpec:
     if value.kind == "once": return ScheduleSpec.once(_timestamp(value.at))  # type: ignore[arg-type]
     if value.kind == "interval": return ScheduleSpec.interval(value.every_seconds, starts_at=_timestamp(value.starts_at))  # type: ignore[arg-type]
     if value.kind == "cron": return ScheduleSpec.cron(value.expression or "", value.timezone_name)
+    if value.kind == "delay":
+        if now is None or now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("delay requires timezone-aware current time")
+        return ScheduleSpec.once(now.astimezone(timezone.utc) + timedelta(seconds=value.after_seconds))  # type: ignore[arg-type]
     raise ValueError("invalid schedule")
 
 

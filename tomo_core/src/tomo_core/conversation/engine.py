@@ -145,6 +145,7 @@ class ConversationEngine:
                 emitted_stages: set[str] = set()
                 output_chars_through_first_frame = 0
                 first_frame_chars: int | None = None
+                emitted_frame_count = 0
 
                 def emit_provider_attempt(outcome: str) -> None:
                     nonlocal provider_attempt_emitted
@@ -220,7 +221,7 @@ class ConversationEngine:
                             return
                         yield from yield_provider_event(MemoryControlReady(index, record, tuple(sorted(tool_observation_ids))))
                     else:
-                        if len(frames) >= 3:
+                        if len(frames) + len(segment_frames) >= 3:
                             raise ConversationOutputError("frame_limit")
                         if (not segment_frames and sum(bool(s.frames) for s in segments) >= self.budget.max_visible_segments):
                             raise ConversationOutputError("visible_segment_limit")
@@ -228,18 +229,25 @@ class ConversationEngine:
                             failure = ConversationOutputError("elapsed_budget_exhausted")
                             return
                         segment_frames.append(record)
-                        frames.append(record)
                         if first_frame_chars is None:
                             first_frame_chars = len(record.text)
                         emit_provider_stage("sandbox_provider_first_frame_validated", include_completion=True)
-                        if index == 0 and plan is not None and plan.reaction is not None and not reaction_window_emitted:
-                            reaction_window_emitted = True
-                            if not is_active():
-                                return
-                            yield from yield_provider_event(ReactionWindowReady())
+                        if not schemas:
+                            yield from emit_segment_frames()
+
+                def emit_segment_frames() -> Iterator[TurnRunEvent]:
+                    nonlocal reaction_window_emitted, emitted_frame_count
+                    if index == 0 and plan is not None and plan.reaction is not None and not reaction_window_emitted:
+                        reaction_window_emitted = True
                         if not is_active():
                             return
-                        yield from yield_provider_event(FrameReady(len(frames) - 1, record))
+                        yield from yield_provider_event(ReactionWindowReady())
+                    for frame in segment_frames[emitted_frame_count:]:
+                        frames.append(frame)
+                        emitted_frame_count += 1
+                        if not is_active():
+                            return
+                        yield from yield_provider_event(FrameReady(len(frames) - 1, frame))
 
                 emit_provider_stage("sandbox_provider_attempt_start")
 
@@ -343,6 +351,7 @@ class ConversationEngine:
                     except ConversationOutputError as error:
                         failure = error
                 tool_finish = terminal is not None and terminal.finish_reason == "tool_calls"
+                mutating_tool_segment = tool_finish and any(self.tool_registry.is_mutating(native_call.name) for native_call in native_calls)
                 if failure is None and tool_finish and native_calls and all(self.tool_registry.is_blocked(call.name) for call in native_calls):
                     if plan is None:
                         resolution = synthesized_tool_plan()
@@ -389,6 +398,14 @@ class ConversationEngine:
                     elif len(segment_frames) > 1:
                         failure = ConversationOutputError("tool_frame_limit")
                 if failure is None and tool_finish:
+                    if mutating_tool_segment:
+                        # Never persist or release an ungrounded mutating-tool announcement.
+                        segment_frames.clear()
+                    else:
+                        # A validated read-only announcement may stay progressive.
+                        yield from emit_segment_frames()
+                        if not is_active():
+                            return
                     emit_provider_attempt("ok")
                     try:
                         tool_started_at = self.monotonic_clock()
@@ -427,7 +444,11 @@ class ConversationEngine:
                 # Finalize after parsing and contract validation, before any tool work.
                 emit_provider_attempt("error" if failure is not None else "ok")
                 if failure is not None:
+                    if mutating_tool_segment:
+                        # A failed tool segment has no observation that could ground its frame.
+                        segment_frames.clear()
                     if segment_frames:
+                        yield from emit_segment_frames()
                         segments.append(SegmentResult(index, tuple(segment_frames), (), SegmentFinish.PARTIAL, tuple(segment_memory_controls)))
                         if not is_active():
                             return
@@ -448,6 +469,7 @@ class ConversationEngine:
                     replacement = True
                     continue
                 segments.append(SegmentResult(index, tuple(segment_frames), (), SegmentFinish.COMPLETE, tuple(segment_memory_controls)))
+                yield from emit_segment_frames()
                 if not is_active() or expired():
                     if not is_active():
                         return

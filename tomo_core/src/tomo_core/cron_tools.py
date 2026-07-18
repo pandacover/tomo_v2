@@ -72,8 +72,9 @@ def cron_registry(client: CronApiClient, generation_id: str) -> ToolRegistry:
     timestamp = {"type": "string", "maxLength": 64}
     once = {"type": "object", "properties": {"kind": {"const": "once"}, "at": timestamp}, "required": ["kind", "at"], "additionalProperties": False}
     interval = {"type": "object", "properties": {"kind": {"const": "interval"}, "everySeconds": {"type": "number", "exclusiveMinimum": 0}, "startsAt": timestamp}, "required": ["kind", "everySeconds"], "additionalProperties": False}
+    delay = {"type": "object", "properties": {"kind": {"const": "delay"}, "afterSeconds": {"type": "number", "exclusiveMinimum": 0, "maximum": 31536000}}, "required": ["kind", "afterSeconds"], "additionalProperties": False}
     cron = {"type": "object", "properties": {"kind": {"const": "cron"}, "expression": {"type": "string", "minLength": 1, "maxLength": 128}, "timezoneName": {"type": "string", "minLength": 1, "maxLength": 128}}, "required": ["kind", "expression"], "additionalProperties": False}
-    schedule = {"oneOf": [once, interval, cron]}
+    schedule = {"oneOf": [once, interval, delay, cron]}
     lifecycle = {"type": "object", "properties": {"endsAt": {"type": "string", "maxLength": 64}, "maxSuccessfulRuns": {"type": "integer", "minimum": 1}}, "additionalProperties": False}
     tools = (
          BoundTool(ToolSpec("cron_create", "Create a scheduled Tomo job for this conversation.", {"type": "object", "properties": {"intent": {"type": "string", "minLength": 1, "maxLength": 4000}, "constraints": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 1000}, "maxItems": 32}, "schedule": schedule, "lifecycle": lifecycle}, "required": ["intent", "schedule"], "additionalProperties": False}, read_only=False, parallel_safe=False), invoke("create", "POST", "/v1/cron/jobs", True)),

@@ -63,6 +63,38 @@ class TurnRunToolTests(unittest.TestCase):
         self.assertEqual(set(message), {"role", "tool_call_id", "content"})
         self.assertEqual(json.loads(message["content"]), {"name": "lookup", "ok": True, "content": "found"})
 
+    def test_mutating_tool_suppresses_pre_observation_frame_and_persists_only_grounded_frame(self):
+        invoked = []
+        provider = ScriptedProvider([
+            [ProviderTextDelta(PLAN + '{"type":"frame","text":"Created."}\n'), ProviderToolCallReady("create-1", "cron_create", "{}"), ProviderStreamCompleted("tool_calls")],
+            [ProviderTextDelta('{"type":"frame","text":"Created for 10 minutes from now."}\n'), ProviderStreamCompleted("stop")],
+        ])
+        mutation = BoundTool(ToolSpec("cron_create", "create", {"type": "object", "properties": {}}, read_only=False, parallel_safe=False), lambda _: invoked.append(True) or "created")
+
+        events = list(ConversationEngine(provider, tool_registry=registry(mutation)).respond_iter(self.request()))
+
+        visible = [event.frame.text for event in events if isinstance(event, FrameReady)]
+        result = events[-1].result
+        self.assertEqual(visible, ["Created for 10 minutes from now."])
+        self.assertEqual([frame.text for frame in result.frames], visible)
+        self.assertEqual(invoked, [True])
+
+    def test_invalid_mutating_tool_does_not_surface_false_pre_observation_confirmation(self):
+        invoked = []
+        provider = ScriptedProvider([
+            [ProviderTextDelta(PLAN + '{"type":"frame","text":"Created."}\n'), ProviderToolCallReady("create-1", "cron_create", "{"), ProviderStreamCompleted("tool_calls")],
+            [ProviderTextDelta('{"type":"frame","text":"I couldn’t create that reminder."}\n'), ProviderStreamCompleted("stop")],
+        ])
+        mutation = BoundTool(ToolSpec("cron_create", "create", {"type": "object", "properties": {}}, read_only=False, parallel_safe=False), lambda _: invoked.append(True))
+
+        events = list(ConversationEngine(provider, tool_registry=registry(mutation)).respond_iter(self.request()))
+
+        visible = [event.frame.text for event in events if isinstance(event, FrameReady)]
+        result = events[-1].result
+        self.assertEqual(visible, ["I couldn’t create that reminder."])
+        self.assertEqual([frame.text for frame in result.frames], visible)
+        self.assertEqual(invoked, [])
+
     def test_memory_control_after_tool_batch_receives_only_that_turns_observation_id(self):
         control = json.dumps({
             "type": "memory_control", "action": "add", "authority": "autonomous", "user_intent_excerpt": None,

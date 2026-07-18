@@ -23,6 +23,9 @@ class CronToolsTests(unittest.TestCase):
         self.assertFalse(registry.resolve("cron_create").spec.parallel_safe)
         self.assertTrue(registry.resolve("cron_list").spec.read_only)
         self.assertEqual(cron_idempotency_key("g", "create", {"b": 2, "a": 1}), cron_idempotency_key("g", "create", {"a": 1, "b": 2}))
+        schedules = names["cron_create"]["properties"]["schedule"]["oneOf"]
+        delay = next(schedule for schedule in schedules if schedule["properties"]["kind"].get("const") == "delay")
+        self.assertEqual(delay["properties"]["afterSeconds"], {"type": "number", "exclusiveMinimum": 0, "maximum": 31536000})
 
     def test_client_returns_stable_safe_errors(self):
         def fail(*_args, **_kwargs):
