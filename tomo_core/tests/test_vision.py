@@ -126,6 +126,24 @@ class ProviderVisionInterpreterTests(unittest.TestCase):
         self.assertEqual(messages[1]["content"][0]["text"], "what is this?")
         self.assertTrue(messages[1]["content"][1]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
 
+    def test_accepts_bounded_json_fence_with_harmless_outer_whitespace(self):
+        payload = '{"summary":"red rectangle","visible_text":[],"relevant_details":[],"uncertainties":[]}'
+        for document in (" \n" + payload + "\n ", " \n```json\n" + payload + "\n```\n ", "\n```\n" + payload + "\n```\n"):
+            with self.subTest(document=document[:10]):
+                interpreter, provider = self._interpreter(
+                    self._png(),
+                    (ProviderTextDelta(document), ProviderStreamCompleted("stop")),
+                )
+
+                observation = interpreter.observe(MessageAttachment("image", "id"), "q", message_id="m", attachment_index=0, actor_id="actor")
+
+                self.assertEqual(observation.status, "ok")
+                self.assertEqual(observation.summary, "red rectangle")
+                prompt = provider.calls[0][0][0]["content"]
+                self.assertIn('summary (a nonblank string)', prompt)
+                self.assertIn('visible_text (an array of strings)', prompt)
+                self.assertIn('Do not use Markdown, fences, or prose', prompt)
+
     def test_rejects_all_malformed_specialist_json_shapes(self):
         image = self._png()
         valid = {"summary": "seen", "visible_text": [], "relevant_details": [], "uncertainties": []}
@@ -156,7 +174,10 @@ class ProviderVisionInterpreterTests(unittest.TestCase):
             ((ProviderToolCallReady("call", "tool", "{}"), ProviderStreamCompleted("stop")), "tool event"),
             ((ProviderTextDelta(valid), ProviderStreamCompleted("stop"), ProviderTextDelta("x")), "trailing delta"),
             ((ProviderTextDelta(" ```json"), ProviderStreamCompleted("stop")), "whitespace"),
-            ((ProviderTextDelta("```json\n" + valid + "\n```"), ProviderStreamCompleted("stop")), "fence"),
+            ((ProviderTextDelta("before\n" + valid), ProviderStreamCompleted("stop")), "leading prose"),
+            ((ProviderTextDelta(valid + "\nafter"), ProviderStreamCompleted("stop")), "trailing prose"),
+            ((ProviderTextDelta("```json\n```json\n" + valid + "\n```\n```"), ProviderStreamCompleted("stop")), "nested fence"),
+            ((ProviderTextDelta("```json\n" + valid + "\n```\n```json\n" + valid + "\n```"), ProviderStreamCompleted("stop")), "multiple fences"),
             ((ProviderTextDelta("not json"), ProviderStreamCompleted("stop")), "malformed"),
             ((ProviderTextDelta("x" * 12001), ProviderStreamCompleted("stop")), "oversize"),
         )
