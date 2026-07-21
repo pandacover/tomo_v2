@@ -5,6 +5,8 @@ from unittest.mock import patch
 import httpx
 
 from tomo_core.providers import (
+    GrokAuthProvider,
+    OAuthBackedSuperGrokProvider,
     ProviderStreamCompleted,
     ProviderTextDelta,
     ProviderToolCallReady,
@@ -12,6 +14,26 @@ from tomo_core.providers import (
     XaiApiProvider,
     supergrok_oauth_provider_from_access_token,
 )
+
+
+STRUCTURED_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "vision_observation",
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["summary", "visible_text", "relevant_details", "uncertainties"],
+            "properties": {
+                "summary": {"type": "string", "minLength": 1, "maxLength": 2000},
+                "visible_text": {"type": "array", "maxItems": 8, "items": {"type": "string", "minLength": 1, "maxLength": 1000}},
+                "relevant_details": {"type": "array", "maxItems": 8, "items": {"type": "string", "minLength": 1, "maxLength": 1000}},
+                "uncertainties": {"type": "array", "maxItems": 8, "items": {"type": "string", "minLength": 1, "maxLength": 1000}},
+            },
+        },
+        "strict": True,
+    },
+}
 
 
 class FakeStreamResponse:
@@ -40,6 +62,33 @@ def sse_chunks(*events, splits=()):
 
 
 class ProviderStreamingTests(unittest.TestCase):
+    def test_structured_stream_serializes_response_format_only_for_xai_and_fixed_token_providers(self):
+        terminal = json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}]})
+        providers = (
+            XaiApiProvider(api_key="test-key"),
+            supergrok_oauth_provider_from_access_token("test-token"),
+        )
+        for provider in providers:
+            with self.subTest(provider=provider.name), patch("tomo_core.providers.httpx.stream", return_value=FakeStreamResponse(sse_chunks(terminal, "[DONE]"))) as stream:
+                request_format = json.loads(json.dumps(STRUCTURED_RESPONSE_FORMAT))
+                events = provider.stream_structured([{"role": "user", "content": "describe"}], response_format=request_format)
+                request_format["type"] = "text"
+                list(events)
+                self.assertEqual(stream.call_args.kwargs["json"]["response_format"], STRUCTURED_RESPONSE_FORMAT)
+            with self.subTest(provider=f"ordinary-{provider.name}"), patch("tomo_core.providers.httpx.stream", return_value=FakeStreamResponse(sse_chunks(terminal, "[DONE]"))) as stream:
+                list(provider.stream([{"role": "user", "content": "describe"}]))
+                self.assertNotIn("response_format", stream.call_args.kwargs["json"])
+
+    def test_oauth_backed_and_grok_auth_providers_forward_structured_streams(self):
+        oauth = type("OAuth", (), {"token_path": lambda *_: type("Path", (), {"exists": lambda _: True, "read_text": lambda _, **__: '{"access_token":"unused"}'})()})()
+        auth_store = type("AuthStore", (), {"access_token": lambda _: "unused"})()
+        with patch("tomo_core.providers.SuperGrokOAuthProvider.stream_structured", return_value=iter(())) as supergrok_stream:
+            list(OAuthBackedSuperGrokProvider(oauth=oauth).stream_structured([{"role": "user", "content": "describe"}], response_format=STRUCTURED_RESPONSE_FORMAT, actor_id="actor"))
+            supergrok_stream.assert_called_once_with([{"role": "user", "content": "describe"}], response_format=STRUCTURED_RESPONSE_FORMAT, actor_id="actor")
+        with patch("tomo_core.providers.XaiApiProvider.stream_structured", return_value=iter(())) as xai_stream:
+            list(GrokAuthProvider(auth_store=auth_store).stream_structured([{"role": "user", "content": "describe"}], response_format=STRUCTURED_RESPONSE_FORMAT, actor_id="actor"))
+            xai_stream.assert_called_once_with([{"role": "user", "content": "describe"}], response_format=STRUCTURED_RESPONSE_FORMAT, actor_id="actor")
+
     def test_vision_store_policy_and_multimodal_content_are_serialized(self):
         terminal = json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}]})
         messages = [{"role": "user", "content": [{"type": "text", "text": "describe"}, {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,abc"}}]}]

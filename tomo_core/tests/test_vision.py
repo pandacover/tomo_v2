@@ -12,6 +12,26 @@ from tomo_core.sessions import ConversationSession
 from tomo_core.vision import DownloadedAttachment, ProviderVisionInterpreter, VisionObservation
 
 
+STRUCTURED_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "vision_observation",
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["summary", "visible_text", "relevant_details", "uncertainties"],
+            "properties": {
+                "summary": {"type": "string", "minLength": 1, "maxLength": 2000},
+                "visible_text": {"type": "array", "maxItems": 8, "items": {"type": "string", "minLength": 1, "maxLength": 1000}},
+                "relevant_details": {"type": "array", "maxItems": 8, "items": {"type": "string", "minLength": 1, "maxLength": 1000}},
+                "uncertainties": {"type": "array", "maxItems": 8, "items": {"type": "string", "minLength": 1, "maxLength": 1000}},
+            },
+        },
+        "strict": True,
+    },
+}
+
+
 class VisionObservationTests(unittest.TestCase):
     def test_ok_observation_exposes_only_safe_prompt_payload(self):
         observation = VisionObservation(
@@ -69,6 +89,37 @@ class VisionObservationTests(unittest.TestCase):
 
 
 class ProviderVisionInterpreterTests(unittest.TestCase):
+    def test_uses_structured_stream_with_the_exact_vision_schema_when_available(self):
+        image = self._png()
+
+        class Reader:
+            def read(self, attachment): return DownloadedAttachment(image, "image/png")
+
+        class Provider:
+            name = "structured"; supports_images_in = True; supports_images_out = False; supports_tool_calls = False
+            def stream(self, *args, **kwargs): raise AssertionError("plain stream must not be used")
+            def stream_structured(self, messages, *, response_format, actor_id=None):
+                self.messages = messages
+                self.response_format = response_format
+                self.actor_id = actor_id
+                return iter((ProviderTextDelta('{"summary":"seen","visible_text":[],"relevant_details":[],"uncertainties":[]}'), ProviderStreamCompleted("stop")))
+
+        provider = Provider()
+        observation = ProviderVisionInterpreter(provider, Reader()).observe(MessageAttachment("image", "id"), "q", message_id="m", attachment_index=0, actor_id="actor")
+
+        self.assertEqual(observation.status, "ok")
+        self.assertEqual(provider.response_format, STRUCTURED_RESPONSE_FORMAT)
+        self.assertEqual(provider.actor_id, "actor")
+        self.assertEqual(provider.messages[1]["content"][0]["text"], "q")
+        first_response_format = provider.response_format
+        first_response_format["json_schema"]["schema"]["required"].append("poison")
+
+        second = ProviderVisionInterpreter(provider, Reader()).observe(MessageAttachment("image", "id"), "q", message_id="m2", attachment_index=0, actor_id="actor")
+
+        self.assertEqual(second.status, "ok")
+        self.assertEqual(provider.response_format, STRUCTURED_RESPONSE_FORMAT)
+        self.assertIsNot(provider.response_format, first_response_format)
+
     def _interpreter(self, image_data, events):
         class Reader:
             def read(self, attachment):

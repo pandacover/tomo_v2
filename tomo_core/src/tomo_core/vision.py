@@ -6,7 +6,8 @@ import warnings
 import time
 from dataclasses import dataclass
 from io import BytesIO
-from typing import Literal, Protocol
+from types import MappingProxyType
+from typing import Literal, Mapping, Protocol
 
 import httpx
 from PIL import Image, ImageOps, UnidentifiedImageError
@@ -19,6 +20,59 @@ _MAX_SUMMARY = 2000
 _MAX_ITEM_LENGTH = 1000
 _MAX_ITEMS = 8
 _UNAVAILABLE_CODES = frozenset({"unsupported_image", "vision_unavailable", "vision_invalid_response"})
+
+
+def _vision_array_schema() -> Mapping[str, object]:
+    return MappingProxyType(
+        {
+            "type": "array",
+            "maxItems": _MAX_ITEMS,
+            "items": MappingProxyType({"type": "string", "minLength": 1, "maxLength": _MAX_ITEM_LENGTH}),
+        }
+    )
+
+
+def _copy_json_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _copy_json_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_copy_json_value(item) for item in value]
+    return value
+
+
+def _vision_response_format() -> dict[str, object]:
+    # Every request gets its own mutable serialization payload.
+    result = _copy_json_value(_VISION_RESPONSE_FORMAT)
+    assert isinstance(result, dict)
+    return result
+
+
+_VISION_RESPONSE_FORMAT: Mapping[str, object] = MappingProxyType(
+    {
+        "type": "json_schema",
+        "json_schema": MappingProxyType(
+            {
+                "name": "vision_observation",
+                "schema": MappingProxyType(
+                    {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ("summary", "visible_text", "relevant_details", "uncertainties"),
+                        "properties": MappingProxyType(
+                            {
+                                "summary": MappingProxyType({"type": "string", "minLength": 1, "maxLength": _MAX_SUMMARY}),
+                                "visible_text": _vision_array_schema(),
+                                "relevant_details": _vision_array_schema(),
+                                "uncertainties": _vision_array_schema(),
+                            }
+                        ),
+                    }
+                ),
+                "strict": True,
+            }
+        ),
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -123,7 +177,9 @@ class ProviderVisionInterpreter:
             ]
             text_parts: list[str] = []
             completed = False
-            for event in self._provider.stream(messages, tools=(), actor_id=actor_id):
+            stream_structured = getattr(self._provider, "stream_structured", None)
+            events = stream_structured(messages, response_format=_vision_response_format(), actor_id=actor_id) if callable(stream_structured) else self._provider.stream(messages, tools=(), actor_id=actor_id)
+            for event in events:
                 if completed or isinstance(event, ProviderToolCallReady):
                     return _unavailable(message_id, attachment_index, "vision_invalid_response")
                 if isinstance(event, ProviderTextDelta):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import codecs
+import copy
 import json
 from dataclasses import dataclass, field
 from typing import Iterator, Protocol, TypeAlias
@@ -87,6 +88,7 @@ def _stream_openai_compatible(
     tools: tuple[dict[str, object], ...],
     reasoning_effort: str | None,
     store: bool | None,
+    response_format: dict[str, object] | None = None,
 ) -> Iterator[ProviderStreamEvent]:
     request_body: dict[str, object] = {"model": model, "messages": messages, "stream": True}
     if tools:
@@ -95,6 +97,8 @@ def _stream_openai_compatible(
         request_body["reasoning_effort"] = reasoning_effort
     if store is not None:
         request_body["store"] = store
+    if response_format is not None:
+        request_body["response_format"] = response_format
 
     tool_calls: dict[int, _ToolCallParts] = {}
     tool_call_indices: dict[str, int] = {}
@@ -265,6 +269,7 @@ class _OpenAICompatibleProvider:
         messages: list[dict[str, object]],
         *,
         tools: tuple[dict[str, object], ...] = (),
+        response_format: dict[str, object] | None = None,
     ) -> Iterator[ProviderStreamEvent]:
         return _stream_openai_compatible(
             base_url=self.base_url,
@@ -274,6 +279,7 @@ class _OpenAICompatibleProvider:
             tools=tools,
             reasoning_effort=self.reasoning_effort,
             store=self.store,
+            response_format=response_format,
         )
 
     # Compatibility collector for callers that have not migrated to streaming.
@@ -303,6 +309,9 @@ class XaiApiProvider(_OpenAICompatibleProvider):
     def stream(self, messages: list[dict[str, object]], *, tools: tuple[dict[str, object], ...] = (), actor_id: str | None = None) -> Iterator[ProviderStreamEvent]:
         return self._stream_with_token(self.api_key, messages, tools=tools)
 
+    def stream_structured(self, messages: list[dict[str, object]], *, response_format: dict[str, object], actor_id: str | None = None) -> Iterator[ProviderStreamEvent]:
+        return self._stream_with_token(self.api_key, messages, response_format=copy.deepcopy(response_format))
+
 
 @dataclass
 class SuperGrokTokenStore:
@@ -324,6 +333,9 @@ class SuperGrokOAuthProvider(_OpenAICompatibleProvider):
 
     def stream(self, messages: list[dict[str, object]], *, tools: tuple[dict[str, object], ...] = (), actor_id: str | None = None) -> Iterator[ProviderStreamEvent]:
         return self._stream_with_token(self.token_store.access_token, messages, tools=tools)
+
+    def stream_structured(self, messages: list[dict[str, object]], *, response_format: dict[str, object], actor_id: str | None = None) -> Iterator[ProviderStreamEvent]:
+        return self._stream_with_token(self.token_store.access_token, messages, response_format=copy.deepcopy(response_format))
 
 
 def supergrok_oauth_provider_from_access_token(access_token: str, *, model: str = "grok-4.5", reasoning_effort: str = "high", store: bool | None = None) -> SuperGrokOAuthProvider:
@@ -360,6 +372,20 @@ class OAuthBackedSuperGrokProvider:
             token_store=SuperGrokTokenStore(access_token=access_token), model=self.model, base_url=self.base_url, reasoning_effort=self.reasoning_effort, store=self.store
         ).stream(messages, tools=tools, actor_id=actor_id)
 
+    def stream_structured(self, messages: list[dict[str, object]], *, response_format: dict[str, object], actor_id: str | None = None) -> Iterator[ProviderStreamEvent]:
+        if not actor_id:
+            raise ProviderSetupRequired("use /connect to connect supergrok oauth first.")
+        token_path = self.oauth.token_path("supergrok", actor_id)
+        if not token_path.exists():
+            raise ProviderSetupRequired("use /connect to connect supergrok oauth first.")
+        token = json.loads(token_path.read_text(encoding="utf-8"))
+        access_token = token.get("access_token")
+        if not access_token:
+            raise ProviderSetupRequired("use /connect to connect supergrok oauth first.")
+        return SuperGrokOAuthProvider(
+            token_store=SuperGrokTokenStore(access_token=access_token), model=self.model, base_url=self.base_url, reasoning_effort=self.reasoning_effort, store=self.store
+        ).stream_structured(messages, response_format=response_format, actor_id=actor_id)
+
     def complete(self, messages: list[dict[str, str]], actor_id: str | None = None) -> str:
         return _collect_text(self.stream(messages, actor_id=actor_id))
 
@@ -382,6 +408,12 @@ class GrokAuthProvider:
         if not access_token:
             raise ProviderSetupRequired("run grok login or grok login --device-auth first, then restart me.")
         return XaiApiProvider(api_key=access_token, model=self.model, base_url=self.base_url, reasoning_effort=self.reasoning_effort, store=self.store).stream(messages, tools=tools, actor_id=actor_id)
+
+    def stream_structured(self, messages: list[dict[str, object]], *, response_format: dict[str, object], actor_id: str | None = None) -> Iterator[ProviderStreamEvent]:
+        access_token = self.auth_store.access_token()
+        if not access_token:
+            raise ProviderSetupRequired("run grok login or grok login --device-auth first, then restart me.")
+        return XaiApiProvider(api_key=access_token, model=self.model, base_url=self.base_url, reasoning_effort=self.reasoning_effort, store=self.store).stream_structured(messages, response_format=response_format, actor_id=actor_id)
 
     def complete(self, messages: list[dict[str, str]], actor_id: str | None = None) -> str:
         return _collect_text(self.stream(messages, actor_id=actor_id))
