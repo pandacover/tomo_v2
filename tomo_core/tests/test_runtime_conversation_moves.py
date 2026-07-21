@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+import httpx
 
 from tomo_core import InboundEnvelope, InboundMessage, InputBurst, PersonalAgentRuntime, RuntimeConfig
 from tomo_core.models import MessageAttachment
@@ -12,6 +13,7 @@ from tomo_core.providers import GrokAuthProvider, ProviderStreamCompleted, Provi
 from tomo_core.runtime import RuntimeCompleted, RuntimeFrameReady, RuntimeReactionReady, StaleSessionRevisionError, _safe_memory_control
 from tomo_core.personal_data import MemorySourceRef, MemoryWriteControl
 from tomo_core.sessions import ConversationSession, StoredMessage
+from tomo_core.vision import VisionObservation
 from tomo_core.sqlite_personal_data import SqlitePersonalDataRepository
 from tomo_core.telegram import FakeTelegramClient, TelegramDeliverySink
 
@@ -40,6 +42,106 @@ def stream(*frames, finish_reason="stop", input_tokens=11, output_tokens=7):
 
 
 class RuntimeConversationMoveTests(unittest.TestCase):
+    def test_vision_cancellation_fences_calls_persistence_and_base_generation(self):
+        for checkpoint in ("before_vision", "after_vision", "after_observation_checkpoint"):
+            with self.subTest(checkpoint=checkpoint), tempfile.TemporaryDirectory() as tmp:
+                soul_path = Path(tmp) / "SOUL.md"
+                soul_path.write_text("SOUL", encoding="utf-8")
+                provider = ScriptedProvider([stream("answer")])
+                active = [checkpoint != "before_vision"]
+                class Vision:
+                    calls = 0
+                    def observe(self, attachment, question, *, message_id, attachment_index, actor_id):
+                        self.calls += 1
+                        if checkpoint == "after_vision": active[0] = False
+                        return VisionObservation(message_id, attachment_index, "ok", "seen", (), (), ())
+                vision = Vision()
+                runtime = PersonalAgentRuntime(provider, TelegramDeliverySink(FakeTelegramClient()), RuntimeConfig(data_dir=tmp, soul_path=str(soul_path)), vision_interpreter=vision)
+                if checkpoint == "after_observation_checkpoint":
+                    original_save = runtime.personal_data.save_session
+                    def save(*args, **kwargs):
+                        result = original_save(*args, **kwargs)
+                        if any("vision_observations" in message.metadata for message in args[1].messages): active[0] = False
+                        return result
+                    runtime.personal_data.save_session = save
+                burst = InputBurst("burst", "gen", 1, (InboundMessage(1, 1, InboundEnvelope("telegram", "u", "m", "q", attachments=(MessageAttachment("image", "id"),))),))
+                self.assertEqual(list(runtime.handle_telegram_burst_iter(burst, is_active=lambda: active[0])), [])
+                self.assertEqual(vision.calls, 0 if checkpoint == "before_vision" else 1)
+                self.assertEqual(provider.calls, [])
+
+    def test_vision_401_precedes_base_and_visible_output_while_unavailable_continues(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            soul_path = Path(tmp) / "SOUL.md"; soul_path.write_text("SOUL", encoding="utf-8")
+            provider = ScriptedProvider([stream("answer")])
+            request = httpx.Request("POST", "https://provider.example")
+            class UnauthorizedVision:
+                def observe(self, *args, **kwargs): raise httpx.HTTPStatusError("secret", request=request, response=httpx.Response(401, request=request))
+            runtime = PersonalAgentRuntime(provider, TelegramDeliverySink(FakeTelegramClient()), RuntimeConfig(data_dir=tmp, soul_path=str(soul_path)), vision_interpreter=UnauthorizedVision())
+            burst = InputBurst("burst", "gen", 1, (InboundMessage(1, 1, InboundEnvelope("telegram", "u", "m", "q", attachments=(MessageAttachment("image", "id"),))),))
+            with self.assertRaises(httpx.HTTPStatusError): list(runtime.handle_telegram_burst_iter(burst))
+            self.assertEqual(provider.calls, [])
+    def test_text_only_base_receives_safe_vision_evidence_not_image_content(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            soul_path = Path(tmp) / "SOUL.md"
+            soul_path.write_text("SOUL", encoding="utf-8")
+            provider = ScriptedProvider([stream("answer")])
+            class Vision:
+                def __init__(self): self.calls = []
+                def observe(self, attachment, question, *, message_id, attachment_index, actor_id):
+                    self.calls.append((attachment, question, actor_id))
+                    return VisionObservation(message_id, attachment_index, "ok", "terminal error", ("AssertionError",), (), ())
+            vision = Vision()
+            runtime = PersonalAgentRuntime(provider, TelegramDeliverySink(FakeTelegramClient()), RuntimeConfig(data_dir=tmp, soul_path=str(soul_path)), vision_interpreter=vision)
+            envelope = InboundEnvelope("telegram", "user-1", "msg-1", "read this", attachments=(MessageAttachment("image", file_id="private-id", mime_type="image/jpeg"),))
+            burst = InputBurst("burst-1", "gen-1", 1, (InboundMessage(1, 1, envelope),))
+
+            list(runtime.handle_telegram_burst_iter(burst))
+
+            self.assertEqual(len(vision.calls), 1)
+            self.assertEqual(vision.calls[0][2], "user-1")
+            messages = provider.calls[0][0]
+            self.assertIn("terminal error", messages[-1]["content"])
+            self.assertNotIn("private-id", messages[-1]["content"])
+            stored = next(message for message in self._load_persisted_session(tmp).messages if message.role == "user")
+            self.assertIn("vision_observations", stored.metadata, stored.metadata)
+            self.assertEqual(stored.metadata["vision_observations"][0]["summary"], "terminal error")
+
+    def test_vision_interprets_and_persists_only_the_first_eight_distinct_images(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            soul_path = Path(tmp) / "SOUL.md"
+            soul_path.write_text("SOUL", encoding="utf-8")
+            provider = ScriptedProvider([stream("answer")])
+
+            class Vision:
+                def __init__(self):
+                    self.calls = []
+
+                def observe(self, attachment, question, *, message_id, attachment_index, actor_id):
+                    self.calls.append(attachment.file_id)
+                    return VisionObservation(message_id, attachment_index, "ok", f"seen {attachment.file_id}", (), (), ())
+
+            vision = Vision()
+            runtime = PersonalAgentRuntime(
+                provider,
+                TelegramDeliverySink(FakeTelegramClient()),
+                RuntimeConfig(data_dir=tmp, soul_path=str(soul_path)),
+                vision_interpreter=vision,
+            )
+            attachments = tuple(MessageAttachment("image", file_id=f"image-{index}") for index in range(10)) + (
+                MessageAttachment("image", file_id="image-0"),
+            )
+            burst = InputBurst(
+                "burst-1",
+                "gen-1",
+                1,
+                (InboundMessage(1, 1, InboundEnvelope("telegram", "user-1", "msg-1", "inspect", attachments=attachments)),),
+            )
+
+            list(runtime.handle_telegram_burst_iter(burst))
+
+            self.assertEqual(vision.calls, [f"image-{index}" for index in range(8)])
+            stored = next(message for message in self._load_persisted_session(tmp).messages if message.role == "user")
+            self.assertEqual(len(stored.metadata["vision_observations"]), 8)
     def test_latency_marker_is_suppressed_when_inactive_after_session_load(self):
         with tempfile.TemporaryDirectory() as tmp:
             soul_path = Path(tmp) / "SOUL.md"
@@ -329,19 +431,24 @@ class RuntimeConversationMoveTests(unittest.TestCase):
             self.assertEqual(list(runtime.handle_telegram_burst_iter(burst, is_active=is_active)), [])
             self.assertEqual(len(provider.calls), 0)
 
-    def test_inbound_attachment_metadata_is_persisted_for_photo_only_messages(self):
+    def test_photo_attachment_history_excludes_file_id_and_persists_vision_observation_after_sqlite_reload(self):
         with tempfile.TemporaryDirectory() as tmp:
             soul_path = Path(tmp) / "SOUL.md"
             soul_path.write_text("SOUL SENTINEL", encoding="utf-8")
             provider = ScriptedProvider([stream("i can work from the image context.")])
-            runtime = PersonalAgentRuntime(provider, TelegramDeliverySink(FakeTelegramClient()), RuntimeConfig(data_dir=tmp, soul_path=str(soul_path)))
+            class Vision:
+                def observe(self, attachment, question, *, message_id, attachment_index, actor_id):
+                    return VisionObservation(message_id, attachment_index, "ok", "a red test failure", (), (), ())
+            runtime = PersonalAgentRuntime(provider, TelegramDeliverySink(FakeTelegramClient()), RuntimeConfig(data_dir=tmp, soul_path=str(soul_path)), vision_interpreter=Vision())
             burst = InputBurst("burst-photo", "gen-photo", 1, (InboundMessage(1, 41, InboundEnvelope("telegram", "user-1", "msg-1", "", attachments=(MessageAttachment("image", file_id="photo-id", mime_type="image/jpeg", metadata={"width": 100}),))),))
 
             list(runtime.handle_telegram_burst_iter(burst))
 
             session = self._load_persisted_session(tmp)
-            self.assertEqual(session.messages[0].metadata["attachments"][0]["file_id"], "photo-id")
+            self.assertNotIn("file_id", session.messages[0].metadata["attachments"][0])
             self.assertEqual(session.messages[0].metadata["attachments"][0]["metadata"], {"width": 100})
+            self.assertEqual(session.messages[0].metadata["vision_observations"][0]["summary"], "a red test failure")
+            self.assertNotIn("photo-id", str(session.model_history_for_burst("other")))
 
     def test_visible_partial_is_prompt_context_without_accepting_full_provisional_completion(self):
         with tempfile.TemporaryDirectory() as tmp:

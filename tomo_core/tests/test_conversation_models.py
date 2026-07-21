@@ -1,8 +1,31 @@
 import unittest
 
 from tomo_core.conversation import ConversationMove, ConversationRequest, Frame, FrameReady, MemoryControlReady, MoveConfidence, MovePlan, SegmentFinish, SegmentResult, ToolCall, ToolObservation, TurnBudget, TurnRunCompleted, TurnRunResult, TurnRunStarted, TurnRunStatus, TurnUsage
-from tomo_core.models import InboundEnvelope, ResponseContract, RuntimeConfig
+from tomo_core.models import AutomationTurn, InboundEnvelope, InboundMessage, InputBurst, MessageAttachment, ResponseContract, RuntimeConfig
 from tomo_core.personal_data import MemoryWriteControl
+from tomo_core.vision import VisionObservation
+
+
+class ConversationRequestVisionTests(unittest.TestCase):
+    def test_request_accepts_only_current_burst_observations(self):
+        burst = InputBurst("b", "g", 1, (InboundMessage(1, 1, InboundEnvelope("telegram", "a", "m1", "", attachments=(MessageAttachment("image", file_id="id"),))),))
+        observation = VisionObservation("m1", 0, "unavailable", "", (), (), (), "unsupported_image")
+
+        request = ConversationRequest(burst, "soul", (), (observation,))
+
+        self.assertEqual(request.vision_observations, (observation,))
+
+    def test_request_rejects_invalid_or_duplicate_observations(self):
+        image = InboundEnvelope("telegram", "a", "image", "", attachments=(MessageAttachment("image", file_id="id"),))
+        text = InboundEnvelope("telegram", "a", "text", "", attachments=(MessageAttachment("file", file_id="id"),))
+        burst = InputBurst("b", "g", 1, (InboundMessage(1, 1, image), InboundMessage(2, 2, text)))
+        observation = VisionObservation("image", 0, "unavailable", "", (), (), (), "unsupported_image")
+        for observations in ((object(),), (observation, observation), (VisionObservation("text", 0, "unavailable", "", (), (), (), "unsupported_image"),)):
+            with self.subTest(observations=observations), self.assertRaises(ValueError):
+                ConversationRequest(burst, "soul", (), observations)
+        automation = AutomationTurn("g", 1, "job", "run", "actor", "chat", "prompt", "2026-01-01T00:00:00+00:00")
+        with self.assertRaises(ValueError):
+            ConversationRequest(automation, "soul", (), (observation,))
 
 
 class ConversationModelTests(unittest.TestCase):

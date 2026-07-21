@@ -36,9 +36,13 @@ _PHASES = frozenset({
     "sandbox_session_load",
     "sandbox_memory_hydration",
     "sandbox_prompt_prepare",
+    "sandbox_attachment_fetch",
+    "sandbox_image_normalize",
+    "sandbox_vision_provider_attempt",
+    "sandbox_vision_observation_ready",
 })
 _OUTCOMES = frozenset({"ok", "error", "send_complete", "origin_to_delivery"})
-_COUNTS = ("attempt", "segment", "repair", "model_segments", "tool_rounds", "tool_calls", "contract_repairs", "visible_segments", "suspended_ms", "active_ms", "input_tokens", "output_tokens", "reasoning_tokens", "output_chars_through_first_frame", "first_frame_chars", "plan_model", "plan_normalized", "plan_synthesized")
+_COUNTS = ("attempt", "segment", "repair", "model_segments", "tool_rounds", "tool_calls", "contract_repairs", "visible_segments", "suspended_ms", "active_ms", "input_tokens", "output_tokens", "reasoning_tokens", "output_chars_through_first_frame", "first_frame_chars", "plan_model", "plan_normalized", "plan_synthesized", "image_count", "input_bytes", "normalized_bytes", "width", "height")
 SANDBOX_LATENCY_MARKER = "TOMO_SANDBOX_LATENCY_V1="
 _sandbox_sink: ContextVar[object | None] = ContextVar("sandbox_latency_sink", default=None)
 

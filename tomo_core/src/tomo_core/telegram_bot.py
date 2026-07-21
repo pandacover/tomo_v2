@@ -7,7 +7,9 @@ from typing import Any, Callable
 import httpx
 
 from .grok_auth import GrokAuthStore
-from .models import InboundEnvelope
+from .models import InboundEnvelope, MessageAttachment
+from .telegram_media import photo_attachment_from_message
+from .vision import DownloadedAttachment
 from .oauth import OAuthError, OAuthManager
 from .runtime import PersonalAgentRuntime
 from .telegram import TelegramSendReceipt
@@ -61,6 +63,36 @@ class TelegramBotApiClient:
         if offset is not None:
             payload["offset"] = offset
         return self.request("getUpdates", payload, timeout=float(timeout) + 5.0).get("result", [])
+
+    def fetch(self, file_id: str, *, max_bytes: int = 10 * 1024 * 1024) -> DownloadedAttachment:
+        if not isinstance(file_id, str) or not file_id or len(file_id) > 4096 or not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes < 1:
+            raise TelegramBotApiError("telegram_file_invalid")
+        try:
+            result = self.request("getFile", {"file_id": file_id}).get("result")
+            if not isinstance(result, dict):
+                raise ValueError
+            path = result.get("file_path")
+            declared = result.get("file_size")
+            if not _valid_file_path(path) or (declared is not None and (not isinstance(declared, int) or isinstance(declared, bool) or declared < 0)):
+                raise ValueError
+            if isinstance(declared, int) and declared > max_bytes:
+                raise OverflowError
+            with httpx.stream("GET", f"{self.base_url}/file/bot{self.token}/{path}", timeout=self.timeout) as response:
+                response.raise_for_status()
+                chunks = bytearray()
+                for chunk in response.iter_bytes():
+                    chunks.extend(chunk)
+                    if len(chunks) > max_bytes:
+                        raise OverflowError
+            return DownloadedAttachment(bytes(chunks), "image/jpeg")
+        except OverflowError:
+            raise TelegramBotApiError("telegram_file_too_large") from None
+        except (httpx.HTTPError, TelegramBotApiError, ValueError, TypeError):
+            raise TelegramBotApiError("telegram_file_unavailable") from None
+
+    def read(self, attachment: MessageAttachment) -> DownloadedAttachment:
+        """AttachmentReader adapter for the in-process local runtime."""
+        return self.fetch(attachment.file_id)
 
     def send_typing(self, actor_id: str) -> None:
         self.request("sendChatAction", {"chat_id": actor_id, "action": "typing"}, timeout=2.0)
@@ -126,7 +158,11 @@ def envelope_from_update(update: dict[str, Any]) -> InboundEnvelope | None:
     if chat.get("type") != "private":
         return None
     text = message.get("text")
-    if not text:
+    if not isinstance(text, str):
+        text = message.get("caption")
+    text = text if isinstance(text, str) else ""
+    attachment = photo_attachment_from_message(message)
+    if not text.strip() and attachment is None:
         return None
     actor_id = str(sender.get("id") or chat.get("id"))
     message_id = str(message["message_id"])
@@ -135,9 +171,15 @@ def envelope_from_update(update: dict[str, Any]) -> InboundEnvelope | None:
         actor_id=actor_id,
         message_id=message_id,
         text=text,
+        attachments=(attachment,) if attachment is not None else (),
         native_metadata={"update_id": update.get("update_id"), "chat_id": chat.get("id")},
         reply_context=reply_context_from_message(message, chat.get("id")),
     )
+
+
+def _valid_file_path(value: object) -> bool:
+    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-/"
+    return isinstance(value, str) and value and len(value) <= 1024 and not value.startswith("/") and all(character in allowed for character in value) and all(part not in {"", ".", ".."} for part in value.split("/"))
 
 
 @dataclass

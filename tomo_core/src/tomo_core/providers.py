@@ -86,12 +86,15 @@ def _stream_openai_compatible(
     messages: list[dict[str, object]],
     tools: tuple[dict[str, object], ...],
     reasoning_effort: str | None,
+    store: bool | None,
 ) -> Iterator[ProviderStreamEvent]:
     request_body: dict[str, object] = {"model": model, "messages": messages, "stream": True}
     if tools:
         request_body["tools"] = list(tools)
     if reasoning_effort:
         request_body["reasoning_effort"] = reasoning_effort
+    if store is not None:
+        request_body["store"] = store
 
     tool_calls: dict[int, _ToolCallParts] = {}
     tool_call_indices: dict[str, int] = {}
@@ -270,6 +273,7 @@ class _OpenAICompatibleProvider:
             messages=messages,
             tools=tools,
             reasoning_effort=self.reasoning_effort,
+            store=self.store,
         )
 
     # Compatibility collector for callers that have not migrated to streaming.
@@ -289,6 +293,7 @@ class XaiApiProvider(_OpenAICompatibleProvider):
     model: str = "grok-4.5"
     base_url: str = "https://api.x.ai/v1"
     reasoning_effort: str | None = None
+    store: bool | None = None
 
     name: str = "xai_api"
     supports_images_in: bool = True
@@ -310,6 +315,7 @@ class SuperGrokOAuthProvider(_OpenAICompatibleProvider):
     model: str = "grok-4.5"
     base_url: str = "https://api.x.ai/v1"
     reasoning_effort: str = "high"
+    store: bool | None = None
 
     name: str = "supergrok_oauth"
     supports_images_in: bool = True
@@ -320,11 +326,11 @@ class SuperGrokOAuthProvider(_OpenAICompatibleProvider):
         return self._stream_with_token(self.token_store.access_token, messages, tools=tools)
 
 
-def supergrok_oauth_provider_from_access_token(access_token: str, *, model: str = "grok-4.5", reasoning_effort: str = "high") -> SuperGrokOAuthProvider:
+def supergrok_oauth_provider_from_access_token(access_token: str, *, model: str = "grok-4.5", reasoning_effort: str = "high", store: bool | None = None) -> SuperGrokOAuthProvider:
     """Build a fixed-token provider without retaining the token in repr output."""
     if not access_token:
         raise ValueError("SuperGrok access token is required")
-    return SuperGrokOAuthProvider(token_store=SuperGrokTokenStore(access_token=access_token), model=model, reasoning_effort=reasoning_effort)
+    return SuperGrokOAuthProvider(token_store=SuperGrokTokenStore(access_token=access_token), model=model, reasoning_effort=reasoning_effort, store=store)
 
 
 @dataclass
@@ -333,6 +339,7 @@ class OAuthBackedSuperGrokProvider:
     model: str = "grok-4.5"
     base_url: str = "https://api.x.ai/v1"
     reasoning_effort: str = "high"
+    store: bool | None = None
 
     name: str = "supergrok_oauth_dynamic"
     supports_images_in: bool = True
@@ -350,7 +357,7 @@ class OAuthBackedSuperGrokProvider:
         if not access_token:
             raise ProviderSetupRequired("use /connect to connect supergrok oauth first.")
         return SuperGrokOAuthProvider(
-            token_store=SuperGrokTokenStore(access_token=access_token), model=self.model, base_url=self.base_url, reasoning_effort=self.reasoning_effort
+            token_store=SuperGrokTokenStore(access_token=access_token), model=self.model, base_url=self.base_url, reasoning_effort=self.reasoning_effort, store=self.store
         ).stream(messages, tools=tools, actor_id=actor_id)
 
     def complete(self, messages: list[dict[str, str]], actor_id: str | None = None) -> str:
@@ -362,6 +369,8 @@ class GrokAuthProvider:
     auth_store: GrokAuthStore
     model: str = "grok-4.5"
     base_url: str = "https://api.x.ai/v1"
+    reasoning_effort: str | None = None
+    store: bool | None = None
 
     name: str = "grok_login_auth"
     supports_images_in: bool = True
@@ -372,7 +381,7 @@ class GrokAuthProvider:
         access_token = self.auth_store.access_token()
         if not access_token:
             raise ProviderSetupRequired("run grok login or grok login --device-auth first, then restart me.")
-        return XaiApiProvider(api_key=access_token, model=self.model, base_url=self.base_url).stream(messages, tools=tools, actor_id=actor_id)
+        return XaiApiProvider(api_key=access_token, model=self.model, base_url=self.base_url, reasoning_effort=self.reasoning_effort, store=self.store).stream(messages, tools=tools, actor_id=actor_id)
 
     def complete(self, messages: list[dict[str, str]], actor_id: str | None = None) -> str:
         return _collect_text(self.stream(messages, actor_id=actor_id))

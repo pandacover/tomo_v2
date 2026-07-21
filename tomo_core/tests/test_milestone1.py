@@ -8,11 +8,37 @@ from tomo_core.conversation.parsing import ConversationOutputError
 from tomo_core.delivery import DeliveryPlanner, split_sentences
 from tomo_core.providers import StaticProvider
 from tomo_core.sessions import ConversationSession, StoredMessage
+from tomo_core.vision import VisionObservation
 from tomo_core.sqlite_personal_data import SqlitePersonalDataRepository
 from tomo_core.telegram import FakeTelegramClient, TelegramDeliverySink
 
 
 class MilestoneOneTests(unittest.TestCase):
+    def test_session_replaces_matching_inbound_observations_and_hydrates_safe_evidence(self):
+        session = ConversationSession("telegram:actor:u")
+        inbound = InboundMessage(
+            1,
+            1,
+            InboundEnvelope(
+                "telegram",
+                "u",
+                "m1",
+                "",
+                attachments=(MessageAttachment("image", file_id="id", mime_type="image/jpeg"),),
+                reply_context=ReplyContext("reply-1", "assistant", "quoted referent"),
+            ),
+        )
+        session.append_inbound_once(inbound, "burst")
+        observation = VisionObservation("m1", 0, "ok", "a terminal", ("error",), (), ())
+
+        session.record_vision_observations("burst", (observation,))
+        session.record_vision_observations("burst", (observation,))
+
+        self.assertEqual(len(session.messages), 1)
+        self.assertEqual(session.messages[0].metadata["vision_observations"][0]["summary"], "a terminal")
+        history_content = session.model_history_for_burst("other")[0]["content"]
+        self.assertIn("vision_observations", history_content)
+        self.assertIn("reply_context", history_content)
     def test_telegram_turn_starts_typing_replies_first_bubble_and_persists_session(self):
         with tempfile.TemporaryDirectory() as tmp:
             client = FakeTelegramClient()
@@ -79,6 +105,13 @@ class MilestoneOneTests(unittest.TestCase):
     def test_delivery_sanitizes_banned_dashes(self):
         bubbles = DeliveryPlanner().compose("bet — this is handled – no weird dash aura.", "m")
         self.assertEqual([bubble.text for bubble in bubbles], ["bet, this is handled, no weird dash aura."])
+
+    def test_delivery_preserves_ellipses_without_creating_empty_bubbles(self):
+        planner = DeliveryPlanner(max_bubbles=4, max_sentences_per_bubble=3)
+        self.assertEqual([bubble.text for bubble in planner.compose("...", "m")], ["..."])
+        self.assertEqual([bubble.text for bubble in planner.compose("i was going to say this plan is doomed, but...", "m")], ["i was going to say this plan is doomed, but..."])
+        self.assertEqual([bubble.text for bubble in planner.compose("the approval process was... optimistic.", "m")], ["the approval process was... optimistic."])
+        self.assertEqual([bubble.text for bubble in planner.compose_utterances(("...",), "m")], ["..."])
 
     def test_dm_only_session_key_does_not_require_room_id(self):
         envelope = InboundEnvelope(connector="telegram", actor_id="user-42", message_id="m", text="yo")

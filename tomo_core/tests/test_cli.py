@@ -1,20 +1,45 @@
 import io
 import json
+import os
 import signal
 import tempfile
 import unittest
 from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from tomo_core.cli import _log_shared_gateway_error, main
+from tomo_core.cli import _log_shared_gateway_error, build_vision_interpreter, main
 from tomo_core.cron_models import CronJob, JobIntent, ScheduleSpec
 from tomo_core.cron_store import CronStore
 from tomo_core.telegram_router import RetryableTelegramUpdateError
+from tomo_core.providers import XaiApiProvider
 
 
 class CliTests(unittest.TestCase):
+    def test_local_vision_interpreter_uses_independent_environment_configuration(self):
+        base = XaiApiProvider("key", model="base-model")
+        args = SimpleNamespace(static_response=None)
+        with (
+            patch.dict(os.environ, {"TOMO_XAI_VISION_MODEL": "vision-model", "TOMO_XAI_VISION_REASONING_EFFORT": "medium"}, clear=False),
+            patch("tomo_core.cli.build_provider", return_value=base),
+        ):
+            interpreter = build_vision_interpreter(args, Mock(), Mock())
+
+        self.assertEqual(interpreter._provider.model, "vision-model")
+        self.assertEqual(interpreter._provider.reasoning_effort, "medium")
+
+    def test_telegram_start_builds_a_vision_interpreter_with_the_live_client(self):
+        with tempfile.TemporaryDirectory() as tmp, patch("tomo_core.cli.TelegramBotApiClient") as client_class, patch("tomo_core.cli.build_oauth_manager") as oauth_builder, patch("tomo_core.cli.build_provider") as provider_builder, patch("tomo_core.cli.build_vision_interpreter") as vision_builder, patch("tomo_core.cli.PersonalAgentRuntime") as runtime_class, patch("tomo_core.cli.TelegramPollingBot") as polling_bot, patch("sys.stdout", io.StringIO()):
+            result = main(["telegram", "start", "--token", "token", "--data-dir", tmp])
+
+        self.assertEqual(result, 0)
+        vision_builder.assert_called_once()
+        self.assertIs(vision_builder.call_args.args[1], oauth_builder.return_value)
+        self.assertIs(vision_builder.call_args.args[2], client_class.return_value)
+        self.assertIs(runtime_class.call_args.kwargs["vision_interpreter"], vision_builder.return_value)
+        polling_bot.return_value.run_forever.assert_called_once()
+
     def test_cron_operator_inspect_and_run_once_are_owner_scoped(self):
         with tempfile.TemporaryDirectory() as tmp:
             job = CronJob(
@@ -90,19 +115,22 @@ class CliTests(unittest.TestCase):
         handlers = {}
         config = SimpleNamespace(
             bot_token="token",
-            data_dir="unused",
+            data_dir=None,
             runtime="local",
             control_public_url=None,
             telegram_delivery_pace_seconds=0,
             telegram_input_debounce_seconds=0,
             poll_timeout=30,
             worker_count=1,
+            xai_vision_model="shared-vision-model",
+            xai_vision_reasoning_effort="medium",
         )
 
         def register_signal(signum, handler):
             handlers[signum] = handler
 
         def run_forever():
+            instances.call_args.kwargs["vision_interpreter_factory"]("owner")
             handlers[signal.SIGTERM](signal.SIGTERM, None)
 
         with (
@@ -112,12 +140,14 @@ class CliTests(unittest.TestCase):
             patch("tomo_core.cli.TelegramOnboardingStore"),
             patch("tomo_core.cli.load_or_create_key", return_value=b"k" * 32),
             patch("tomo_core.cli.CronStore"),
-            patch("tomo_core.cli.RuntimeInstanceRegistry"),
+            patch("tomo_core.cli.RuntimeInstanceRegistry") as instances,
+            patch("tomo_core.cli.build_vision_interpreter") as vision_builder,
             patch("tomo_core.cli.SharedTelegramGateway") as gateway,
             patch("tomo_core.cli.CronSchedulerService") as scheduler,
             patch("tomo_core.cli.TelegramUpdateRouter") as router,
             patch("tomo_core.cli.signal.signal", side_effect=register_signal),
         ):
+            config.data_dir = tmp
             gateway.return_value.dispatch.cancel_generation = None
             router.return_value.run_forever.side_effect = run_forever
             with self.assertRaises(KeyboardInterrupt):
@@ -125,6 +155,10 @@ class CliTests(unittest.TestCase):
 
         scheduler.return_value.start.assert_called_once()
         scheduler.return_value.stop.assert_called_once()
+        self.assertEqual(
+            vision_builder.call_args.kwargs,
+            {"model": "shared-vision-model", "reasoning_effort": "medium"},
+        )
 
     def test_telegram_shared_ignores_static_response_environment_without_explicit_flag(self):
         with patch.dict("os.environ", {"TOMO_CORE_STATIC_RESPONSE": "test"}, clear=True):

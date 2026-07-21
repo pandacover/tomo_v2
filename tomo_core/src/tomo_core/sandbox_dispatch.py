@@ -14,18 +14,35 @@ from typing import Callable, Iterator, Protocol
 
 from .daytona_client import DaytonaClient, DaytonaClientError, SessionCommandHandle
 from .daytona_supervisor import DaytonaSupervisor
+from .attachment_capability import AttachmentCapability, hash_file_id, issue_attachment_capability
 from .conversation import TurnBudget
 from .models import AutomationTurn, InboundEnvelope, InboundMessage, InputBurst, OutboundBubble, RuntimeConfig
-from .telegram import photo_attachments_from_message, reply_context_from_message
 from .onboarding_store import InterruptedGeneration, TelegramGenerationInput, TelegramGenerationWork, TelegramInstallation
 from .sandbox_protocol import SandboxCompletedEvent, SandboxErrorEvent, SandboxEvent, SandboxFrameEvent, SandboxProtocolError, encode_automation, encode_inbound, iter_event_markers, parse_result_marker
+from .telegram import photo_attachments_from_message, reply_context_from_message
 from . import latency_trace
 from .cron_capability import CronCapability, issue_capability
 
 
 _COMMAND = "/opt/tomo/.venv/bin/tomo-core sandbox-inbound"
 _EXEC_TIMEOUT_SECONDS = 120
+_IMAGE_TIMEOUT_ALLOWANCE_SECONDS = 75
+_MAX_IMAGE_TIMEOUT_COUNT = 8
 _logger = logging.getLogger(__name__)
+
+
+def _interactive_timeout_seconds(inbound: InputBurst | InboundEnvelope) -> int:
+    envelopes = (
+        (inbound,)
+        if isinstance(inbound, InboundEnvelope)
+        else tuple(message.envelope for message in inbound.messages)
+    )
+    image_count = sum(
+        attachment.kind == "image"
+        for envelope in envelopes
+        for attachment in envelope.attachments
+    )
+    return _EXEC_TIMEOUT_SECONDS + min(image_count, _MAX_IMAGE_TIMEOUT_COUNT) * _IMAGE_TIMEOUT_ALLOWANCE_SECONDS
 
 
 class RailwayAuthBroker(Protocol):
@@ -59,9 +76,12 @@ class SandboxDispatch:
         data_dir: str,
         xai_model: str,
         xai_reasoning_effort: str,
+        xai_vision_model: str = "grok-4.3",
+        xai_vision_reasoning_effort: str = "low",
         budget: TurnBudget | None = None,
         control_url: str | None = None,
         capability_key: bytes | None = None,
+        attachment_capability_key: bytes | None = None,
     ) -> None:
         self.supervisor = supervisor
         self.client = client
@@ -69,9 +89,12 @@ class SandboxDispatch:
         self.data_dir = data_dir
         self.xai_model = xai_model
         self.xai_reasoning_effort = xai_reasoning_effort
+        self.xai_vision_model = xai_vision_model
+        self.xai_vision_reasoning_effort = xai_vision_reasoning_effort
         self.budget = budget or RuntimeConfig().tool_turn_budget
         self.control_url = control_url
         self.capability_key = capability_key
+        self.attachment_capability_key = attachment_capability_key
 
     def ensure_worker(self, installation: TelegramInstallation) -> None:
         self.supervisor.reconcile(installation.tomo_id)
@@ -145,10 +168,11 @@ class SandboxDispatch:
                         "TOMO_CORE_SOUL": "/opt/tomo/SOUL.md",
                         "TOMO_XAI_MODEL": os.getenv("TOMO_XAI_MODEL", self.xai_model),
                         "TOMO_XAI_REASONING_EFFORT": os.getenv("TOMO_XAI_REASONING_EFFORT", self.xai_reasoning_effort),
+                        **self._attachment_env(installation, burst),
                         **self._interactive_cron_env(installation),
                         **_latency_env(),
                     },
-                    timeout=_EXEC_TIMEOUT_SECONDS,
+                    timeout=_interactive_timeout_seconds(burst),
                 )
                 latency_trace.emit(work.burst_id, "pty_ready", elapsed_ms=max(0, int((time.monotonic() - pty_started_at) * 1000)), attempt=attempt + 1)
                 runtime_entry_started_at = time.monotonic()
@@ -236,6 +260,31 @@ class SandboxDispatch:
             "TOMO_CRON_SESSION_ID": f"telegram:actor:{installation.actor_id}",
         }
 
+    def _attachment_env(self, installation: TelegramInstallation, burst: InputBurst) -> dict[str, str]:
+        """Grant a sandbox exactly the image file IDs in this interactive burst."""
+        if self.control_url is None or self.attachment_capability_key is None:
+            return {}
+        file_ids = tuple(dict.fromkeys(
+            attachment.file_id
+            for message in burst.messages
+            for attachment in message.envelope.attachments
+            if attachment.kind == "image" and isinstance(attachment.file_id, str) and attachment.file_id
+        ))[:8]
+        if not file_ids:
+            return {}
+        now = int(time.time())
+        capability = AttachmentCapability(
+            installation.tomo_id, burst.generation_id, tuple(hash_file_id(file_id) for file_id in file_ids), now, now + 300
+        )
+        return {
+            "TOMO_ATTACHMENT_CONTROL_URL": self.control_url,
+            "TOMO_ATTACHMENT_CAPABILITY": issue_attachment_capability(self.attachment_capability_key, capability),
+            "TOMO_ATTACHMENT_OWNER_ID": installation.tomo_id,
+            "TOMO_ATTACHMENT_GENERATION_ID": burst.generation_id,
+            "TOMO_XAI_VISION_MODEL": self.xai_vision_model,
+            "TOMO_XAI_VISION_REASONING_EFFORT": self.xai_vision_reasoning_effort,
+        }
+
     def iter_automation_events(
         self, installation: TelegramInstallation, turn: AutomationTurn, generation_id: str, session_id: str,
         is_active: Callable[[], bool] | None = None,
@@ -316,6 +365,10 @@ class SandboxDispatch:
         try:
             sandbox = self.client.get(sandbox_id)
             token = self.auth_broker.access_token(force_refresh=force_refresh)
+            burst = InputBurst(
+                f"legacy-{envelope.message_id}", f"legacy-{envelope.message_id}", 1,
+                (InboundMessage(1, int(envelope.native_metadata.get("update_id", 0)), envelope),),
+            )
             result = self.client.exec(
                 sandbox,
                 _COMMAND,
@@ -328,9 +381,10 @@ class SandboxDispatch:
                     "TOMO_XAI_MODEL": os.getenv("TOMO_XAI_MODEL", self.xai_model),
                     "TOMO_XAI_REASONING_EFFORT": os.getenv("TOMO_XAI_REASONING_EFFORT", self.xai_reasoning_effort),
                     **self._interactive_cron_env(installation),
+                    **self._attachment_env(installation, burst),
                     **_latency_env(),
                 },
-                timeout=_EXEC_TIMEOUT_SECONDS,
+                timeout=_interactive_timeout_seconds(envelope),
             )
         except TimeoutError as error:
             raise SandboxDispatchError("sandbox_timeout") from error

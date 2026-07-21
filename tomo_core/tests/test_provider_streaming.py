@@ -10,6 +10,7 @@ from tomo_core.providers import (
     ProviderToolCallReady,
     StaticProvider,
     XaiApiProvider,
+    supergrok_oauth_provider_from_access_token,
 )
 
 
@@ -39,6 +40,26 @@ def sse_chunks(*events, splits=()):
 
 
 class ProviderStreamingTests(unittest.TestCase):
+    def test_vision_store_policy_and_multimodal_content_are_serialized(self):
+        terminal = json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}]})
+        messages = [{"role": "user", "content": [{"type": "text", "text": "describe"}, {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,abc"}}]}]
+        provider = supergrok_oauth_provider_from_access_token("token", model="grok-4.3", reasoning_effort="low", store=False)
+
+        with patch("tomo_core.providers.httpx.stream", return_value=FakeStreamResponse(sse_chunks(terminal, "[DONE]"))) as stream:
+            list(provider.stream(messages))
+
+        body = stream.call_args.kwargs["json"]
+        self.assertEqual(body["model"], "grok-4.3")
+        self.assertEqual(body["reasoning_effort"], "low")
+        self.assertIs(body["store"], False)
+        self.assertEqual(body["messages"], messages)
+
+    def test_ordinary_requests_omit_store_policy(self):
+        terminal = json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}]})
+        with patch("tomo_core.providers.httpx.stream", return_value=FakeStreamResponse(sse_chunks(terminal, "[DONE]"))) as stream:
+            list(XaiApiProvider(api_key="test-key").stream([{"role": "user", "content": "hi"}]))
+        self.assertNotIn("store", stream.call_args.kwargs["json"])
+
     def test_stream_decodes_utf8_text_across_arbitrary_sse_chunks(self):
         first = json.dumps({"choices": [{"delta": {"content": "hello "}, "finish_reason": None}]})
         second = json.dumps({"choices": [{"delta": {"content": "café"}, "finish_reason": "stop"}]}, ensure_ascii=False)

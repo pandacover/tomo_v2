@@ -23,7 +23,35 @@ from .soul import load_soul
 from .telegram import TelegramDeliverySink
 from .tool_execution import ToolExecutor
 from .tools import ToolRegistry
+from .vision import VisionInterpreter, VisionObservation
 from . import latency_trace
+
+
+_MAX_VISION_IMAGES_PER_TURN = 8
+
+
+def _selected_image_attachments(burst: InputBurst):
+    seen: set[tuple[object, ...]] = set()
+    selected = 0
+    for message in burst.messages:
+        for attachment_index, attachment in enumerate(message.envelope.attachments):
+            if attachment.kind != "image":
+                continue
+            if attachment.file_id:
+                identity: tuple[object, ...] = ("file_id", attachment.file_id)
+            elif attachment.url:
+                identity = ("url", attachment.url)
+            elif attachment.path:
+                identity = ("path", attachment.path)
+            else:
+                identity = ("message", message.envelope.message_id, attachment_index)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            yield message, attachment_index, attachment
+            selected += 1
+            if selected == _MAX_VISION_IMAGES_PER_TURN:
+                return
 
 
 @dataclass(frozen=True)
@@ -84,9 +112,11 @@ class PersonalAgentRuntime:
         config: RuntimeConfig | None = None,
         tool_registry: ToolRegistry | None = None,
         personal_data_repository: PersonalDataRepository | None = None,
+        vision_interpreter: VisionInterpreter | None = None,
     ) -> None:
         self.config = config or RuntimeConfig()
         self.provider = provider
+        self.vision_interpreter = vision_interpreter
         self.personal_data = personal_data_repository or SqlitePersonalDataRepository(
             Path(self.config.data_dir) / "tomo.sqlite3", local_work_dir=self.config.local_work_dir
         )
@@ -197,6 +227,28 @@ class PersonalAgentRuntime:
         if not is_active():
             return
 
+        observations: tuple[VisionObservation, ...] = ()
+        if not automation and self.vision_interpreter is not None:
+            observed: list[VisionObservation] = []
+            for message, attachment_index, attachment in _selected_image_attachments(burst):
+                if not is_active():
+                    return
+                observed.append(self.vision_interpreter.observe(attachment, message.envelope.text, message_id=message.envelope.message_id, attachment_index=attachment_index, actor_id=message.envelope.actor_id))
+            if not is_active():
+                return
+            observations = tuple(observed)
+            if observations:
+                session.record_vision_observations(burst.burst_id, observations)
+                if not is_active():
+                    return
+                if not self.personal_data.save_session(self.owner_id, session, generation_id=burst.generation_id, revision=burst.revision):
+                    current_revision = self.personal_data.current_session_revision(self.owner_id, session_key)
+                    if current_revision is None:
+                        raise RuntimeError("stale_session_revision_unavailable")
+                    raise StaleSessionRevisionError(current_revision)
+                if not is_active():
+                    return
+
         memory_started_at = time.monotonic()
         try:
             query_text = burst.intent if automation else "\n".join(m.envelope.text for m in burst.messages)
@@ -216,6 +268,7 @@ class PersonalAgentRuntime:
             burst=burst,
             soul=load_soul(Path(self.config.soul_path)),
             history=tuple(history),
+            vision_observations=observations,
         )
         governance_revision = self.personal_data.memory_settings(self.owner_id).governance_revision
         if is_active():

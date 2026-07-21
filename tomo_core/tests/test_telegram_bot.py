@@ -31,6 +31,64 @@ class FakeBotApiClient:
 
 
 class TelegramBotTests(unittest.TestCase):
+    def test_fetch_rejects_invalid_file_id_with_safe_error(self):
+        with self.assertRaisesRegex(TelegramBotApiError, "telegram_file_invalid"):
+            TelegramBotApiClient("token").fetch("")
+
+    def test_fetch_downloads_bounded_telegram_file_without_leaking_identifiers(self):
+        class Response:
+            def raise_for_status(self): pass
+            def iter_bytes(self): return iter((b"jpeg", b"-bytes"))
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+        client = TelegramBotApiClient("secret-token")
+        with patch.object(client, "request", return_value={"result": {"file_path": "photos/image.jpg", "file_size": 10}}) as request, patch("httpx.stream", return_value=Response()) as stream:
+            attachment = client.fetch("secret-file", max_bytes=10)
+        self.assertEqual(attachment.data, b"jpeg-bytes")
+        request.assert_called_once_with("getFile", {"file_id": "secret-file"})
+        self.assertEqual(stream.call_args.args[1], "https://api.telegram.org/file/botsecret-token/photos/image.jpg")
+
+    def test_fetch_classifies_invalid_sizes_paths_and_upstream_failures_safely(self):
+        client = TelegramBotApiClient("secret-token")
+        for size in (-1, True, "10"):
+            with self.subTest(size=size), patch.object(client, "request", return_value={"result": {"file_path": "photos/image.jpg", "file_size": size}}), self.assertRaisesRegex(TelegramBotApiError, "telegram_file_unavailable"):
+                client.fetch("secret-file")
+        for path in ("../secret", "photos/x.jpg?token=leak", "photos/x.jpg#leak", "photos/\nsecret"):
+            with self.subTest(path=path), patch.object(client, "request", return_value={"result": {"file_path": path}}), self.assertRaisesRegex(TelegramBotApiError, "telegram_file_unavailable"):
+                client.fetch("secret-file")
+        with patch.object(client, "request", side_effect=TelegramBotApiError("secret-file secret-token upstream-body")):
+            with self.assertRaises(TelegramBotApiError) as error:
+                client.fetch("secret-file")
+        self.assertEqual(str(error.exception), "telegram_file_unavailable")
+        for secret in ("secret-file", "secret-token", "upstream-body"):
+            self.assertNotIn(secret, str(error.exception))
+
+    def test_fetch_rejects_negative_declared_size_before_download(self):
+        client = TelegramBotApiClient("secret-token")
+        with patch.object(client, "request", return_value={"result": {"file_path": "photos/image.jpg", "file_size": -1}}), patch("httpx.stream") as stream:
+            with self.assertRaisesRegex(TelegramBotApiError, "telegram_file_unavailable"):
+                client.fetch("secret-file")
+        stream.assert_not_called()
+
+    def test_fetch_rejects_boolean_max_and_declared_or_streamed_oversize(self):
+        client = TelegramBotApiClient("secret-token")
+        with self.assertRaisesRegex(TelegramBotApiError, "telegram_file_invalid"):
+            client.fetch("file", max_bytes=True)
+        with patch.object(client, "request", return_value={"result": {"file_path": "photos/image.jpg", "file_size": 11}}), self.assertRaisesRegex(TelegramBotApiError, "telegram_file_too_large"):
+            client.fetch("file", max_bytes=10)
+        class Response:
+            def raise_for_status(self): pass
+            def iter_bytes(self): return iter((b"12345678901",))
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+        with patch.object(client, "request", return_value={"result": {"file_path": "photos/image.jpg"}}), patch("httpx.stream", return_value=Response()), self.assertRaisesRegex(TelegramBotApiError, "telegram_file_too_large"):
+            client.fetch("file", max_bytes=10)
+
+    def test_envelope_from_photo_only_private_update(self):
+        envelope = envelope_from_update({"update_id": 1, "message": {"message_id": 2, "chat": {"id": 3, "type": "private"}, "from": {"id": 3}, "photo": [{"file_id": "photo", "width": 100, "height": 100}]}})
+        self.assertEqual(envelope.text, "")
+        self.assertEqual(envelope.attachments[0].file_id, "photo")
+
     def test_envelope_from_private_text_update(self):
         envelope = envelope_from_update(
             {

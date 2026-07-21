@@ -10,6 +10,7 @@ dependencies = [
   "fastapi>=0.115",
   "uvicorn>=0.30",
   "daytona==0.195.0",
+  "Pillow>=10,<12",
 ]
 
 [project.scripts]
@@ -28,3 +29,4 @@ packages = ["src/tomo_core"]
 [tool.hatch.build.targets.wheel.force-include]
 "src/tomo_core/skills/memory/SKILL.md" = "tomo_core/skills/memory/SKILL.md"
 "src/tomo_core/skills/cron-jobs/SKILL.md" = "tomo_core/skills/cron-jobs/SKILL.md"
+"src/tomo_core/skills/visual-evidence/SKILL.md" = "tomo_core/skills/visual-evidence/SKILL.md"

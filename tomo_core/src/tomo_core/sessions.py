@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
+import json
 from typing import Literal
 
 from .models import AutomationTurn, InboundMessage, MessageAttachment, utc_now_iso
+from .vision import VisionObservation
 
 Role = Literal["user", "assistant", "automation"]
 
@@ -77,6 +79,40 @@ class ConversationSession:
             accepted.add(generation_id)
         self.accepted_generation_ids = tuple(sorted(accepted))
 
+    def record_vision_observations(self, burst_id: str, observations: tuple[VisionObservation, ...]) -> None:
+        """Replace safe evidence on existing inbound rows without changing burst identity."""
+        if not isinstance(burst_id, str) or not burst_id.strip():
+            raise ValueError("burst_id must be non-empty")
+        observations = tuple(observations)
+        rows = {
+            message.metadata.get("message_id"): message
+            for message in self.messages
+            if message.role == "user" and message.metadata.get("burst_id") == burst_id
+        }
+        grouped: dict[str, list[tuple[int, dict[str, object]]]] = {}
+        references: set[tuple[str, int]] = set()
+        for observation in observations:
+            if not isinstance(observation, VisionObservation):
+                raise ValueError("vision observations must be VisionObservation values")
+            reference = (observation.message_id, observation.attachment_index)
+            row = rows.get(observation.message_id)
+            attachments = row.metadata.get("attachments") if row is not None else None
+            target = attachments[observation.attachment_index] if isinstance(attachments, list) and observation.attachment_index < len(attachments) else None
+            if reference in references or not isinstance(target, dict) or target.get("kind") != "image":
+                raise ValueError("vision observations must belong to the current input burst")
+            references.add(reference)
+            grouped.setdefault(observation.message_id, []).append((observation.attachment_index, observation.prompt_payload()))
+        for values in grouped.values():
+            values.sort(key=lambda value: value[0])
+        for index, message in enumerate(self.messages):
+            if message.role != "user" or message.metadata.get("burst_id") != burst_id:
+                continue
+            message_id = message.metadata.get("message_id")
+            if message_id not in grouped:
+                continue
+            metadata = {**message.metadata, "vision_observations": [value for _, value in grouped[message_id]]}
+            self.messages[index] = StoredMessage(message.role, message.content, message.timestamp, metadata)
+
     def model_history(self, limit: int = 20) -> list[dict[str, str]]:
         return [
             _model_message(message)
@@ -98,15 +134,27 @@ class ConversationSession:
 
 def _attachment_metadata(attachment: MessageAttachment) -> dict:
     payload = asdict(attachment)
-    return {key: value for key, value in payload.items() if value is not None}
+    return {key: value for key, value in payload.items() if key != "file_id" and value is not None}
 
 
 def _model_message(message: StoredMessage) -> dict[str, str]:
     if message.role == "automation":
         return {"role": "user", "content": message.content}
-    if message.role == "user" and isinstance(message.metadata.get("reply_context"), dict):
-        reply = message.metadata["reply_context"]
-        payload = {"message_id": message.metadata.get("message_id"), "content": message.content, "reply_context": _history_reply_context(reply)}
+    reply = message.metadata.get("reply_context")
+    observations = message.metadata.get("vision_observations")
+    if message.role == "user" and (isinstance(reply, dict) or observations):
+        payload: dict[str, object] = {"content": message.content}
+        if isinstance(reply, dict):
+            payload["message_id"] = message.metadata.get("message_id")
+            payload["reply_context"] = _history_reply_context(reply)
+        if observations:
+            attachments = message.metadata.get("attachments", [])
+            payload["attachments"] = [
+                {key: value for key, value in attachment.items() if key in {"kind", "mime_type", "metadata"}}
+                for attachment in attachments
+                if isinstance(attachment, dict)
+            ]
+            payload["vision_observations"] = observations
         return {"role": "user", "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":"))}
     return {"role": message.role, "content": message.content}
 

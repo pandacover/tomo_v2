@@ -21,6 +21,24 @@ class MessageAttachment:
     mime_type: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, str) or not self.kind or any(value is not None and not isinstance(value, str) for value in (self.file_id, self.url, self.path, self.mime_type)):
+            raise ValueError("attachment fields are invalid")
+        if not isinstance(self.metadata, dict) or not _safe_attachment_metadata(self.metadata):
+            raise ValueError("attachment metadata is invalid")
+
+
+def _safe_attachment_metadata(value: object) -> bool:
+    if isinstance(value, bool):
+        return False
+    if value is None or isinstance(value, (str, int, float)):
+        return True
+    if isinstance(value, list):
+        return all(_safe_attachment_metadata(item) for item in value)
+    if isinstance(value, dict):
+        return all(isinstance(key, str) and _safe_attachment_metadata(item) for key, item in value.items())
+    return False
+
 
 @dataclass(frozen=True)
 class ReplyContext:

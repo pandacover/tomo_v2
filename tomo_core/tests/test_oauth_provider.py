@@ -1,14 +1,44 @@
 import json
 import tempfile
 import unittest
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
+from PIL import Image
+from tomo_core.models import MessageAttachment
 from tomo_core.oauth import OAuthManager, OAuthProviderConfig
-from tomo_core.providers import OAuthBackedSuperGrokProvider, ProviderSetupRequired
+from tomo_core.providers import OAuthBackedSuperGrokProvider, ProviderSetupRequired, ProviderStreamCompleted, ProviderTextDelta
+from tomo_core.vision import DownloadedAttachment, ProviderVisionInterpreter
 
 
 class OAuthBackedProviderTests(unittest.TestCase):
+    def test_connected_actor_token_is_reused_for_local_vision_without_a_second_connect(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            oauth = OAuthManager(data_dir=tmp, providers={"supergrok": OAuthProviderConfig("supergrok", "client", "https://auth.example/authorize", "https://auth.example/token", "http://127.0.0.1:56120/callback", ("openid",))})
+            (Path(tmp) / "oauth" / "token_supergrok_telegram-actor.json").write_text(json.dumps({"access_token": "actor-access"}), encoding="utf-8")
+            image = BytesIO(); Image.new("RGB", (10, 10), "red").save(image, format="PNG")
+
+            class Reader:
+                def read(self, attachment): return DownloadedAttachment(image.getvalue(), "image/png")
+
+            class Provider:
+                name = "oauth"; supports_images_in = True; supports_images_out = False; supports_tool_calls = False
+                def stream(self, messages, *, tools=(), actor_id=None):
+                    return OAuthBackedSuperGrokProvider(oauth=oauth).stream(messages, tools=tools, actor_id=actor_id)
+
+            class FakeResponse:
+                def __enter__(self): return self
+                def __exit__(self, *args): return None
+                def raise_for_status(self): return None
+                def iter_raw(self): yield b'data: {"choices":[{"delta":{"content":"{\\"summary\\":\\"red image\\",\\"visible_text\\":[],\\"relevant_details\\":[],\\"uncertainties\\":[]}"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+
+            with patch("tomo_core.providers.httpx.stream", return_value=FakeResponse()) as stream:
+                observation = ProviderVisionInterpreter(Provider(), Reader()).observe(MessageAttachment("image", "photo"), "what is shown?", message_id="message", attachment_index=0, actor_id="telegram-actor")
+
+        self.assertEqual(observation.summary, "red image")
+        self.assertEqual(stream.call_args.kwargs["headers"]["Authorization"], "Bearer actor-access")
+
     def test_connected_supergrok_token_is_used_for_actor_completion(self):
         with tempfile.TemporaryDirectory() as tmp:
             oauth = OAuthManager(

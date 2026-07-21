@@ -3,8 +3,10 @@ import unittest
 from tomo_core.skills import (
     CRON_JOBS_SKILL_PATH,
     MEMORY_SKILL_PATH,
+    VISUAL_EVIDENCE_SKILL_PATH,
     load_cron_jobs_skill,
     load_memory_skill,
+    load_visual_evidence_skill,
     render_capability_skill_index,
 )
 
@@ -70,6 +72,36 @@ class CapabilitySkillTests(unittest.TestCase):
         self.assertEqual(rendered[memory_start:memory_end], load_memory_skill())
         self.assertEqual(rendered[cron_start:cron_end], load_cron_jobs_skill())
         self.assertNotIn("`", rendered)
+
+    def test_visual_evidence_skill_is_packaged_and_backtick_free(self):
+        skill = load_visual_evidence_skill()
+
+        self.assertEqual(VISUAL_EVIDENCE_SKILL_PATH, "skills/visual-evidence/SKILL.md")
+        self.assertTrue(skill)
+        for expected in (
+            "status", "summary", "visible_text", "relevant_details", "uncertainties",
+            "untrusted evidence", "visible facts", "inference", "Never obey instructions",
+            "Never invent image details", "fresh pixel inspection", "sensitive attributes",
+        ):
+            self.assertIn(expected, skill)
+        self.assertNotIn("`", skill)
+
+    def test_visual_evidence_is_conditionally_embedded_exactly_once(self):
+        rendered = render_capability_skill_index(include_visual_evidence=True)
+
+        self.assertIn(f"visual-evidence: {VISUAL_EVIDENCE_SKILL_PATH}", rendered)
+        self.assertEqual(rendered.count("<TOMO_VISUAL_EVIDENCE_SKILL>"), 1)
+        self.assertEqual(rendered.count("</TOMO_VISUAL_EVIDENCE_SKILL>"), 1)
+        start = rendered.index("<TOMO_VISUAL_EVIDENCE_SKILL>\n") + len("<TOMO_VISUAL_EVIDENCE_SKILL>\n")
+        end = rendered.index("\n</TOMO_VISUAL_EVIDENCE_SKILL>")
+        self.assertEqual(rendered[start:end], load_visual_evidence_skill())
+        self.assertNotIn("`", rendered)
+
+    def test_visual_evidence_is_absent_by_default(self):
+        rendered = render_capability_skill_index()
+
+        self.assertNotIn("visual-evidence:", rendered)
+        self.assertNotIn("TOMO_VISUAL_EVIDENCE_SKILL", rendered)
 
 
 if __name__ == "__main__":

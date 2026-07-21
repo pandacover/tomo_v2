@@ -168,6 +168,18 @@ class SegmentFrameParserTests(unittest.TestCase):
             parser.feed('{"type":"frame","text":"next"}\n')
         self.assertEqual(raised.exception.code, "frame_limit")
 
+    def test_preserves_ascii_ellipses_at_terminal_standalone_and_mid_sentence_positions(self):
+        examples = (
+            "i was going to say this plan is doomed, but...",
+            "...",
+            "the approval process was... optimistic.",
+        )
+        for text in examples:
+            with self.subTest(text=text):
+                parser = SegmentFrameParser(segment_index=1, first_segment=False, budget=budget())
+                self.assertEqual(parser.feed('{"type":"frame","text":' + repr(text).replace("'", '"') + '}\n'), [Frame(1, 0, text)])
+                self.assertEqual(parser.finish(), [])
+
 
 if __name__ == "__main__":
     unittest.main()

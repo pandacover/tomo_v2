@@ -4,10 +4,10 @@ import unittest
 from unittest.mock import Mock, patch
 
 from tomo_core.daytona_client import DaytonaClientError, ExecResult, SandboxHandle, SessionCommandHandle
-from tomo_core.models import InboundEnvelope
+from tomo_core.models import InboundEnvelope, InboundMessage, InputBurst, MessageAttachment
 from tomo_core.models import AutomationTurn
 from tomo_core.onboarding_store import InterruptedGeneration, TelegramGenerationInput, TelegramGenerationWork
-from tomo_core.sandbox_dispatch import SandboxDispatch, SandboxDispatchError
+from tomo_core.sandbox_dispatch import SandboxDispatch, SandboxDispatchError, _interactive_timeout_seconds
 from tomo_core.sandbox_registry import SandboxRegistry
 from tomo_core.sandbox_protocol import EVENT_MARKER, RESULT_MARKER, SandboxCompletedEvent, SandboxErrorEvent, SandboxFrameEvent, SandboxTracebackFrame, encode_error, encode_event, encode_result
 from tomo_core.conversation.models import ConversationMove, Frame, FrameReady, MoveConfidence, MovePlan, SegmentFinish, SegmentResult, ToolCall, TurnBudget, TurnRunCompleted, TurnRunResult, TurnRunStatus, TurnUsage
@@ -15,6 +15,7 @@ from tomo_core.runtime import RuntimeCompleted, RuntimeFrameReady
 from tomo_core.models import OutboundBubble
 from tomo_core.onboarding_store import TelegramInstallation
 from tomo_core.cron_capability import verify_capability
+from tomo_core.attachment_capability import AttachmentCapabilityError, verify_attachment_capability
 
 
 def legacy_event(request_id, generation_id, sequence, event_type, **fields):
@@ -142,6 +143,43 @@ class SandboxDispatchTests(unittest.TestCase):
         self.assertNotIn("hello", command)
         self.assertEqual(self.daytona.exec.call_args.kwargs["timeout"], 120)
 
+    def test_legacy_image_turn_extends_the_sandbox_timeout(self):
+        result = encode_result("telegram:update:42", [OutboundBubble("hello")])
+        self.daytona.exec.return_value = ExecResult(0, f"{RESULT_MARKER}{result}\n")
+        inbound = InboundEnvelope(
+            connector="telegram",
+            actor_id="user",
+            message_id="message",
+            text="what is this?",
+            attachments=(MessageAttachment("image", "photo-1", mime_type="image/jpeg"),),
+        )
+
+        self.dispatch.deliver_telegram(self.installation, 42, inbound)
+
+        self.assertEqual(self.daytona.exec.call_args.kwargs["timeout"], 195)
+
+    def test_interactive_timeout_allowance_is_bounded_to_eight_images(self):
+        burst = InputBurst(
+            "burst",
+            "generation",
+            1,
+            (
+                InboundMessage(
+                    1,
+                    1,
+                    InboundEnvelope(
+                        "telegram",
+                        "user",
+                        "message",
+                        "",
+                        attachments=tuple(MessageAttachment("image", f"photo-{index}") for index in range(12)),
+                    ),
+                ),
+            ),
+        )
+
+        self.assertEqual(_interactive_timeout_seconds(burst), 720)
+
     def test_iter_telegram_events_streams_v2_events_from_named_session(self):
         work = self._work()
         self.daytona.start_session_command.return_value = SessionCommandHandle("telegram-burst-one-r1", "cmd-1")
@@ -195,6 +233,20 @@ class SandboxDispatchTests(unittest.TestCase):
         automation_env = self.daytona.start_session_command.call_args.kwargs["env"]
         self.assertNotIn("TOMO_CRON_CONTROL_URL", automation_env)
         self.assertNotIn("TOMO_CRON_CAPABILITY", automation_env)
+        self.assertEqual(self.daytona.start_session_command.call_args.kwargs["timeout"], 120)
+
+    def test_hosted_attachment_capability_grants_only_the_first_eight_distinct_images(self):
+        key = b"k" * 32
+        self.dispatch.control_url = "https://control.example.test"
+        self.dispatch.attachment_capability_key = key
+        burst = InputBurst("burst", "generation", 1, (InboundMessage(1, 1, InboundEnvelope("telegram", "user", "message", "", attachments=tuple(MessageAttachment("image", f"photo-{index}") for index in range(9)))),))
+
+        env = self.dispatch._attachment_env(self.installation, burst)
+
+        for index in range(8):
+            verify_attachment_capability(key, env["TOMO_ATTACHMENT_CAPABILITY"], f"photo-{index}", owner_id="tomo-a", generation_id="generation", now=int(time.time()))
+        with self.assertRaises(AttachmentCapabilityError):
+            verify_attachment_capability(key, env["TOMO_ATTACHMENT_CAPABILITY"], "photo-8", owner_id="tomo-a", generation_id="generation", now=int(time.time()))
 
     def test_iter_telegram_events_streams_v3_frame_coordinates(self):
         work = self._work()
@@ -320,6 +372,7 @@ class SandboxDispatchTests(unittest.TestCase):
         env = self.daytona.start_session_command.call_args.kwargs["env"]
         self.assertIn('"attachments":[{"kind":"image","file_id":"large"', env["TOMO_INBOUND_JSON"])
         self.assertIn('"text":"look"', env["TOMO_INBOUND_JSON"])
+        self.assertEqual(self.daytona.start_session_command.call_args.kwargs["timeout"], 195)
 
     def test_burst_from_work_captures_reply_context_from_the_queued_raw_update(self):
         work = self._work()

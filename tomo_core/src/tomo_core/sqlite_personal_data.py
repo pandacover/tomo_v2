@@ -453,7 +453,8 @@ class SqlitePersonalDataRepository:
                     if role == "assistant" and gen:
                         con.execute("INSERT INTO messages VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET content=excluded.content,timestamp=excluded.timestamp,ordinal=excluded.ordinal,generation_status=excluded.generation_status,metadata_json=excluded.metadata_json",(mid,s["id"],role,m.content,m.timestamp,d.get("ordinal",pos),d.get("message_id"),update,burst,gen,status,json.dumps(d,sort_keys=True,default=str),now))
                     else:
-                        con.execute("INSERT OR IGNORE INTO messages VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(mid,s["id"],role,m.content,m.timestamp,d.get("ordinal",pos),d.get("message_id"),update,burst,gen,status,json.dumps(d,sort_keys=True,default=str),now))
+                        # Inbound identity is immutable, but bounded derived evidence may be attached later.
+                        con.execute("INSERT INTO messages VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET metadata_json=excluded.metadata_json",(mid,s["id"],role,m.content,m.timestamp,d.get("ordinal",pos),d.get("message_id"),update,burst,gen,status,json.dumps(d,sort_keys=True,default=str),now))
                 existing_generations = {
                     row[0] for row in con.execute(
                         "SELECT generation_id FROM accepted_generations WHERE session_id=?", (s["id"],)

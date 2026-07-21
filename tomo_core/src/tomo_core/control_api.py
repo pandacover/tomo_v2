@@ -6,17 +6,35 @@ import json
 import math
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Annotated, Callable, Literal
+from typing import Annotated, Callable, Literal, NamedTuple, Protocol
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, field_validator
 
 from .cron_capability import CronCapability, CronCapabilityError, load_or_create_key, verify_capability
 from .cron_models import CronJob, JobIntent, LifecyclePolicy, ScheduleSpec
 from .cron_store import CronStore
 from .onboarding_store import TelegramOnboardingStore
+from .attachment_capability import AttachmentCapability, AttachmentCapabilityError, load_or_create_attachment_key, verify_attachment_capability
+from .telegram_bot import TelegramBotApiClient, TelegramBotApiError
+from .vision import DownloadedAttachment
+
+
+class TelegramFileSource(Protocol):
+    def fetch(self, file_id: str) -> DownloadedAttachment: ...
+
+
+class AttachmentCapabilityContext(NamedTuple):
+    token: str
+    owner_id: str
+    generation_id: str
+
+
+class AttachmentResolveRequest(BaseModel):
+    file_id: str = Field(alias="fileId", min_length=1, max_length=4096)
+    model_config = {"extra": "forbid"}
 
 
 class InstallLinkRequest(BaseModel):
@@ -106,13 +124,15 @@ class CronRevisionRequest(BaseModel):
     model_config = {"extra": "forbid"}
 
 
-def create_app(data_dir: str | Path | None = None, api_key: str | None = None, bot_username: str | None = None, now: Callable[[], datetime] | None = None) -> FastAPI:
+def create_app(data_dir: str | Path | None = None, api_key: str | None = None, bot_username: str | None = None, now: Callable[[], datetime] | None = None, telegram_files: TelegramFileSource | None = None, attachment_key: bytes | None = None) -> FastAPI:
     resolved_data_dir = Path(data_dir or os.getenv("TOMO_CORE_DATA_DIR", ".tomo_core"))
     resolved_api_key = api_key if api_key is not None else os.getenv("TOMO_CONTROL_API_KEY")
     resolved_bot_username = bot_username or os.getenv("TOMO_TELEGRAM_GLOBAL_BOT_USERNAME")
     store: TelegramOnboardingStore | None = None
     cron_store: CronStore | None = None
     cron_key: bytes | None = None
+    attachment_signing_key = attachment_key
+    attachment_source = telegram_files
     clock = now or (lambda: datetime.now(timezone.utc))
     app = FastAPI(title="tomo core control api")
 
@@ -154,9 +174,45 @@ def create_app(data_dir: str | Path | None = None, api_key: str | None = None, b
             raise HTTPException(status_code=401, detail="invalid capability")
         return capability
 
+    def attachment_capability(request: Request) -> AttachmentCapabilityContext:
+        nonlocal attachment_signing_key
+        authorization = request.headers.get("authorization", "")
+        owner_id = request.headers.get("x-tomo-owner-id")
+        generation_id = request.headers.get("x-tomo-generation-id")
+        if not authorization.startswith("Bearer ") or not owner_id or not generation_id:
+            raise HTTPException(status_code=401, detail="invalid capability")
+        if attachment_signing_key is None:
+            attachment_signing_key = load_or_create_attachment_key(resolved_data_dir)
+        return AttachmentCapabilityContext(authorization[7:], owner_id, generation_id)
+
     @app.get("/v1/health")
     def health() -> dict[str, str]:
         return {"ok": "true"}
+
+    @app.post("/v1/attachments/resolve")
+    def resolve_attachment(body: AttachmentResolveRequest, request: Request) -> Response:
+        capability_context = attachment_capability(request)
+        try:
+            verify_attachment_capability(attachment_signing_key, capability_context.token, body.file_id, owner_id=capability_context.owner_id, generation_id=capability_context.generation_id, now=int(clock().timestamp()))
+        except AttachmentCapabilityError:
+            raise HTTPException(status_code=401, detail="invalid capability") from None
+        nonlocal attachment_source
+        if attachment_source is None:
+            token_value = os.getenv("TOMO_TELEGRAM_GLOBAL_BOT_TOKEN")
+            if not token_value:
+                raise HTTPException(status_code=503, detail="attachment service unavailable")
+            attachment_source = TelegramBotApiClient(token_value)
+        try:
+            attachment = attachment_source.fetch(body.file_id)
+        except TelegramBotApiError as error:
+            if error.args == ("telegram_file_too_large",):
+                raise HTTPException(status_code=413, detail="attachment too large") from None
+            raise HTTPException(status_code=503, detail="attachment service unavailable") from None
+        if not isinstance(attachment, DownloadedAttachment):
+            raise HTTPException(status_code=503, detail="attachment service unavailable")
+        if len(attachment.data) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="attachment too large")
+        return Response(attachment.data, media_type=attachment.mime_type, headers={"Cache-Control": "no-store"})
 
     @app.post("/v1/onboarding/telegram/install-link", response_model=InstallLinkResponse, response_model_by_alias=True)
     def create_install_link(body: InstallLinkRequest, x_api_key: str | None = Header(default=None)) -> InstallLinkResponse:

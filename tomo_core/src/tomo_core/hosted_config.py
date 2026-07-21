@@ -15,6 +15,8 @@ _MAX_POLL_TIMEOUT = 60
 _MAX_ROUTER_WORKERS = 32
 _DEFAULT_XAI_MODEL = "grok-4.5"
 _DEFAULT_XAI_REASONING_EFFORT = "medium"
+_DEFAULT_XAI_VISION_MODEL = "grok-4.3"
+_DEFAULT_XAI_VISION_REASONING_EFFORT = "low"
 _DAYTONA_HOSTED_VARIABLES = (
     "DAYTONA_API_KEY",
     "DAYTONA_API_URL",
@@ -40,6 +42,8 @@ class HostedRuntimeConfig:
     telegram_delivery_pace_seconds: float
     xai_model: str
     xai_reasoning_effort: str
+    xai_vision_model: str
+    xai_vision_reasoning_effort: str
     control_public_url: str | None
 
     @classmethod
@@ -121,6 +125,12 @@ class HostedRuntimeConfig:
         except OSError:
             raise ValueError("invalid or unwritable TOMO_CORE_DATA_DIR") from None
 
+        vision_model = values.get("TOMO_XAI_VISION_MODEL", _DEFAULT_XAI_VISION_MODEL)
+        vision_effort = values.get("TOMO_XAI_VISION_REASONING_EFFORT", _DEFAULT_XAI_VISION_REASONING_EFFORT)
+        if not isinstance(vision_model, str) or not vision_model.strip():
+            raise ValueError("invalid TOMO_XAI_VISION_MODEL")
+        if vision_effort not in {"low", "medium", "high"}:
+            raise ValueError("invalid TOMO_XAI_VISION_REASONING_EFFORT")
         return cls(
             runtime=runtime,
             bot_token=resolved_token,
@@ -135,6 +145,8 @@ class HostedRuntimeConfig:
             telegram_delivery_pace_seconds=delivery_pace_seconds,
             xai_model=values.get("TOMO_XAI_MODEL", _DEFAULT_XAI_MODEL),
             xai_reasoning_effort=values.get("TOMO_XAI_REASONING_EFFORT", _DEFAULT_XAI_REASONING_EFFORT),
+            xai_vision_model=vision_model,
+            xai_vision_reasoning_effort=vision_effort,
             control_public_url=control_public_url,
         )
 

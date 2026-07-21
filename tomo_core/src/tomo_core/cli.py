@@ -35,6 +35,9 @@ from .sandbox_protocol import RESULT_MARKER, decode_inbound, encode_result
 from .cron_service import CronSchedulerService
 from .cron_store import CronStore
 from .cron_capability import load_or_create_key
+from .attachment_capability import load_or_create_attachment_key
+from .attachment_reader import ControlAttachmentReader
+from .vision import ProviderVisionInterpreter
 from .personal_data_transfer import export_owner
 from .sqlite_personal_data import SqlitePersonalDataRepository
 
@@ -100,6 +103,31 @@ def build_provider(args: argparse.Namespace, oauth: OAuthManager):
     if getattr(args, "use_grok_login", False) or os.getenv("TOMO_USE_GROK_LOGIN") == "1":
         return GrokAuthProvider(auth_store=GrokAuthStore(), model=args.model)
     return OAuthBackedSuperGrokProvider(oauth=oauth, model=args.model)
+
+
+def build_vision_interpreter(
+    args: argparse.Namespace,
+    oauth: OAuthManager,
+    reader: TelegramBotApiClient,
+    *,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+):
+    """Create a role-specific provider while reusing the selected local auth source."""
+    if args.static_response:
+        return None
+    vision_model = model or os.getenv("TOMO_XAI_VISION_MODEL", "grok-4.3")
+    vision_effort = reasoning_effort or os.getenv("TOMO_XAI_VISION_REASONING_EFFORT", "low")
+    base = build_provider(args, oauth)
+    if isinstance(base, XaiApiProvider):
+        provider = XaiApiProvider(base.api_key, model=vision_model, base_url=base.base_url, reasoning_effort=vision_effort, store=False)
+    elif isinstance(base, GrokAuthProvider):
+        provider = GrokAuthProvider(base.auth_store, model=vision_model, base_url=base.base_url, reasoning_effort=vision_effort, store=False)
+    elif isinstance(base, OAuthBackedSuperGrokProvider):
+        provider = OAuthBackedSuperGrokProvider(base.oauth, model=vision_model, base_url=base.base_url, reasoning_effort=vision_effort, store=False)
+    else:
+        return None
+    return ProviderVisionInterpreter(provider, reader)
 
 
 def build_oauth_manager(args: argparse.Namespace) -> OAuthManager:
@@ -228,8 +256,21 @@ def run_shared_gateway_foreground(args: argparse.Namespace, config: HostedRuntim
         capability_key = load_or_create_key(config.data_dir)
         cron_store = CronStore(config.data_dir)
         if config.runtime == "local":
-            provider_factory = lambda _: StaticProvider(args.static_response) if args.static_response else build_provider(args, build_oauth_manager(args))
-            instances = RuntimeInstanceRegistry(config.data_dir, provider_factory, client, soul_path=args.soul)
+            oauth = build_oauth_manager(args)
+            provider_factory = lambda _: StaticProvider(args.static_response) if args.static_response else build_provider(args, oauth)
+            instances = RuntimeInstanceRegistry(
+                config.data_dir,
+                provider_factory,
+                client,
+                soul_path=args.soul,
+                vision_interpreter_factory=lambda _: build_vision_interpreter(
+                    args,
+                    oauth,
+                    client,
+                    model=config.xai_vision_model,
+                    reasoning_effort=config.xai_vision_reasoning_effort,
+                ),
+            )
             gateway = SharedTelegramGateway(
                 client=client,
                 store=store,
@@ -242,6 +283,7 @@ def run_shared_gateway_foreground(args: argparse.Namespace, config: HostedRuntim
                 cron_store=cron_store,
             )
         else:
+            attachment_capability_key = load_or_create_attachment_key(config.data_dir)
             auth = HostedSuperGrokTokenBroker(config.data_dir, os.getenv("TOMO_SUPERGROK_OAUTH_JSON_B64"))
             auth.access_token()
             registry = SandboxRegistry(config.data_dir)
@@ -262,8 +304,11 @@ def run_shared_gateway_foreground(args: argparse.Namespace, config: HostedRuntim
                 data_dir=config.daytona_sandbox_data_dir,
                 xai_model=config.xai_model,
                 xai_reasoning_effort=config.xai_reasoning_effort,
+                xai_vision_model=config.xai_vision_model,
+                xai_vision_reasoning_effort=config.xai_vision_reasoning_effort,
                 control_url=config.control_public_url,
                 capability_key=capability_key,
+                attachment_capability_key=attachment_capability_key,
             )
             gateway = SharedTelegramGateway(
                 client=client,
@@ -440,6 +485,7 @@ def main(argv: list[str] | None = None) -> int:
             provider=provider,
             telegram=TelegramDeliverySink(client),
             config=RuntimeConfig(data_dir=args.data_dir, soul_path=args.soul),
+            vision_interpreter=build_vision_interpreter(args, oauth, client),
         )
         print("telegram bot polling started. press ctrl+c to stop.")
         TelegramPollingBot(client=client, runtime=runtime, oauth=oauth, poll_timeout=args.poll_timeout).run_forever()
@@ -497,6 +543,15 @@ def main(argv: list[str] | None = None) -> int:
                 model=os.getenv("TOMO_XAI_MODEL", "grok-4.5"),
                 reasoning_effort=os.getenv("TOMO_XAI_REASONING_EFFORT", "high"),
             )
+            vision = ProviderVisionInterpreter(
+                supergrok_oauth_provider_from_access_token(
+                    access_token,
+                    model=os.getenv("TOMO_XAI_VISION_MODEL", "grok-4.3"),
+                    reasoning_effort=os.getenv("TOMO_XAI_VISION_REASONING_EFFORT", "low"),
+                    store=False,
+                ),
+                ControlAttachmentReader.from_env(),
+            ) if os.getenv("TOMO_ATTACHMENT_CAPABILITY") else None
             return run_once(
                 io.StringIO(payload),
                 sys.stdout,
@@ -506,7 +561,8 @@ def main(argv: list[str] | None = None) -> int:
                     owner_id=owner_id,
                 ),
                 provider=provider,
-                secret_values=tuple(value for value in (access_token, os.getenv("TOMO_CRON_CAPABILITY")) if value),
+                vision_interpreter=vision,
+                secret_values=tuple(value for value in (access_token, os.getenv("TOMO_CRON_CAPABILITY"), os.getenv("TOMO_ATTACHMENT_CAPABILITY")) if value),
             )
         except SandboxInboundError:
             return 1

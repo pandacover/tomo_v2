@@ -48,6 +48,10 @@ _SANDBOX_LATENCY_PHASES = frozenset({
     "sandbox_session_load",
     "sandbox_memory_hydration",
     "sandbox_prompt_prepare",
+    "sandbox_attachment_fetch",
+    "sandbox_image_normalize",
+    "sandbox_vision_provider_attempt",
+    "sandbox_vision_observation_ready",
 })
 _SANDBOX_LATENCY_COUNTS = frozenset({
     "attempt",
@@ -68,6 +72,11 @@ _SANDBOX_LATENCY_COUNTS = frozenset({
     "plan_model",
     "plan_normalized",
     "plan_synthesized",
+    "image_count",
+    "input_bytes",
+    "normalized_bytes",
+    "width",
+    "height",
 })
 
 

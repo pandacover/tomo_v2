@@ -7,6 +7,7 @@ from types import MappingProxyType
 from typing import Mapping, Sequence, TypeAlias
 
 from ..models import AutomationTurn, InboundEnvelope, InboundMessage, InputBurst
+from ..vision import VisionObservation
 from ..personal_data import MemoryControl, MemoryGovernanceControl, MemoryWriteControl, OwnerSettingControl, PendingMemoryActionControl
 
 
@@ -344,6 +345,25 @@ class ConversationRequest:
     burst: InputBurst | AutomationTurn
     soul: str
     history: tuple[dict[str, str], ...]
+    vision_observations: tuple[VisionObservation, ...] = ()
+
+    def __post_init__(self) -> None:
+        observations = tuple(self.vision_observations)
+        if isinstance(self.burst, AutomationTurn):
+            if observations:
+                raise ValueError("automation requests cannot include vision observations")
+        elif isinstance(self.burst, InputBurst):
+            messages = {message.envelope.message_id: message.envelope for message in self.burst.messages}
+            references: set[tuple[str, int]] = set()
+            for observation in observations:
+                envelope = messages.get(observation.message_id) if isinstance(observation, VisionObservation) else None
+                reference = (observation.message_id, observation.attachment_index) if isinstance(observation, VisionObservation) else None
+                if envelope is None or reference in references or observation.attachment_index >= len(envelope.attachments) or envelope.attachments[observation.attachment_index].kind != "image":
+                    raise ValueError("vision observations must belong to the current input burst")
+                references.add(reference)
+        else:
+            raise ValueError("conversation request burst is invalid")
+        object.__setattr__(self, "vision_observations", observations)
 
     @property
     def envelope(self) -> InboundEnvelope | None:
