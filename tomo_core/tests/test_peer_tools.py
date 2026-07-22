@@ -161,6 +161,19 @@ class PeerToolsTests(unittest.TestCase):
             "error_code": "peer_unavailable",
         })
 
+    def test_provider_stream_failure_is_reduced_to_peer_unavailable(self):
+        result = _client(lambda _request, **_kwargs: _Response({
+            "requestId": "private-request",
+            "status": "failed",
+            "errorCode": "provider_stream_failure",
+        })).inspect_request("request")
+
+        self.assertEqual(result, {
+            "ok": True,
+            "status": "failed",
+            "error_code": "peer_unavailable",
+        })
+
     def test_ask_uses_only_an_exact_listed_ready_handle_and_replaces_the_cache(self):
         requests = []
         responses = iter([

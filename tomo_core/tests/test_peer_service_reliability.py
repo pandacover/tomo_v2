@@ -142,6 +142,41 @@ class PeerServiceReliabilityTests(unittest.TestCase):
             self.assertIn("error_code=sandbox_exec_failed", logs)
             self.assertNotIn("private provider detail", logs)
 
+    def test_provider_stream_failure_is_not_downgraded_across_retries(self):
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as directory:
+            exchange = self._exchange(directory, now)
+            request = exchange.submit(
+                "a", "bobby", "generation", "call", "ordinary_message", "hello", now=now
+            )
+            current = [now]
+            installation = type("Installation", (), {"tomo_id": "b"})()
+            installations = type(
+                "Installations",
+                (),
+                {"installation_for_tomo": lambda *_: installation},
+            )()
+
+            class Dispatch:
+                def iter_peer_events(self, *_args, **_kwargs):
+                    raise SandboxDispatchError("provider_stream_failure")
+                    yield
+
+            service = PeerService(
+                exchange, installations, Dispatch(), clock=lambda: current[0]
+            )
+            with self.assertLogs("tomo_core.peer_service", level="WARNING") as captured:
+                for seconds in (0, 2, 6):
+                    current[0] = now + timedelta(seconds=seconds)
+                    self.assertTrue(service.run_once())
+
+            inspected = exchange.inspect("a", request.request_id)
+            self.assertEqual(inspected.status, "failed")
+            self.assertEqual(inspected.error_code, "provider_stream_failure")
+            self.assertIn(
+                "error_code=provider_stream_failure", "\n".join(captured.output)
+            )
+
     @staticmethod
     def _exchange(directory, now):
         exchange = PeerExchange(directory)
