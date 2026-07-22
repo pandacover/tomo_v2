@@ -379,7 +379,7 @@ class PersonalAgentRuntime:
                 continue
             if isinstance(event, FrameReady):
                 if peer and not _peer_frame_grounded(
-                    event.text, burst.disclosure_scope, peer_candidates or []
+                    event.frame.text, burst.disclosure_scope, peer_candidates or []
                 ):
                     return
                 ready = emit_reaction()

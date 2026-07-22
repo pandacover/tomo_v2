@@ -6,7 +6,7 @@ from unittest.mock import patch
 import httpx
 
 from tomo_core import InboundEnvelope, InboundMessage, InputBurst, PersonalAgentRuntime, RuntimeConfig
-from tomo_core.models import MessageAttachment
+from tomo_core.models import MessageAttachment, PeerTurn
 from tomo_core.conversation import FrameReady
 from tomo_core.grok_auth import GrokAuthStore
 from tomo_core.providers import GrokAuthProvider, ProviderStreamCompleted, ProviderTextDelta
@@ -42,6 +42,38 @@ def stream(*frames, finish_reason="stop", input_tokens=11, output_tokens=7):
 
 
 class RuntimeConversationMoveTests(unittest.TestCase):
+    def test_peer_turn_emits_grounded_runtime_frame(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            soul_path = Path(tmp) / "SOUL.md"
+            soul_path.write_text("SOUL", encoding="utf-8")
+            provider = ScriptedProvider([[
+                ProviderTextDelta('{"type":"frame","text":"Safe answer."}\n'),
+                ProviderStreamCompleted("stop"),
+            ]])
+            runtime = PersonalAgentRuntime(
+                provider,
+                TelegramDeliverySink(FakeTelegramClient()),
+                RuntimeConfig(data_dir=tmp, soul_path=str(soul_path)),
+            )
+            turn = PeerTurn(
+                "peer-generation",
+                1,
+                "relationship",
+                "thread",
+                "peer-request",
+                "alice",
+                "question",
+                "ordinary_message",
+                "hello",
+                "2099-01-01T00:15:00+00:00",
+            )
+
+            events = list(runtime.handle_peer_turn_iter(turn))
+
+            self.assertEqual([type(event) for event in events], [RuntimeFrameReady, RuntimeCompleted])
+            self.assertEqual(events[0].bubble.text, "Safe answer.")
+            self.assertEqual(provider.calls[0][2], None)
+
     def test_vision_cancellation_fences_calls_persistence_and_base_generation(self):
         for checkpoint in ("before_vision", "after_vision", "after_observation_checkpoint"):
             with self.subTest(checkpoint=checkpoint), tempfile.TemporaryDirectory() as tmp:
