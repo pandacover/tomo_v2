@@ -15,6 +15,7 @@ from tomo_core.cron_store import CronStore
 from tomo_core.telegram_router import RetryableTelegramUpdateError
 from tomo_core.providers import XaiApiProvider
 from tomo_core.peer_exchange import PeerExchange
+from tomo_core.sandbox_dispatch import SandboxDispatchError
 
 
 class CliTests(unittest.TestCase):
@@ -76,6 +77,15 @@ class CliTests(unittest.TestCase):
         self.assertIn("code=storage_operation_failed", output)
         self.assertIn("exception_class=RetryableTelegramUpdateError", output)
         self.assertNotIn("sensitive-value", output)
+
+    def test_shared_gateway_error_log_preserves_sandbox_dispatch_code(self):
+        with patch("sys.stderr", io.StringIO()) as stderr:
+            _log_shared_gateway_error(SandboxDispatchError("sandbox_exec_failed"))
+
+        self.assertIn(
+            "code=sandbox_exec_failed exception_class=SandboxDispatchError",
+            stderr.getvalue(),
+        )
 
     def test_control_start_invokes_uvicorn(self):
         with patch("uvicorn.run") as run:

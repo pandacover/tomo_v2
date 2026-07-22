@@ -46,7 +46,7 @@ from .sqlite_personal_data import SqlitePersonalDataRepository
 
 
 def _log_shared_gateway_error(error: Exception) -> None:
-    raw_code = getattr(error, "error_code", "processing_error")
+    raw_code = getattr(error, "error_code", getattr(error, "code", "processing_error"))
     code = re.sub(r"[^a-z0-9]+", "_", str(raw_code).lower()).strip("_")[:64] or "processing_error"
     exception_class = re.sub(r"[^A-Za-z0-9_]+", "_", type(error).__name__)[:64] or "Exception"
     print(

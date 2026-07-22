@@ -86,10 +86,14 @@ class TelegramUpdateRouter:
     on_error: Callable[[Exception], None] | None = None
     cancel_generation: Callable[[InterruptedGeneration], None] | None = None
     cancellation_queue_size: int = 100
+    cancellation_retry_base_seconds: float = 1.0
+    cancellation_retry_max_seconds: float = 60.0
     _stop_event: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
     _workers: list[threading.Thread] = field(default_factory=list, init=False, repr=False)
     _cancellations: queue.Queue[InterruptedGeneration] = field(init=False, repr=False)
     _scheduled_cancellation_ids: set[str] = field(default_factory=set, init=False, repr=False)
+    _cancellation_failures: dict[str, int] = field(default_factory=dict, init=False, repr=False)
+    _cancellation_retry_at: dict[str, float] = field(default_factory=dict, init=False, repr=False)
     _cancellation_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -228,17 +232,27 @@ class TelegramUpdateRouter:
                 self.store.complete_generation_cleanup(interrupted.generation_id)
                 with self._cancellation_lock:
                     self._scheduled_cancellation_ids.discard(interrupted.generation_id)
+                    self._cancellation_failures.pop(interrupted.generation_id, None)
+                    self._cancellation_retry_at.pop(interrupted.generation_id, None)
                 continue
             try:
                 self.cancel_generation(interrupted)
                 self.store.complete_generation_cleanup(interrupted.generation_id)
                 with self._cancellation_lock:
                     self._scheduled_cancellation_ids.discard(interrupted.generation_id)
+                    self._cancellation_failures.pop(interrupted.generation_id, None)
+                    self._cancellation_retry_at.pop(interrupted.generation_id, None)
             except Exception as exc:
                 all_succeeded = False
                 with self._cancellation_lock:
                     self._scheduled_cancellation_ids.discard(interrupted.generation_id)
-                self._schedule_cancellation(interrupted)
+                    failures = self._cancellation_failures.get(interrupted.generation_id, 0) + 1
+                    self._cancellation_failures[interrupted.generation_id] = failures
+                    delay = min(
+                        self.cancellation_retry_max_seconds,
+                        self.cancellation_retry_base_seconds * (2 ** min(failures - 1, 16)),
+                    )
+                    self._cancellation_retry_at[interrupted.generation_id] = time.monotonic() + delay
                 if self.on_error:
                     self.on_error(exc)
         self._refill_cancellations()
@@ -247,6 +261,8 @@ class TelegramUpdateRouter:
     def _schedule_cancellation(self, interrupted: InterruptedGeneration) -> None:
         with self._cancellation_lock:
             if interrupted.generation_id in self._scheduled_cancellation_ids:
+                return
+            if time.monotonic() < self._cancellation_retry_at.get(interrupted.generation_id, 0.0):
                 return
             try:
                 self._cancellations.put_nowait(interrupted)

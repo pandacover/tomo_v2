@@ -2,6 +2,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 from tomo_core.onboarding_store import TelegramOnboardingStore
 from tomo_core.onboarding_store import TelegramGenerationWork
@@ -266,6 +267,8 @@ class TelegramUpdateRouterTests(unittest.TestCase):
             router.poll_once()
 
             self.assertFalse(router.drain_cancellations())
+            self.assertFalse(router.drain_cancellations())
+            self.assertEqual(calls, [active.generation_id])
             recovered = TelegramUpdateRouter(
                 client=FakeTelegramClient([]),
                 store=store,
@@ -282,6 +285,36 @@ class TelegramUpdateRouterTests(unittest.TestCase):
                 cancel_generation=lambda _: self.fail("cleanup replayed after receipt"),
             )
             self.assertFalse(restarted.drain_cancellations())
+
+    def test_failed_cleanup_retries_after_cooldown_in_same_router(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TelegramOnboardingStore(tmp)
+            installation = install_chat(store)
+            store.enqueue_update(1, "123", '{"update_id":1}', now=0, update_kind="message", message_id="1", tomo_id=installation.tomo_id)
+            active = store.claim_next_work(now=1)
+            calls = []
+
+            def flaky_cancel(interrupted):
+                calls.append(interrupted.generation_id)
+                if len(calls) == 1:
+                    raise RuntimeError("transient delete failure")
+
+            with patch("tomo_core.telegram_router.time.monotonic", return_value=100.0):
+                router = TelegramUpdateRouter(
+                    client=FakeTelegramClient([private_update(2)]),
+                    store=store,
+                    process_update=lambda _: None,
+                    cancel_generation=flaky_cancel,
+                )
+                router.poll_once()
+                self.assertFalse(router.drain_cancellations())
+                self.assertFalse(router.drain_cancellations())
+
+            with patch("tomo_core.telegram_router.time.monotonic", return_value=101.0):
+                self.assertTrue(router.drain_cancellations())
+
+            self.assertEqual(calls, [active.generation_id, active.generation_id])
+            self.assertEqual(store.pending_generation_cleanups(), ())
 
     def test_bounded_cleanup_queue_refills_without_dropping_durable_work(self):
         with tempfile.TemporaryDirectory() as tmp:
