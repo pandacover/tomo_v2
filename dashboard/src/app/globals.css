@@ -560,7 +560,8 @@ a {
   letter-spacing: 0.08em;
 }
 
-.login-form .form-input {
+.login-form .form-input,
+.reset-card .form-input {
   border: 0;
   border-bottom: 1px solid rgb(247 240 232 / 0.42);
   background: rgb(10 11 9 / 0.34);
@@ -571,12 +572,14 @@ a {
   letter-spacing: 0;
 }
 
-.login-form .form-input:focus {
+.login-form .form-input:focus,
+.reset-card .form-input:focus {
   border-bottom-color: #f0b28f;
   box-shadow: 0 2px 0 #f0b28f;
 }
 
-.login-form .submit-button {
+.login-form .submit-button,
+.reset-card .submit-button {
   width: fit-content;
   margin-top: 0.75rem;
   padding: 0 0.1rem 0.45rem;
@@ -590,13 +593,15 @@ a {
   letter-spacing: 0.07em;
 }
 
-.login-form .submit-button:hover {
+.login-form .submit-button:hover,
+.reset-card .submit-button:hover {
   border-bottom-color: #f0b28f;
   background: transparent;
   color: #f0b28f;
 }
 
 .login-form .submit-button:focus-visible,
+.reset-card .submit-button:focus-visible,
 .login-mode-toggle:focus-visible {
   outline: 2px solid #f7f0e8;
   outline-offset: 3px;
@@ -626,6 +631,57 @@ a {
   color: #ffc0aa;
   font-size: 0.85rem;
   font-weight: 600;
+}
+.reset-page {
+  width: 100%;
+  color: #f7f0e8;
+}
+
+.reset-card {
+  width: min(100%, 32rem);
+}
+
+.reset-card h1 {
+  max-width: 10ch;
+  margin: 2.75rem 0 2rem;
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: clamp(3.3rem, 7vw, 5.75rem);
+  font-weight: 400;
+  letter-spacing: -0.075em;
+  line-height: 0.9;
+}
+
+.reset-card .action-link {
+  border-color: rgb(247 240 232 / 0.8);
+  color: #f7f0e8;
+}
+
+.reset-form {
+  display: grid;
+  gap: 1.2rem;
+}
+
+.account-security {
+  display: grid;
+  gap: 0.65rem;
+  margin: 3rem 0;
+  border-top: 1px solid var(--color-tomo-line);
+  border-bottom: 1px solid var(--color-tomo-line);
+  padding: 1.3rem 0;
+}
+
+.account-security h2,
+.account-security p {
+  margin: 0;
+}
+
+.account-security h2 {
+  font-size: 1.2rem;
+}
+
+.account-security p:not(.field-label) {
+  color: var(--color-tomo-muted);
+  font-size: 0.9rem;
 }
 
 .tomos-page {

@@ -1,9 +1,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { dash } from '@better-auth/infra';
+import { createEmailSender, dash } from '@better-auth/infra';
 import { betterAuth } from 'better-auth';
 import { getMigrations } from 'better-auth/db/migration';
 import { dashboardEnv, requireDashboardEnv } from './env';
+import { deliverResetPasswordEmail } from './reset-password';
 
 type SqliteDatabase = unknown;
 
@@ -41,6 +42,13 @@ async function createAuth() {
     emailAndPassword: {
       enabled: true,
       autoSignIn: true,
+      revokeSessionsOnPasswordReset: true,
+      sendResetPassword: async ({ user, url }) => {
+        await deliverResetPasswordEmail(
+          createEmailSender({ apiKey: requireDashboardEnv('betterAuthApiKey') }),
+          { user, url },
+        );
+      },
     },
     trustedOrigins: [dashboardEnv.betterAuthUrl],
     ...(hostedAuth

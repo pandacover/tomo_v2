@@ -3,6 +3,7 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import Link from 'next/link';
 import type { PeerDashboard, PeerHistoryEntry, PeerRelationship } from '@/lib/peer-types';
+import { authClient } from '@/lib/auth-client';
 
 const handlePattern = /^[a-z0-9_]{3,32}$/;
 const trustCopy = 'another tomo can ask yours questions. it cannot use your tools, accounts, files, credentials, or authority.';
@@ -27,6 +28,25 @@ export function TomoRelationships({ initial }: { initial: PeerDashboard | null }
   const [loading, setLoading] = useState(initial === null);
   const [busy, setBusy] = useState('');
   const [history, setHistory] = useState<Record<string, PeerHistoryEntry[]>>({});
+  const { data: session } = authClient.useSession();
+  const [securityStatus, setSecurityStatus] = useState('');
+  const [securityBusy, setSecurityBusy] = useState(false);
+
+  async function resetPassword() {
+    if (!session?.user.email || securityBusy) return;
+    setSecurityBusy(true); setSecurityStatus('');
+    try {
+      const result = await authClient.requestPasswordReset({
+        email: session.user.email,
+        redirectTo: new URL('/reset-password', window.location.origin).toString(),
+      });
+      setSecurityStatus(result.error ? 'could not send a reset link. try again.' : 'a reset link is on its way.');
+    } catch {
+      setSecurityStatus('could not send a reset link. try again.');
+    } finally {
+      setSecurityBusy(false);
+    }
+  }
 
   async function refresh() {
     const value = await request('/api/peers') as PeerDashboard;
@@ -93,6 +113,7 @@ export function TomoRelationships({ initial }: { initial: PeerDashboard | null }
       {error && <p className="tomos-error" role="alert">{error} {!dashboard && <button onClick={() => void refresh().catch(() => setError('connections could not be loaded. try again.'))}>retry</button>}</p>}
       {loading && <p role="status">loading connections...</p>}
       {!loading && !dashboard ? null : dashboard && (dashboard.relationships.length === 0 ? <p className="tomos-empty">no tomo connections yet.</p> : <div className="tomos-list">{dashboard.relationships.map((relationship) => <RelationshipRow key={`${relationship.relationshipId}:${relationship.relationshipRevision}:${relationship.grant?.revision ?? 0}`} relationship={relationship} busy={busy} history={history[relationship.relationshipId]} onAction={action} onHistory={loadHistory} />)}</div>)}
+      <section className="account-security" aria-labelledby="account-security-heading"><p className="field-label">account security</p><h2 id="account-security-heading">reset password</h2><p>send a reset link to your signed-in email.</p><button className="login-mode-toggle" type="button" onClick={() => void resetPassword()} disabled={securityBusy || !session?.user.email}>{securityBusy ? 'sending...' : 'send reset link'}</button><p role="status">{securityStatus}</p></section>
       {dashboard && dashboard.relationships.length > 0 && <PrivacyControls relationships={dashboard.relationships} selected={purgeTarget || dashboard.relationships[0].relationshipId} onSelect={setPurgeTarget} confirmation={purgeConfirmation} onConfirmation={setPurgeConfirmation} onPurge={purgeHistory} busy={Boolean(busy)} status={privacyStatus} />}
     </main>
   </section>;
