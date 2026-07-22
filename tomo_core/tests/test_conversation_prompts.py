@@ -76,6 +76,40 @@ class ConversationPromptTests(unittest.TestCase):
         self.assertNotIn("TOMO_CONNECTIONS_SKILL", system)
         self.assertIn("Call cron", messages[-1]["content"])
 
+    def test_peer_first_segment_repair_reuses_peer_output_contract(self):
+        turn = PeerTurn("peer-request", 1, "relationship", "thread", "peer-request", "alice", "peer_exchange", "ordinary_message", "hello", "2026-01-01T00:15:00+00:00")
+        request = ConversationRequest(turn, self.soul, self.history)
+
+        messages = build_first_segment_repair_messages(
+            request,
+            ContextHydrator().hydrate(request),
+            TurnBudget(1, 0, 0, 1, 3, 3, 800),
+            "missing_frame",
+        )
+
+        system = messages[0]["content"]
+        self.assertIn("previous segment violated the JSONL contract: missing_frame", system)
+        self.assertIn("Controls are unavailable; emit frames only after an optional turn_plan", system)
+        self.assertNotIn("memory_control", system)
+        self.assertNotIn('"reaction":null', system)
+
+    def test_peer_later_segment_repair_reuses_peer_output_contract(self):
+        turn = PeerTurn("peer-request", 1, "relationship", "thread", "peer-request", "alice", "peer_exchange", "ordinary_message", "hello", "2026-01-01T00:15:00+00:00")
+        request = ConversationRequest(turn, self.soul, self.history)
+
+        messages = build_segment_repair_messages(
+            request,
+            ContextHydrator().hydrate(request),
+            TurnBudget(2, 1, 1, 1, 3, 3, 800),
+            MovePlan.direct_answer(),
+            "missing_frame",
+        )
+
+        system = messages[0]["content"]
+        self.assertIn("previous segment violated the JSONL contract: missing_frame", system)
+        self.assertIn("Controls are unavailable; emit frame records only", system)
+        self.assertNotIn("memory_control", system)
+
     def test_current_vision_evidence_is_only_in_user_json_payload(self):
         envelope = InboundEnvelope(
             "telegram",

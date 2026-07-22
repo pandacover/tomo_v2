@@ -67,12 +67,7 @@ def build_segment_repair_messages(
     frame_count = _frame_count_phrase(budget.max_frames_per_segment)
     _prepend_repair_instruction(
         messages,
-        render_later_segment_contract(
-            max_frames=budget.max_frames_per_segment,
-            max_sentences=budget.max_sentences_per_frame,
-            max_chars=budget.max_chars_per_frame,
-            native_tools_available=bool(tool_schemas),
-        ),
+        _later_segment_contract(request, budget, tool_schemas),
         (
             f"the previous segment violated the JSONL contract: {safe_code}. "
             f"replace it with {frame_count} frame records only. preserve the fixed turn plan exactly. "
@@ -106,12 +101,7 @@ def build_first_segment_repair_messages(
     )
     _prepend_repair_instruction(
         messages,
-        render_first_segment_contract(
-            max_frames=budget.max_frames_per_segment,
-            max_sentences=budget.max_sentences_per_frame,
-            max_chars=budget.max_chars_per_frame,
-            native_tools_available=bool(tool_schemas),
-        ),
+        _first_segment_contract(request, budget, tool_schemas),
         (
             f"the previous segment violated the JSONL contract: {safe_code}. "
             "replace the entire segment with a canonical turn_plan plus mandatory frame records. "
@@ -148,12 +138,7 @@ def _first_segment_system(request: ConversationRequest, budget: TurnBudget, tool
         f"{render_capability_skill_index(include_visual_evidence=_needs_visual_evidence_skill(request), include_tomo_connections=connections)}\n\n"
         f"<TOMO_SOUL>\n{request.soul}\n</TOMO_SOUL>\n\n"
         f"move planning vocabulary:\n{render_move_procedures(tuple(ConversationMove))}\n\n"
-        + render_first_segment_contract(
-            max_frames=budget.max_frames_per_segment,
-            max_sentences=budget.max_sentences_per_frame,
-            max_chars=budget.max_chars_per_frame,
-            native_tools_available=bool(tool_schemas),
-        )
+        + _first_segment_contract(request, budget, tool_schemas)
     )
 
 
@@ -183,12 +168,7 @@ def _later_segment_system(request: ConversationRequest, budget: TurnBudget, plan
         f"{render_capability_skill_index(include_visual_evidence=_needs_visual_evidence_skill(request), include_tomo_connections=connections)}\n\n"
         f"<TOMO_SOUL>\n{request.soul}\n</TOMO_SOUL>\n\n"
         f"fixed turn plan: primary_move={plan.primary.value}; supporting_moves={supporting}; confidence={plan.confidence.value}.\n\n"
-        + render_later_segment_contract(
-            max_frames=budget.max_frames_per_segment,
-            max_sentences=budget.max_sentences_per_frame,
-            max_chars=budget.max_chars_per_frame,
-            native_tools_available=bool(tool_schemas),
-        )
+        + _later_segment_contract(request, budget, tool_schemas)
     )
 
 
@@ -222,25 +202,47 @@ def _peer_guidance(tool_schemas: tuple[dict[str, object], ...], scope: str = "no
 
 
 def _peer_first_segment_system(request: ConversationRequest, budget: TurnBudget, tool_schemas: tuple[dict[str, object], ...]) -> str:
-    contract = render_first_segment_contract(
-        max_frames=budget.max_frames_per_segment,
-        max_sentences=budget.max_sentences_per_frame,
-        max_chars=budget.max_chars_per_frame,
-        native_tools_available=bool(tool_schemas),
-    ).replace("memory_control records are optional, strictly validated, and must precede frame records.\n", "Controls are unavailable; emit frames only after an optional turn_plan.\n").replace("; reaction is one of 👍, ❤️, 😂, 🔥, 🥰, 👏, 🤔, 👀, 🙏, 🫡 or null.\n", ".\n").replace(',"reaction":null', "")
-    return _peer_guidance(tool_schemas, request.burst.disclosure_scope).replace("{soul}", request.soul) + contract
+    return _peer_guidance(tool_schemas, request.burst.disclosure_scope).replace("{soul}", request.soul) + _first_segment_contract(request, budget, tool_schemas)
 
 
 def _peer_later_segment_system(request: ConversationRequest, budget: TurnBudget, plan: MovePlan, tool_schemas: tuple[dict[str, object], ...]) -> str:
     supporting = ",".join(move.value for move in plan.supporting) or "none"
     return _peer_guidance(tool_schemas, request.burst.disclosure_scope).replace("{soul}", request.soul) + (
         f"fixed turn plan: primary_move={plan.primary.value}; supporting_moves={supporting}; confidence={plan.confidence.value}.\n\n"
-        + render_later_segment_contract(
-            max_frames=budget.max_frames_per_segment,
-            max_sentences=budget.max_sentences_per_frame,
-            max_chars=budget.max_chars_per_frame,
-            native_tools_available=bool(tool_schemas),
-        ).replace("use only optional memory_control records before frame records; they are strictly validated.\n", "Controls are unavailable; emit frame records only.\n")
+        + _later_segment_contract(request, budget, tool_schemas)
+    )
+
+
+def _first_segment_contract(request: ConversationRequest, budget: TurnBudget, tool_schemas: tuple[dict[str, object], ...]) -> str:
+    contract = render_first_segment_contract(
+        max_frames=budget.max_frames_per_segment,
+        max_sentences=budget.max_sentences_per_frame,
+        max_chars=budget.max_chars_per_frame,
+        native_tools_available=bool(tool_schemas),
+    )
+    if not isinstance(request.burst, PeerTurn):
+        return contract
+    return contract.replace(
+        "memory_control records are optional, strictly validated, and must precede frame records.\n",
+        "Controls are unavailable; emit frames only after an optional turn_plan.\n",
+    ).replace(
+        "; reaction is one of 👍, ❤️, 😂, 🔥, 🥰, 👏, 🤔, 👀, 🙏, 🫡 or null.\n",
+        ".\n",
+    ).replace(',"reaction":null', "")
+
+
+def _later_segment_contract(request: ConversationRequest, budget: TurnBudget, tool_schemas: tuple[dict[str, object], ...]) -> str:
+    contract = render_later_segment_contract(
+        max_frames=budget.max_frames_per_segment,
+        max_sentences=budget.max_sentences_per_frame,
+        max_chars=budget.max_chars_per_frame,
+        native_tools_available=bool(tool_schemas),
+    )
+    if not isinstance(request.burst, PeerTurn):
+        return contract
+    return contract.replace(
+        "use only optional memory_control records before frame records; they are strictly validated.\n",
+        "Controls are unavailable; emit frame records only.\n",
     )
 
 
