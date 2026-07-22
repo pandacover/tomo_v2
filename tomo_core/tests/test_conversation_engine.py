@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 from tomo_core.conversation import ConversationEngine, ConversationRequest, FrameReady, MemoryControlReady, ReactionWindowReady, SegmentFinish, TurnBudget, TurnRunCompleted, TurnRunStarted, TurnRunStatus
 from tomo_core.conversation.parsing import ConversationOutputError
-from tomo_core.models import InboundEnvelope, ResponseContract
+from tomo_core.models import InboundEnvelope, PeerTurn, ResponseContract
 from tomo_core.providers import ProviderSetupRequired, ProviderStreamCompleted, ProviderTextDelta, ProviderToolCallReady
 
 
@@ -85,6 +85,29 @@ class ConversationEngineTests(unittest.TestCase):
         self.assertEqual(len(completed.result.frames), 2)
         self.assertEqual(completed.result.segments[0].finish, SegmentFinish.COMPLETE)
         self.assertTrue(provider.iterators[0].closed)
+
+    def test_peer_turn_streams_without_connector_actor_identity(self):
+        provider = ScriptedProvider([[
+            ProviderTextDelta('{"type":"frame","text":"Safe answer."}\n'),
+            ProviderStreamCompleted("stop"),
+        ]])
+        turn = PeerTurn(
+            "peer-generation",
+            1,
+            "relationship",
+            "thread",
+            "peer-request",
+            "alice",
+            "question",
+            "ordinary_message",
+            "hello",
+            "2099-01-01T00:15:00+00:00",
+        )
+
+        result = ConversationEngine(provider).respond(ConversationRequest(turn, "SOUL SENTINEL", ()))
+
+        self.assertEqual([frame.text for frame in result.frames], ["Safe answer."])
+        self.assertEqual(provider.calls[0][2], None)
 
     def test_no_tools_three_frame_reply_completes_with_exactly_three_frames(self):
         provider = ScriptedProvider([[

@@ -7,7 +7,7 @@ from dataclasses import replace
 
 from ..context import ContextHydrator
 from ..delivery import split_sentences
-from ..models import AutomationTurn, ResponseContract
+from ..models import AutomationTurn, PeerTurn, ResponseContract
 from ..providers import ProviderAdapter, ProviderSetupRequired, ProviderStreamCompleted, ProviderTextDelta, ProviderToolCallReady
 from ..tool_execution import ToolBatchCancelled, ToolBatchValidationError, ToolExecutor
 from ..tools import ToolRegistry
@@ -292,7 +292,12 @@ class ConversationEngine:
                 emit_provider_stage("sandbox_provider_attempt_start")
 
                 try:
-                    actor_id = request.burst.actor_id if isinstance(request.burst, AutomationTurn) else request.burst.latest.actor_id
+                    if isinstance(request.burst, AutomationTurn):
+                        actor_id = request.burst.actor_id
+                    elif isinstance(request.burst, PeerTurn):
+                        actor_id = None
+                    else:
+                        actor_id = request.burst.latest.actor_id
                     stream = self.provider.stream(messages, tools=schemas, actor_id=actor_id)
                 except ProviderSetupRequired as error:
                     emit_provider_attempt("error")
