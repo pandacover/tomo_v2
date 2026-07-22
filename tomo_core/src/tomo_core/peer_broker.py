@@ -46,6 +46,26 @@ _SELF_LOCATION = re.compile(
 )
 
 
+def canonicalize_availability(peer_handle: str, message: str) -> str:
+    """Convert only an exact selected handle in a direct availability question."""
+    if not isinstance(peer_handle, str) or not isinstance(message, str):
+        return message
+    handle = re.escape(peer_handle)
+    patterns = (
+        (rf"^(?P<prefix>\s*)(?P<word>when)\s+is\s+@?{handle}\s+free\b(?P<suffix>.*)$", "when are you free"),
+        (rf"^(?P<prefix>\s*)(?P<word>is)\s+@?{handle}\s+available\b(?P<suffix>.*)$", "are you available"),
+        (rf"^(?P<prefix>\s*)@?{handle}'s\s+availability\b(?P<suffix>.*)$", "your availability"),
+    )
+    for pattern, replacement in patterns:
+        match = re.match(pattern, message, re.I)
+        if match is not None:
+            first = match.groupdict().get("word", "")
+            if first[:1].isupper():
+                replacement = replacement[:1].upper() + replacement[1:]
+            return f"{match.group('prefix')}{replacement}{match.group('suffix')}"
+    return message
+
+
 def classify(kind: RequestKind | str, purpose: str, message: str) -> tuple[RequestKind, RequestAction, str]:
     """Ignore caller labels and return only bounded, host-trusted values."""
     # Purpose and kind are peer/model-authored labels. They may narrow policy,

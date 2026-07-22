@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
@@ -43,6 +44,8 @@ class PeerApiClient:
     opener: Callable[..., object] = urlopen
     sleeper: Callable[[float], None] = time.sleep
     clock: Callable[[], float] = time.monotonic
+    utc_now: Callable[[], datetime] = lambda: datetime.now(UTC)
+    _listed_relationships: dict[str, dict[str, object]] = field(default_factory=dict, init=False, repr=False)
 
     def request(
         self, method: str, path: str, body: dict[str, object] | None = None, *, raw: bool = False
@@ -94,9 +97,20 @@ class PeerApiClient:
         return result if raw else _observation(result)
 
     def list_relationships(self) -> dict[str, object]:
-        return _relationship_observation(
-            self.request("GET", "/v1/peer-agent/relationships", raw=True)
+        observation = _relationship_observation(
+            self.request("GET", "/v1/peer-agent/relationships", raw=True), self.utc_now()
         )
+        self._listed_relationships.clear()
+        relationships = observation.get("relationships")
+        if isinstance(relationships, list):
+            self._listed_relationships.update(
+                {
+                    relationship["peer_handle"]: relationship
+                    for relationship in relationships
+                    if isinstance(relationship, dict) and isinstance(relationship.get("peer_handle"), str)
+                }
+            )
+        return observation
 
     def inspect_request(self, request_id: str) -> dict[str, object]:
         return self.request(
@@ -104,6 +118,14 @@ class PeerApiClient:
         )
 
     def ask(self, arguments: dict[str, object]) -> dict[str, object]:
+        handle = arguments.get("peer_handle")
+        relationship = self._listed_relationships.get(handle) if isinstance(handle, str) else None
+        if not isinstance(relationship, dict) or not (
+            relationship.get("status") == "active"
+            and relationship.get("can_ask") is True
+            and relationship.get("peer_auto_reply") is True
+        ):
+            return {"ok": False, "status": "failed"}
         body = {
             "peerHandle": arguments["peer_handle"],
             "purpose": arguments["purpose"],
@@ -147,7 +169,7 @@ def peer_registry(client: PeerApiClient) -> ToolRegistry:
         BoundTool(
             ToolSpec(
                 "peer_list",
-                "List relationships available to this conversation.",
+                "List connected Tomos and their safe readiness fields. Follow the indexed tomo-connections contract.",
                 {"type": "object", "properties": {}, "additionalProperties": False},
                 read_only=True,
                 parallel_safe=True,
@@ -159,7 +181,7 @@ def peer_registry(client: PeerApiClient) -> ToolRegistry:
         BoundTool(
             ToolSpec(
                 "peer_ask",
-                "Ask a connected peer a bounded question and wait for its terminal result.",
+                "Ask a connected Tomo under the indexed tomo-connections contract and wait for its result.",
                 {
                     "type": "object",
                     "properties": {
@@ -191,7 +213,7 @@ def peer_registry(client: PeerApiClient) -> ToolRegistry:
             ),
             client.ask,
         ),
-        BoundTool(ToolSpec("peer_resume", "Retrieve the latest safe result for an existing peer thread.", {"type": "object", "properties": {"thread_id": identifier}, "required": ["thread_id"], "additionalProperties": False}, read_only=True, parallel_safe=True, internal_context=False, unattended_safe=False), client.resume),
+        BoundTool(ToolSpec("peer_resume", "Retrieve a safe peer result under the indexed tomo-connections contract.", {"type": "object", "properties": {"thread_id": identifier}, "required": ["thread_id"], "additionalProperties": False}, read_only=True, parallel_safe=True, internal_context=False, unattended_safe=False), client.resume),
     )
     return ToolRegistry(tools)
 
@@ -216,7 +238,34 @@ def _observation(value: object) -> dict[str, object]:
     return result
 
 
-def _relationship_observation(value: object) -> dict[str, object]:
+def _effective_grant_flags(status: str, grant: object, peer_grant: object, now: datetime) -> tuple[bool, bool, bool]:
+    if status != "active":
+        return False, False, False
+    return (
+        _grant_allows(grant, "communicate", now),
+        _grant_allows(peer_grant, "autoReply", now),
+        _grant_allows(peer_grant, "shareAvailability", now),
+    )
+
+
+def _grant_allows(grant: object, flag: str, now: datetime) -> bool:
+    if not isinstance(grant, dict) or grant.get(flag) is not True:
+        return False
+    expires_at = grant.get("expiresAt", grant.get("expires_at"))
+    if expires_at is None:
+        return True
+    if not isinstance(expires_at, str):
+        return False
+    try:
+        expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if expiry.tzinfo is None:
+        return False
+    return expiry > now
+
+
+def _relationship_observation(value: object, now: datetime) -> dict[str, object]:
     if not isinstance(value, dict) or value.get("ok") is False:
         return {"ok": False, "status": "failed", "relationships": []}
     rows = value.get("relationships")
@@ -228,10 +277,16 @@ def _relationship_observation(value: object) -> dict[str, object]:
             handle = row.get("peerHandle", row.get("peer_handle"))
             status = row.get("status")
             if isinstance(handle, str) and isinstance(status, str):
+                grant = row.get("grant")
+                peer_grant = row.get("peerGrant", row.get("peer_grant"))
+                can_ask, peer_auto_reply, peer_share_availability = _effective_grant_flags(status, grant, peer_grant, now)
                 safe.append(
                     {
                         "peer_handle": handle[:32],
                         "status": status[:32],
+                        "can_ask": can_ask,
+                        "peer_auto_reply": peer_auto_reply,
+                        "peer_share_availability": peer_share_availability,
                     }
                 )
     return {"ok": True, "status": "completed", "relationships": safe}

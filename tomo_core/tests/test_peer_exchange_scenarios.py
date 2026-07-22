@@ -65,13 +65,31 @@ class PeerExchangeScenarioTests(unittest.TestCase):
     def test_availability_is_allowed_without_confirmation_and_same_thread_sequences(self):
         self.exchange.update_grant("b", self.relationship.relationship_id, "a", False, True, True, 1, now=self.now)
         first = self.exchange.submit("a", "bob", "source-1", "call-1", "availability", "Are you free this afternoon?", now=self.now, thread_id="thread")
-        second = self.exchange.submit("a", "bob", "source-2", "call-2", "availability", "What about tomorrow?", now=self.now, thread_id="thread")
+        second = self.exchange.submit("a", "bob", "source-2", "call-2", "availability", "Are you available tomorrow?", now=self.now, thread_id="thread")
         dispatch = self._run(_Dispatch('{"status":"free","window":"afternoon"}'))
         self._run(dispatch)
 
         self.assertEqual((first.status, second.status), ("pending", "pending"))
         self.assertEqual([turn.revision for turn in dispatch.turns], [1, 2])
         self.assertEqual(len(self.exchange.relationship_history("a", self.relationship.relationship_id)), 2)
+
+    def test_availability_canonicalizes_exact_target_and_rejects_non_direct_requests(self):
+        self.exchange.update_grant("b", self.relationship.relationship_id, "a", False, True, True, 1, now=self.now)
+        request = self.exchange.submit("a", "bob", "source-1", "call-1", "ordinary_message", "When is Bob free this Friday afternoon?", now=self.now)
+        dispatch = self._run()
+
+        self.assertEqual(dispatch.turns[0].message, "When are you free this Friday afternoon?")
+        self.assertEqual(dispatch.turns[0].disclosure_scope, "availability")
+        for message in ("When is cora free?", "When is bob's sister free?"):
+            with self.subTest(message=message), self.assertRaisesRegex(PeerError, "unsafe_action"):
+                self.exchange.submit("a", "bob", "source-2", message, "availability", message, now=self.now)
+
+    def test_direct_second_person_availability_is_allowed(self):
+        self.exchange.update_grant("b", self.relationship.relationship_id, "a", False, True, True, 1, now=self.now)
+
+        request = self.exchange.submit("a", "bob", "source", "call", "availability", "Are you available tomorrow?", now=self.now)
+
+        self.assertEqual(request.status, "pending")
 
     def test_sensitive_confirmation_runs_once_only_after_exact_approval_and_replay_loses(self):
         request = self.exchange.submit("a", "bob", "source", "call", "sensitive", "Can you share your exact calendar details?", now=self.now)

@@ -6,6 +6,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import replace
 
 from ..context import ContextHydrator
+from ..delivery import split_sentences
 from ..models import AutomationTurn, ResponseContract
 from ..providers import ProviderAdapter, ProviderSetupRequired, ProviderStreamCompleted, ProviderTextDelta, ProviderToolCallReady
 from ..tool_execution import ToolBatchCancelled, ToolBatchValidationError, ToolExecutor
@@ -85,6 +86,7 @@ class ConversationEngine:
         output_tokens: int | None = None
         reaction_window_emitted = False
         mutating_execution_attempted = False
+        pending_peer_resume = False
 
         def expired() -> bool:
             return self.monotonic_clock() - started_at >= self.budget.max_elapsed_seconds
@@ -100,14 +102,33 @@ class ConversationEngine:
             if not is_active():
                 return
             if expired():
+                if pending_peer_resume:
+                    frame = Frame(
+                        index,
+                        0,
+                        _bounded_peer_text(
+                            _PEER_PENDING,
+                            self.budget.max_chars_per_frame,
+                            self.budget.max_sentences_per_frame,
+                        ),
+                    )
+                    segments.append(SegmentResult(index, (frame,), (), SegmentFinish.COMPLETE))
+                    frames.append(frame)
+                    yield FrameReady(len(frames) - 1, frame)
+                    if not is_active():
+                        return
+                    yield completed(TurnRunStatus.COMPLETED)
+                    return
                 if segments and frames:
                     if not is_active():
                         return
                     yield completed(TurnRunStatus.COMPLETED_PARTIAL)
                     return
                 raise ConversationOutputError("elapsed_budget_exhausted")
-            allow_tools = not mutating_execution_attempted and bool(self.tool_registry.schemas()) and index < self.budget.max_model_segments - 1 and sum(bool(s.frames) for s in segments) < self.budget.max_visible_segments - 1 and sum(s.finish is SegmentFinish.TOOL_BATCH for s in segments) < self.budget.max_tool_rounds and sum(len(s.tool_calls) for s in segments) < self.budget.max_tool_calls
+            allow_tools = (not mutating_execution_attempted or pending_peer_resume) and bool(self.tool_registry.schemas()) and index < self.budget.max_model_segments - 1 and sum(bool(s.frames) for s in segments) < self.budget.max_visible_segments - 1 and sum(s.finish is SegmentFinish.TOOL_BATCH for s in segments) < self.budget.max_tool_rounds and sum(len(s.tool_calls) for s in segments) < self.budget.max_tool_calls
             schemas = self.tool_registry.schemas() if allow_tools else ()
+            if pending_peer_resume:
+                schemas = tuple(schema for schema in schemas if schema.get("function", {}).get("name") == "peer_resume")
             replacement = False
             repair_code: str | None = None
             while True:
@@ -138,6 +159,7 @@ class ConversationEngine:
                 native_calls: list[ProviderToolCallReady] = []
                 segment_frames: list[Frame] = []
                 segment_memory_controls = []
+                pending_memory_control_events: list[tuple[int, object, tuple[str, ...]]] = []
                 terminal: ProviderStreamCompleted | None = None
                 failure: ConversationOutputError | None = None
                 attempt_started_at = self.monotonic_clock()
@@ -216,13 +238,19 @@ class ConversationEngine:
                             return
                         yield from yield_provider_event(TurnRunStarted(plan))
                     elif not isinstance(record, Frame):
+                        if pending_peer_resume:
+                            # A pending peer result cannot ground durable memory.
+                            return
                         if sum(len(segment.memory_controls) for segment in segments) + len(segment_memory_controls) >= 8:
                             raise ConversationOutputError("memory_control_turn_limit")
                         segment_memory_controls.append(record)
-                        if not is_active():
-                            return
-                        yield from yield_provider_event(MemoryControlReady(index, record, tuple(sorted(tool_observation_ids))))
+                        pending_memory_control_events.append((index, record, tuple(sorted(tool_observation_ids))))
+                        if not schemas:
+                            yield from emit_segment_memory_controls()
                     else:
+                        if pending_peer_resume:
+                            # Until resume completes, model-authored frames are ungrounded.
+                            return
                         if len(frames) + len(segment_frames) - emitted_frame_count >= 3:
                             raise ConversationOutputError("frame_limit")
                         if (not segment_frames and sum(bool(s.frames) for s in segments) >= self.budget.max_visible_segments):
@@ -250,6 +278,16 @@ class ConversationEngine:
                         if not is_active():
                             return
                         yield from yield_provider_event(FrameReady(len(frames) - 1, frame))
+
+                emitted_memory_control_count = 0
+
+                def emit_segment_memory_controls() -> Iterator[TurnRunEvent]:
+                    nonlocal emitted_memory_control_count
+                    for segment_index, control, observation_ids in pending_memory_control_events[emitted_memory_control_count:]:
+                        emitted_memory_control_count += 1
+                        if not is_active():
+                            return
+                        yield from yield_provider_event(MemoryControlReady(segment_index, control, observation_ids))
 
                 emit_provider_stage("sandbox_provider_attempt_start")
 
@@ -354,7 +392,16 @@ class ConversationEngine:
                         failure = error
                 tool_finish = terminal is not None and terminal.finish_reason == "tool_calls"
                 mutating_tool_segment = any(self.tool_registry.is_mutating(native_call.name) for native_call in native_calls)
-                if failure is None and tool_finish and native_calls and all(self.tool_registry.is_blocked(call.name) for call in native_calls):
+                peer_tool_segment = any(native_call.name in {"peer_list", "peer_ask", "peer_resume"} for native_call in native_calls)
+                offered_tool_names = {
+                    function["name"]
+                    for schema in schemas
+                    if isinstance((function := schema.get("function")), dict) and isinstance(function.get("name"), str)
+                }
+                blocked_tool_segment = bool(native_calls) and all(self.tool_registry.is_blocked(call.name) for call in native_calls)
+                if failure is None and tool_finish and not blocked_tool_segment and any(call.name not in offered_tool_names for call in native_calls):
+                    failure = ConversationOutputError("native_tool_unavailable")
+                if failure is None and tool_finish and blocked_tool_segment:
                     if plan is None:
                         resolution = synthesized_tool_plan()
                         plan = resolution.plan
@@ -404,8 +451,12 @@ class ConversationEngine:
                 if failure is None and tool_finish:
                     if mutating_tool_segment:
                         mutating_execution_attempted = True
-                    if mutating_tool_segment:
-                        # Never persist or release an ungrounded mutating-tool announcement.
+                    if not peer_tool_segment:
+                        yield from emit_segment_memory_controls()
+                        if not is_active():
+                            return
+                    if mutating_tool_segment or peer_tool_segment:
+                        # Peer and mutating tools cannot ground pre-observation announcements.
                         segment_frames.clear()
                     else:
                         # A validated read-only announcement may stay progressive.
@@ -432,25 +483,103 @@ class ConversationEngine:
                         if is_active():
                             # A batch is all tools in one model segment, never individual tools.
                             latency_trace.emit_sandbox("sandbox_tool_batch", elapsed_ms=max(0, int((self.monotonic_clock() - tool_started_at) * 1000)), segment=index, repair=repairs)
-                        segments.append(SegmentResult(index, tuple(segment_frames), batch.tool_calls, SegmentFinish.TOOL_BATCH, tuple(segment_memory_controls)))
+                        peer_pending = _peer_is_pending(batch)
+                        if peer_tool_segment and expired() and not peer_pending:
+                            segments.append(SegmentResult(index, (), batch.tool_calls, SegmentFinish.TOOL_BATCH))
+                            if frames:
+                                yield completed(TurnRunStatus.COMPLETED_PARTIAL)
+                                return
+                            raise ConversationOutputError("elapsed_budget_exhausted")
+                        peer_frames = _terminal_peer_frames(
+                            index,
+                            batch,
+                            max_frames=segment_budget.max_frames_per_segment,
+                            max_chars_per_frame=segment_budget.max_chars_per_frame,
+                            max_sentences_per_frame=segment_budget.max_sentences_per_frame,
+                        )
+                        if peer_frames is not None:
+                            # Peer-owned terminal frames cannot ground pre-result memory controls.
+                            segments.append(SegmentResult(index, (), batch.tool_calls, SegmentFinish.TOOL_BATCH))
+                            segment_frames[:] = [Frame(index + 1, frame.frame_index, frame.text) for frame in peer_frames]
+                            segments.append(SegmentResult(index + 1, tuple(segment_frames), (), SegmentFinish.COMPLETE))
+                            if not is_active():
+                                return
+                            yield from emit_segment_frames()
+                            if not is_active():
+                                return
+                            yield completed(TurnRunStatus.COMPLETED)
+                            return
+                        if peer_pending:
+                            pending_peer_resume = True
+                        segments.append(SegmentResult(index, tuple(segment_frames), batch.tool_calls, SegmentFinish.TOOL_BATCH, () if peer_tool_segment else tuple(segment_memory_controls)))
                         prior_messages.append(_assistant_continuation("".join(raw) or None, batch.tool_calls))
                         prior_messages.extend(_tool_continuation(observation) for observation in batch.observations)
-                        tool_observation_ids.update(observation.call_id for observation in batch.observations)
+                        tool_observation_ids.update(
+                            observation.call_id
+                            for observation in batch.observations
+                            if _observation_can_ground(observation)
+                        )
                         if not is_active():
                             return
                         if expired():
+                            if peer_pending:
+                                segment_frames[:] = [Frame(index + 1, 0, _bounded_peer_text(_PEER_PENDING, segment_budget.max_chars_per_frame, segment_budget.max_sentences_per_frame))]
+                                segments.append(SegmentResult(index + 1, tuple(segment_frames), (), SegmentFinish.COMPLETE))
+                                yield from emit_segment_frames()
+                                if not is_active():
+                                    return
+                                yield completed(TurnRunStatus.COMPLETED)
+                                return
                             if frames:
                                 yield completed(TurnRunStatus.COMPLETED_PARTIAL)
                                 return
                             raise ConversationOutputError("elapsed_budget_exhausted")
                         index += 1
                         break
+                if failure is not None and peer_tool_segment and not pending_peer_resume:
+                    # Validation and execution failures provide no peer observation to ground a claim.
+                    emit_provider_attempt("error")
+                    segment_frames[:] = [
+                        Frame(
+                            index,
+                            0,
+                            _bounded_peer_text(
+                                _PEER_NO_ANSWER,
+                                segment_budget.max_chars_per_frame,
+                                segment_budget.max_sentences_per_frame,
+                            ),
+                        )
+                    ]
+                    segment_memory_controls.clear()
+                    if plan is None:
+                        resolution = synthesized_tool_plan()
+                        plan = resolution.plan
+                        emit_plan_validated(resolution.source)
+                        if not is_active():
+                            return
+                        yield from yield_provider_event(TurnRunStarted(plan))
+                    segments.append(SegmentResult(index, tuple(segment_frames), (), SegmentFinish.COMPLETE))
+                    yield from emit_segment_frames()
+                    if not is_active():
+                        return
+                    yield completed(TurnRunStatus.COMPLETED)
+                    return
+                if pending_peer_resume:
+                    emit_provider_attempt("error" if failure is not None else "ok")
+                    segment_frames[:] = [Frame(index, 0, _bounded_peer_text(_PEER_PENDING, segment_budget.max_chars_per_frame, segment_budget.max_sentences_per_frame))]
+                    failure = None
+                    segments.append(SegmentResult(index, tuple(segment_frames), (), SegmentFinish.COMPLETE))
+                    yield from emit_segment_frames()
+                    if not is_active():
+                        return
+                    yield completed(TurnRunStatus.COMPLETED)
+                    return
                 if failure is None and (plan is None or not segment_frames):
                     failure = ConversationOutputError("missing_frame")
                 # Finalize after parsing and contract validation, before any tool work.
                 emit_provider_attempt("error" if failure is not None else "ok")
                 if failure is not None:
-                    if mutating_tool_segment:
+                    if mutating_tool_segment or peer_tool_segment:
                         # A failed tool segment has no observation that could ground its frame.
                         segment_frames.clear()
                     if segment_frames:
@@ -474,6 +603,9 @@ class ConversationEngine:
                     repairs += 1
                     replacement = True
                     continue
+                yield from emit_segment_memory_controls()
+                if not is_active():
+                    return
                 segments.append(SegmentResult(index, tuple(segment_frames), (), SegmentFinish.COMPLETE, tuple(segment_memory_controls)))
                 yield from emit_segment_frames()
                 if not is_active() or expired():
@@ -514,3 +646,86 @@ def _tool_continuation(observation) -> dict[str, object]:
     if observation.error_code is not None:
         content["error_code"] = observation.error_code
     return {"role": "tool", "tool_call_id": observation.call_id, "content": json.dumps(content, ensure_ascii=True, separators=(",", ":"), allow_nan=False)}
+
+
+_PEER_NO_ANSWER = "i couldn't get an answer from that tomo. check the connection permissions in tomo connections, then try again."
+_PEER_APPROVAL_PENDING = "that tomo needs their owner's approval before answering. check back after they approve it."
+_PEER_PENDING = "that tomo hasn't answered yet. i don't have an answer yet."
+
+
+def _peer_is_pending(batch) -> bool:
+    for call, observation in zip(batch.tool_calls, batch.observations):
+        if call.name not in {"peer_ask", "peer_resume"}:
+            continue
+        try:
+            value = json.loads(observation.content)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(value, dict) and value.get("ok") is True and value.get("status") == "pending":
+            return True
+    return False
+
+
+def _observation_can_ground(observation) -> bool:
+    if not observation.ok:
+        return False
+    try:
+        value = json.loads(observation.content)
+    except (TypeError, json.JSONDecodeError):
+        return observation.name not in {"peer_list", "peer_ask", "peer_resume"}
+    if observation.name in {"peer_list", "peer_ask", "peer_resume"}:
+        return isinstance(value, dict) and value.get("ok") is True and value.get("status") == "completed"
+    return not (isinstance(value, dict) and value.get("ok") is False)
+
+
+def _bounded_peer_text(preferred: str, max_chars: int, max_sentences: int) -> str:
+    return next(
+        (
+            candidate
+            for candidate in (preferred, "no peer answer.", "no answer.", "?")
+            if len(candidate) <= max_chars and len(split_sentences(candidate)) <= max_sentences
+        ),
+        "?"[:max_chars],
+    )
+
+
+def _terminal_peer_frames(
+    index: int,
+    batch,
+    *,
+    max_frames: int,
+    max_chars_per_frame: int,
+    max_sentences_per_frame: int,
+) -> list[Frame] | None:
+    """Return runtime-owned frames for terminal peer observations, failing closed."""
+    peer_observations = [
+        observation
+        for call, observation in zip(batch.tool_calls, batch.observations)
+        if call.name in {"peer_ask", "peer_resume"}
+    ]
+    if not peer_observations:
+        return None
+    observation = peer_observations[-1]
+    try:
+        value = json.loads(observation.content)
+    except (TypeError, json.JSONDecodeError):
+        value = None
+    fallback_text = _bounded_peer_text(_PEER_NO_ANSWER, max_chars_per_frame, max_sentences_per_frame)
+    fallback = [Frame(index, 0, fallback_text)]
+    if not isinstance(value, dict):
+        return fallback
+    status = value.get("status")
+    if status == "pending":
+        return None
+    if status == "completed" and value.get("ok") is True:
+        raw_frames = value.get("frames")
+        if (
+            isinstance(raw_frames, list)
+            and 0 < len(raw_frames) <= min(3, max_frames)
+            and all(isinstance(frame, str) and 0 < len(frame) <= max_chars_per_frame for frame in raw_frames)
+            and all(len(split_sentences(frame)) <= max_sentences_per_frame for frame in raw_frames)
+        ):
+            return [Frame(index, ordinal, frame) for ordinal, frame in enumerate(raw_frames)]
+    if status == "confirmation_pending":
+        return [Frame(index, 0, _bounded_peer_text(_PEER_APPROVAL_PENDING, max_chars_per_frame, max_sentences_per_frame))]
+    return fallback

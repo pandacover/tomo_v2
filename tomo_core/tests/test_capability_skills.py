@@ -1,5 +1,7 @@
 import unittest
+from pathlib import Path
 
+import tomo_core.skills as capability_skills
 from tomo_core.skills import (
     CRON_JOBS_SKILL_PATH,
     MEMORY_SKILL_PATH,
@@ -12,6 +14,38 @@ from tomo_core.skills import (
 
 
 class CapabilitySkillTests(unittest.TestCase):
+    def test_tomo_connections_skill_is_packaged_and_embedded_when_peer_tools_exist(self):
+        path = getattr(capability_skills, "TOMO_CONNECTIONS_SKILL_PATH")
+        loader = getattr(capability_skills, "load_tomo_connections_skill")
+        skill = loader()
+
+        self.assertEqual(path, "skills/tomo-connections/SKILL.md")
+        for expected in (
+            "peer_list",
+            "peer_ask",
+            "peer_resume",
+            "when is bob free?",
+            "when are you free?",
+            "confirmation_pending",
+            "never answer the requested factual question",
+            "status is active",
+            "current-turn peer_list-backed",
+            "exact selected public handle",
+            "ask the owner to clarify",
+        ):
+            self.assertIn(expected, skill)
+        rendered = render_capability_skill_index(include_tomo_connections=True)
+        self.assertIn(f"tomo-connections: {path}", rendered)
+        self.assertEqual(rendered.count("<TOMO_CONNECTIONS_SKILL>"), 1)
+        self.assertEqual(rendered.count("</TOMO_CONNECTIONS_SKILL>"), 1)
+        self.assertIn(skill, rendered)
+        self.assertNotIn("`", skill)
+
+    def test_wheel_declares_only_the_tomo_connections_skill_resource_once(self):
+        pyproject = (Path(__file__).parent.parent / "pyproject.toml").read_text(encoding="utf-8")
+
+        self.assertEqual(pyproject.count('"src/tomo_core/skills/tomo-connections/SKILL.md"'), 1)
+
     def test_memory_skill_is_packaged_nonempty_and_safe_for_system_content(self):
         skill = load_memory_skill()
 

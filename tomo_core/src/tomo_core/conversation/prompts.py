@@ -127,11 +127,14 @@ def build_first_segment_repair_messages(
 def _first_segment_system(request: ConversationRequest, budget: TurnBudget, tool_schemas: tuple[dict[str, object], ...]) -> str:
     if isinstance(request.burst, PeerTurn):
         return _peer_first_segment_system(request, budget, tool_schemas)
+    connections = _has_peer_tools(tool_schemas)
     tool_guidance = (
         "batch independent related native tool calls in one assistant response. tool announcements are optional social output, never execution telemetry; do not add redundant completion messages."
         if tool_schemas
         else "native tools are unavailable. do not call tools. finish with final frame JSONL records."
     )
+    if connections:
+        tool_guidance += " follow the indexed tomo-connections skill for connected Tomo requests."
     return (
         "you are tomo. follow the supplied SOUL completely.\n"
         "memory_control records are optional and internal. follow the indexed memory skill when emitting them.\n"
@@ -142,7 +145,7 @@ def _first_segment_system(request: ConversationRequest, budget: TurnBudget, tool
         f"{tool_guidance}\n"
         "do not offer mutation, booking, purchase, send, delete, or other side-effect capabilities unless an exposed bound tool and confirmation path exist.\n"
         + f"allowed native tool schemas: {json.dumps(tool_schemas, ensure_ascii=False, separators=(',', ':'))}\n\n"
-        f"{render_capability_skill_index(include_visual_evidence=_needs_visual_evidence_skill(request))}\n\n"
+        f"{render_capability_skill_index(include_visual_evidence=_needs_visual_evidence_skill(request), include_tomo_connections=connections)}\n\n"
         f"<TOMO_SOUL>\n{request.soul}\n</TOMO_SOUL>\n\n"
         f"move planning vocabulary:\n{render_move_procedures(tuple(ConversationMove))}\n\n"
         + render_first_segment_contract(
@@ -157,12 +160,15 @@ def _first_segment_system(request: ConversationRequest, budget: TurnBudget, tool
 def _later_segment_system(request: ConversationRequest, budget: TurnBudget, plan: MovePlan, tool_schemas: tuple[dict[str, object], ...]) -> str:
     if isinstance(request.burst, PeerTurn):
         return _peer_later_segment_system(request, budget, plan, tool_schemas)
+    connections = _has_peer_tools(tool_schemas)
     supporting = ",".join(move.value for move in plan.supporting) or "none"
     completion_guidance = (
         "either make another native tool round or complete with final frames."
         if tool_schemas
         else "native tools are unavailable. do not call tools. complete with final frame records."
     )
+    if connections:
+        completion_guidance += " follow the indexed tomo-connections skill for connected Tomo requests."
     return (
         "you are tomo. follow the supplied SOUL completely.\n"
         "memory_control records are optional and internal. follow the indexed memory skill when emitting them.\n"
@@ -174,7 +180,7 @@ def _later_segment_system(request: ConversationRequest, budget: TurnBudget, plan
         "tool announcements are optional social output, never execution telemetry.\n"
         "do not offer mutation, booking, purchase, send, delete, or other side-effect capabilities unless an exposed bound tool and confirmation path exist.\n"
         + f"allowed native tool schemas: {json.dumps(tool_schemas, ensure_ascii=False, separators=(',', ':'))}\n\n"
-        f"{render_capability_skill_index(include_visual_evidence=_needs_visual_evidence_skill(request))}\n\n"
+        f"{render_capability_skill_index(include_visual_evidence=_needs_visual_evidence_skill(request), include_tomo_connections=connections)}\n\n"
         f"<TOMO_SOUL>\n{request.soul}\n</TOMO_SOUL>\n\n"
         f"fixed turn plan: primary_move={plan.primary.value}; supporting_moves={supporting}; confidence={plan.confidence.value}.\n\n"
         + render_later_segment_contract(
@@ -276,6 +282,15 @@ def _tool_schemas(tools_available: Sequence[dict[str, object]]) -> tuple[dict[st
             raise ValueError("tool schemas must be mappings")
         schemas.append(dict(tool))
     return tuple(schemas)
+
+
+def _has_peer_tools(tool_schemas: Sequence[dict[str, object]]) -> bool:
+    for schema in tool_schemas:
+        function = schema.get("function")
+        name = function.get("name") if isinstance(function, Mapping) else schema.get("name")
+        if name in {"peer_list", "peer_ask", "peer_resume"}:
+            return True
+    return False
 
 
 def _visible_context(inbound: InboundEnvelope | InputBurst) -> list[dict[str, str]]:

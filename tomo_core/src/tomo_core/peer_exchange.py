@@ -22,7 +22,7 @@ from .peer_models import (
 )
 from .peer_policy import PeerPolicy
 from .peer_safety import contains_unauthorized_output, contains_unsafe_content
-from .peer_broker import classify, disclosure_scope
+from .peer_broker import canonicalize_availability, classify, disclosure_scope
 from .peer_store import PeerStore, utc_now
 
 
@@ -152,7 +152,12 @@ class PeerExchange:
                 raise PeerError("superseded")
             return PeerSubmitResult(saved.request_id, saved.status.value, handle, saved.thread_id, pending)
         kind, action, purpose = classify(kind, " ".join(purpose.split()), text)
+        if kind == RequestKind.AVAILABILITY:
+            text = canonicalize_availability(peer_handle, text)
+            kind, action, purpose = classify(kind, purpose, text)
         scope = disclosure_scope(purpose, text, action)
+        if kind == RequestKind.AVAILABILITY and scope != "availability":
+            raise PeerError("unsafe_action")
         if kind == RequestKind.SENSITIVE and scope == "none":
             raise PeerError("unsafe_action")
         try:

@@ -30,3 +30,4 @@ packages = ["src/tomo_core"]
 "src/tomo_core/skills/memory/SKILL.md" = "tomo_core/skills/memory/SKILL.md"
 "src/tomo_core/skills/cron-jobs/SKILL.md" = "tomo_core/skills/cron-jobs/SKILL.md"
 "src/tomo_core/skills/visual-evidence/SKILL.md" = "tomo_core/skills/visual-evidence/SKILL.md"
+"src/tomo_core/skills/tomo-connections/SKILL.md" = "tomo_core/skills/tomo-connections/SKILL.md"
