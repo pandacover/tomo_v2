@@ -32,3 +32,30 @@ class PeerStoreTests(unittest.TestCase):
             store = PeerStore(tmp)
 
             store.register_handle("a", "alice")
+
+    def test_initialization_adds_safe_failure_code_to_existing_request_schema(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = sqlite3.connect(f"{tmp}/peer.sqlite3")
+            db.execute("CREATE TABLE peer_schema(version INTEGER NOT NULL CHECK(version=1))")
+            db.execute("INSERT INTO peer_schema VALUES(1)")
+            db.execute(
+                "CREATE TABLE peer_requests("
+                "request_id TEXT PRIMARY KEY,relationship_id TEXT NOT NULL,sender TEXT NOT NULL,"
+                "recipient TEXT NOT NULL,thread_id TEXT NOT NULL,generation_id TEXT NOT NULL,"
+                "call_id TEXT NOT NULL,kind TEXT NOT NULL,action TEXT NOT NULL,text TEXT NOT NULL,"
+                "sequence INTEGER NOT NULL,created_at TEXT NOT NULL,status TEXT NOT NULL,"
+                "disclosure_scope TEXT NOT NULL DEFAULT 'none',lease_token TEXT,lease_until TEXT,"
+                "execution_deadline TEXT,attempt_count INTEGER NOT NULL,available_at TEXT NOT NULL,"
+                "UNIQUE(sender,generation_id,call_id))"
+            )
+            db.commit()
+            db.close()
+
+            PeerStore(tmp)
+
+            db = sqlite3.connect(f"{tmp}/peer.sqlite3")
+            try:
+                columns = {row[1] for row in db.execute("PRAGMA table_info(peer_requests)")}
+            finally:
+                db.close()
+            self.assertIn("error_code", columns)

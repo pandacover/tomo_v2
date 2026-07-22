@@ -36,6 +36,7 @@ class PeerClaim:
     lease_token: str
     relationship_revision: int
     grant_revisions: dict[str, int]
+    attempt_count: int
 
 
 class PeerExchange:
@@ -260,7 +261,7 @@ class PeerExchange:
             now=current, lease_seconds=lease_seconds
         )
         while candidate is not None:
-            request, token, relationship, grants = candidate
+            request, token, relationship, grants, attempt_count = candidate
             if not self._source_active(request):
                 self._store.deny_claim(request.request_id, token, now=current)
                 candidate = self._store.claim_candidates(now=current, lease_seconds=lease_seconds)
@@ -270,7 +271,13 @@ class PeerExchange:
                 grant_revisions = {
                     grant.grantor_owner_id: grant.revision for grant in grants
                 }
-                return PeerClaim(request, token, relationship.revision, grant_revisions)
+                return PeerClaim(
+                    request,
+                    token,
+                    relationship.revision,
+                    grant_revisions,
+                    attempt_count,
+                )
             self._store.deny_claim(request.request_id, token, now=current)
             candidate = self._store.claim_candidates(
                 now=current, lease_seconds=lease_seconds
@@ -372,6 +379,7 @@ class PeerExchange:
             relationship_revision,
             grant_revisions,
             False,
+            None,
             now,
         )
 
@@ -384,6 +392,7 @@ class PeerExchange:
         *,
         relationship_revision: int | None = None,
         grant_revisions: dict[str, int] | None = None,
+        error_code: str = "peer_execution_failed",
         now: datetime | None = None,
     ) -> bool:
         return self._finish(
@@ -394,6 +403,7 @@ class PeerExchange:
             relationship_revision,
             grant_revisions,
             True,
+            error_code,
             now,
         )
 
@@ -406,6 +416,7 @@ class PeerExchange:
         relationship_revision: int | None,
         grant_revisions: dict[str, int] | None,
         failed: bool,
+        error_code: str | None,
         now: datetime | None,
     ) -> bool:
         if isinstance(frames, str):
@@ -424,16 +435,27 @@ class PeerExchange:
                 relationship_revision,
                 grant_revisions,
                 failed=failed,
+                error_code=error_code if failed else None,
                 now=utc_now(now),
             )
         except ValueError:
             return False
 
     def defer(
-        self, request_id: str, lease_token: str, *, now: datetime | None = None
+        self,
+        request_id: str,
+        lease_token: str,
+        *,
+        error_code: str = "peer_execution_failed",
+        now: datetime | None = None,
     ) -> bool:
         try:
-            return self._store.defer(request_id, lease_token, now=utc_now(now))
+            return self._store.defer(
+                request_id,
+                lease_token,
+                error_code=error_code,
+                now=utc_now(now),
+            )
         except ValueError:
             return False
 
@@ -515,6 +537,7 @@ class PeerExchange:
             response,
             value[0].thread_id,
             value[3],
+            value[4],
         )
 
     inspect = inspect_request
@@ -524,7 +547,15 @@ class PeerExchange:
         if value is None:
             return None
         response = None if value[1] is None else PeerResponseSummary(value[1].frames, value[1].status, value[1].created_at)
-        return PeerRequestInspection(value[0].request_id, value[0].status.value, value[2], response, value[0].thread_id, value[3])
+        return PeerRequestInspection(
+            value[0].request_id,
+            value[0].status.value,
+            value[2],
+            response,
+            value[0].thread_id,
+            value[3],
+            value[4],
+        )
 
     def list_relationships(self, owner: str) -> tuple[PeerRelationshipSummary, ...]:
         return self._store.list_relationships(owner)

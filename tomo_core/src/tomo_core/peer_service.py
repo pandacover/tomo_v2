@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta
 from threading import Event, Thread
 from typing import Callable
@@ -13,6 +14,24 @@ from .sandbox_protocol import (
     SandboxErrorEvent,
     SandboxFrameEvent,
     SandboxStaleEvent,
+)
+
+
+_logger = logging.getLogger(__name__)
+_SAFE_DISPATCH_CODES = frozenset(
+    {
+        "access_token_failed",
+        "auth_expired",
+        "invalid_result",
+        "sandbox_create_failed",
+        "sandbox_delete_failed",
+        "sandbox_exec_failed",
+        "sandbox_lookup_failed",
+        "sandbox_not_ready",
+        "sandbox_smoke_failed",
+        "sandbox_timeout",
+        "volume_create_failed",
+    }
 )
 
 
@@ -121,9 +140,14 @@ class PeerService:
             claim.request.recipient_owner_id
         )
         if installation is None:
-            if not self.exchange.defer(
-                claim.request.request_id, claim.lease_token, now=now
-            ):
+            error_code = "peer_installation_missing"
+            deferred = self.exchange.defer(
+                claim.request.request_id,
+                claim.lease_token,
+                error_code=error_code,
+                now=now,
+            )
+            if not deferred:
                 self.exchange.fail(
                     claim.request.recipient_owner_id,
                     claim.request.request_id,
@@ -131,8 +155,10 @@ class PeerService:
                     ("unable to answer right now",),
                     relationship_revision=claim.relationship_revision,
                     grant_revisions=claim.grant_revisions,
+                    error_code=error_code,
                     now=now,
                 )
+            self._log_failure(claim, error_code, deferred=deferred)
             return True
         inspection = self.exchange.inspect_request(
             claim.request.recipient_owner_id, claim.request.request_id
@@ -239,8 +265,9 @@ class PeerService:
                 grant_revisions=claim.grant_revisions,
                 now=self.clock(),
             )
-        except ValueError:
+        except ValueError as error:
             if active():
+                error_code = _failure_code(error)
                 self.exchange.fail(
                     claim.request.recipient_owner_id,
                     claim.request.request_id,
@@ -248,13 +275,20 @@ class PeerService:
                     ("unable to answer right now",),
                     relationship_revision=claim.relationship_revision,
                     grant_revisions=claim.grant_revisions,
+                    error_code=error_code,
                     now=self.clock(),
                 )
-        except Exception:
+                self._log_failure(claim, error_code, deferred=False)
+        except Exception as error:
             if active():
-                if not self.exchange.defer(
-                    claim.request.request_id, claim.lease_token, now=self.clock()
-                ):
+                error_code = _failure_code(error)
+                deferred = self.exchange.defer(
+                    claim.request.request_id,
+                    claim.lease_token,
+                    error_code=error_code,
+                    now=self.clock(),
+                )
+                if not deferred:
                     self.exchange.fail(
                         claim.request.recipient_owner_id,
                         claim.request.request_id,
@@ -262,10 +296,32 @@ class PeerService:
                         ("unable to answer right now",),
                         relationship_revision=claim.relationship_revision,
                         grant_revisions=claim.grant_revisions,
+                        error_code=error_code,
                         now=self.clock(),
                     )
+                self._log_failure(claim, error_code, deferred=deferred)
         finally:
             heartbeat_stop.set()
             if 'heartbeat' in locals():
                 heartbeat.join(timeout=1)
         return True
+
+    @staticmethod
+    def _log_failure(claim, error_code: str, *, deferred: bool) -> None:
+        _logger.warning(
+            "peer request execution %s request_id=%s recipient=%s attempt=%d error_code=%s",
+            "deferred" if deferred else "failed",
+            claim.request.request_id,
+            claim.request.recipient_owner_id,
+            claim.attempt_count,
+            error_code,
+        )
+
+
+def _failure_code(error: Exception) -> str:
+    code = getattr(error, "code", None)
+    if isinstance(code, str) and code in _SAFE_DISPATCH_CODES:
+        return code
+    if isinstance(error, ValueError):
+        return "peer_invalid_response"
+    return "peer_execution_failed"

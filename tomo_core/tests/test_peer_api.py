@@ -132,7 +132,7 @@ class PeerApiTests(unittest.IsolatedAsyncioTestCase):
             exchange.update_grant(installation.tomo_id, relationship.relationship_id, None, True, False, False, 0, now=now)
             exchange.update_grant(bob, relationship.relationship_id, None, False, True, False, 0, now=now)
             key = b"k" * 32
-            token = issue_capability(key, PeerCapability(installation.tomo_id, "actor-1", "telegram:chat-1", work.session_id, work.generation_id, 100, 200, frozenset({"ask"})))
+            token = issue_capability(key, PeerCapability(installation.tomo_id, "actor-1", "telegram:chat-1", work.session_id, work.generation_id, 100, 200, frozenset({"ask", "inspect_request"})))
             app = FastAPI()
             app.include_router(create_peer_router(tmp, onboarding=store, peer_exchange=exchange, peer_key=key, clock=lambda: 150))
             headers = {"authorization": f"Bearer {token}", "x-tomo-owner-id": installation.tomo_id, "x-tomo-actor-id": "actor-1", "x-tomo-destination": "telegram:chat-1", "x-tomo-session-id": work.session_id, "x-tomo-generation-id": work.generation_id}
@@ -141,8 +141,25 @@ class PeerApiTests(unittest.IsolatedAsyncioTestCase):
                 accepted = await client.post("/v1/peer-agent/requests", headers=headers, json=body)
                 rejected = await client.post("/v1/peer-agent/requests", headers=headers | {"x-tomo-actor-id": "other"}, json=body)
                 invalid = await client.post("/v1/peer-agent/requests", headers=headers, json=body | {"ownerId": "leak"})
+                claim = exchange.claim()
+                self.assertIsNotNone(claim)
+                exchange.fail(
+                    bob,
+                    accepted.json()["requestId"],
+                    claim.lease_token,
+                    ("unable to answer right now",),
+                    relationship_revision=claim.relationship_revision,
+                    grant_revisions=claim.grant_revisions,
+                    error_code="sandbox_exec_failed",
+                )
+                inspected = await client.get(
+                    f"/v1/peer-agent/requests/{accepted.json()['requestId']}",
+                    headers=headers,
+                )
 
             self.assertEqual(accepted.status_code, 200)
             self.assertEqual(rejected.status_code, 401)
             self.assertEqual(invalid.status_code, 422)
+            self.assertEqual(inspected.status_code, 200)
+            self.assertEqual(inspected.json()["errorCode"], "sandbox_exec_failed")
             self.assertNotIn(installation.tomo_id, accepted.text)

@@ -839,7 +839,7 @@ class PeerStore:
             ).fetchall()
             for terminal in exhausted:
                 if not db.execute(
-                    "UPDATE peer_requests SET status='failed',lease_token=NULL,lease_until=NULL "
+                    "UPDATE peer_requests SET status='failed',lease_token=NULL,lease_until=NULL,error_code=COALESCE(error_code,'peer_timeout') "
                     "WHERE request_id=? AND status IN('pending','authorized','leased')",
                     (terminal["request_id"],),
                 ).rowcount:
@@ -916,6 +916,7 @@ class PeerStore:
                         token,
                         relation,
                         self._grants(db, relation),
+                        int(row["attempt_count"]) + 1,
                     )
             return None
 
@@ -933,12 +934,20 @@ class PeerStore:
                 ).rowcount
             )
 
-    def defer(self, request_id: str, token: str, *, now: datetime) -> bool:
+    def defer(
+        self,
+        request_id: str,
+        token: str,
+        *,
+        error_code: str,
+        now: datetime,
+    ) -> bool:
         request_id, token, now = (
             _id(request_id, "request_id"),
             _id(token, "lease_token"),
             utc_now(now),
         )
+        error_code = _safe_error_code(error_code)
         with self._write() as db:
             row = db.execute(
                 "SELECT status,attempt_count,recipient,relationship_id FROM peer_requests WHERE request_id=? AND status='leased' AND lease_token=? AND lease_until>?",
@@ -947,7 +956,10 @@ class PeerStore:
             if row is None:
                 return False
             if row["attempt_count"] >= 3:
-                db.execute("UPDATE peer_requests SET status='failed',lease_token=NULL,lease_until=NULL WHERE request_id=? AND status='leased' AND lease_token=?", (request_id, token))
+                db.execute(
+                    "UPDATE peer_requests SET status='failed',lease_token=NULL,lease_until=NULL,error_code=? WHERE request_id=? AND status='leased' AND lease_token=?",
+                    (error_code, request_id, token),
+                )
                 db.execute(
                     "INSERT INTO peer_responses VALUES(?,?,?,?,?)",
                     (request_id, row["recipient"], json.dumps(["unable to answer right now"]), "failed", _iso(now)),
@@ -957,10 +969,11 @@ class PeerStore:
             delay = min(2 ** row["attempt_count"], 60)
             return bool(
                 db.execute(
-                    "UPDATE peer_requests SET status=CASE WHEN EXISTS(SELECT 1 FROM peer_confirmations WHERE request_id=? AND status='confirmed') THEN 'authorized' ELSE 'pending' END,lease_token=NULL,lease_until=NULL,available_at=? WHERE request_id=? AND status='leased' AND lease_token=?",
+                    "UPDATE peer_requests SET status=CASE WHEN EXISTS(SELECT 1 FROM peer_confirmations WHERE request_id=? AND status='confirmed') THEN 'authorized' ELSE 'pending' END,lease_token=NULL,lease_until=NULL,available_at=?,error_code=? WHERE request_id=? AND status='leased' AND lease_token=?",
                     (
                         request_id,
                         _iso(now + timedelta(seconds=delay)),
+                        error_code,
                         request_id,
                         token,
                     ),
@@ -1097,6 +1110,7 @@ class PeerStore:
         grant_revisions: dict[str, int],
         *,
         failed: bool,
+        error_code: str | None = None,
         now: datetime,
     ) -> bool:
         owner_id, request_id, token, now = (
@@ -1108,6 +1122,7 @@ class PeerStore:
         PeerResponse(
             request_id, owner_id, frames, "failed" if failed else "completed", now
         )
+        error_code = _safe_error_code(error_code) if failed else None
         if (
             isinstance(relationship_revision, bool)
             or not isinstance(relationship_revision, int)
@@ -1141,8 +1156,8 @@ class PeerStore:
                 return False
             status = "failed" if failed else "completed"
             if not db.execute(
-                "UPDATE peer_requests SET status=?,lease_token=NULL,lease_until=NULL WHERE request_id=? AND status='leased' AND lease_token=?",
-                (status, request_id, token),
+                "UPDATE peer_requests SET status=?,lease_token=NULL,lease_until=NULL,error_code=? WHERE request_id=? AND status='leased' AND lease_token=?",
+                (status, error_code, request_id, token),
             ).rowcount:
                 return False
             db.execute(
@@ -1201,6 +1216,7 @@ class PeerStore:
                     db, row["recipient"] if row["sender"] == owner_id else row["sender"]
                 ),
                 None if confirmation is None else _dt(confirmation["expires_at"]),
+                row["error_code"] if "error_code" in row.keys() else None,
             )
 
     def latest_thread_request(self, owner_id: str, thread_id: str):
@@ -1650,6 +1666,8 @@ class PeerStore:
                     db.execute("ALTER TABLE peer_requests ADD COLUMN execution_deadline TEXT")
                 if requests_exists and "disclosure_scope" not in columns:
                     db.execute("ALTER TABLE peer_requests ADD COLUMN disclosure_scope TEXT NOT NULL DEFAULT 'none'")
+                if requests_exists and "error_code" not in columns:
+                    db.execute("ALTER TABLE peer_requests ADD COLUMN error_code TEXT")
             db.executescript("""
 BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS peer_schema(version INTEGER NOT NULL CHECK(version=1));
@@ -1658,7 +1676,7 @@ CREATE TABLE IF NOT EXISTS peer_handles(handle TEXT PRIMARY KEY,owner_id TEXT NO
 CREATE TABLE IF NOT EXISTS peer_relationships(relationship_id TEXT PRIMARY KEY,owner_a TEXT NOT NULL,owner_b TEXT NOT NULL,invited_by TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,revision INTEGER NOT NULL,UNIQUE(owner_a,owner_b));
 CREATE TABLE IF NOT EXISTS peer_grants(relationship_id TEXT NOT NULL REFERENCES peer_relationships ON DELETE CASCADE,grantor TEXT NOT NULL,communicate INTEGER NOT NULL,auto_reply INTEGER NOT NULL,share_availability INTEGER NOT NULL,revision INTEGER NOT NULL,expires_at TEXT,updated_at TEXT NOT NULL,PRIMARY KEY(relationship_id,grantor));
 CREATE TABLE IF NOT EXISTS peer_threads(thread_id TEXT PRIMARY KEY,relationship_id TEXT NOT NULL REFERENCES peer_relationships ON DELETE CASCADE,sender TEXT NOT NULL,recipient TEXT NOT NULL,purpose TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,expires_at TEXT NOT NULL,request_count INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS peer_requests(request_id TEXT PRIMARY KEY,relationship_id TEXT NOT NULL REFERENCES peer_relationships ON DELETE CASCADE,sender TEXT NOT NULL,recipient TEXT NOT NULL,thread_id TEXT NOT NULL REFERENCES peer_threads ON DELETE CASCADE,generation_id TEXT NOT NULL,call_id TEXT NOT NULL,kind TEXT NOT NULL,action TEXT NOT NULL,text TEXT NOT NULL,sequence INTEGER NOT NULL,created_at TEXT NOT NULL,status TEXT NOT NULL,disclosure_scope TEXT NOT NULL DEFAULT 'none',lease_token TEXT,lease_until TEXT,execution_deadline TEXT,attempt_count INTEGER NOT NULL,available_at TEXT NOT NULL,UNIQUE(sender,generation_id,call_id));
+CREATE TABLE IF NOT EXISTS peer_requests(request_id TEXT PRIMARY KEY,relationship_id TEXT NOT NULL REFERENCES peer_relationships ON DELETE CASCADE,sender TEXT NOT NULL,recipient TEXT NOT NULL,thread_id TEXT NOT NULL REFERENCES peer_threads ON DELETE CASCADE,generation_id TEXT NOT NULL,call_id TEXT NOT NULL,kind TEXT NOT NULL,action TEXT NOT NULL,text TEXT NOT NULL,sequence INTEGER NOT NULL,created_at TEXT NOT NULL,status TEXT NOT NULL,disclosure_scope TEXT NOT NULL DEFAULT 'none',lease_token TEXT,lease_until TEXT,execution_deadline TEXT,error_code TEXT,attempt_count INTEGER NOT NULL,available_at TEXT NOT NULL,UNIQUE(sender,generation_id,call_id));
 CREATE TABLE IF NOT EXISTS peer_responses(request_id TEXT PRIMARY KEY REFERENCES peer_requests ON DELETE CASCADE,responder TEXT NOT NULL,frames TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS peer_confirmations(pending_id TEXT PRIMARY KEY,request_id TEXT NOT NULL UNIQUE REFERENCES peer_requests ON DELETE CASCADE,affected_owner TEXT NOT NULL,action_kind TEXT NOT NULL,payload_hash TEXT NOT NULL,preview TEXT NOT NULL,status TEXT NOT NULL,expires_at TEXT NOT NULL,created_at TEXT NOT NULL,decided_at TEXT,relationship_revision INTEGER NOT NULL,grant_revisions TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS peer_confirmation_notices(pending_id TEXT PRIMARY KEY REFERENCES peer_confirmations ON DELETE CASCADE,status TEXT NOT NULL,lease_token TEXT,lease_until TEXT,available_at TEXT NOT NULL);
@@ -1673,6 +1691,13 @@ COMMIT;
             db.commit()
         finally:
             db.close()
+
+
+def _safe_error_code(value: object) -> str:
+    if not isinstance(value, str):
+        return "peer_execution_failed"
+    normalized = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")[:64]
+    return normalized or "peer_execution_failed"
 
 
 class _Transaction:

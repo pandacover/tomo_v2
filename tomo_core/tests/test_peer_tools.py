@@ -141,11 +141,25 @@ class PeerToolsTests(unittest.TestCase):
         client = _client(lambda request, **_kwargs: requests.append(request) or _Response({"relationships": [{"peerHandle": "bob", "status": "active", "grant": {"communicate": True}, "peerGrant": {"autoReply": True}}]}))
         ask = {"peer_handle": "bob", "purpose": "question", "disclosure_kind": "ordinary_message", "message": "hello", "call_id": "call"}
 
-        self.assertEqual(client.ask(ask), {"ok": False, "status": "failed"})
+        self.assertEqual(client.ask(ask), {"ok": False, "status": "failed", "error_code": "peer_connection_unavailable"})
         self.assertEqual(requests, [])
         client.list_relationships()
-        self.assertEqual(client.ask(ask | {"peer_handle": "guessed"}), {"ok": False, "status": "failed"})
+        self.assertEqual(client.ask(ask | {"peer_handle": "guessed"}), {"ok": False, "status": "failed", "error_code": "peer_connection_unavailable"})
         self.assertEqual([request.get_method() for request in requests], ["GET"])
+
+    def test_safe_worker_error_is_reduced_to_a_public_failure_category(self):
+        result = _client(lambda _request, **_kwargs: _Response({
+            "requestId": "private-request",
+            "status": "failed",
+            "errorCode": "sandbox_exec_failed",
+            "token": "private-token",
+        })).inspect_request("request")
+
+        self.assertEqual(result, {
+            "ok": True,
+            "status": "failed",
+            "error_code": "peer_unavailable",
+        })
 
     def test_ask_uses_only_an_exact_listed_ready_handle_and_replaces_the_cache(self):
         requests = []
@@ -164,10 +178,10 @@ class PeerToolsTests(unittest.TestCase):
 
         client.list_relationships()
         for handle in ("guessed", "inactive", "no_communicate", "no_auto_reply"):
-            self.assertEqual(ask(handle), {"ok": False, "status": "failed"})
+            self.assertEqual(ask(handle), {"ok": False, "status": "failed", "error_code": "peer_connection_unavailable"})
         self.assertEqual(ask("bob"), {"ok": True, "status": "pending"})
         client.list_relationships()
-        self.assertEqual(ask("bob"), {"ok": False, "status": "failed"})
+        self.assertEqual(ask("bob"), {"ok": False, "status": "failed", "error_code": "peer_connection_unavailable"})
         self.assertEqual([request.get_method() for request in requests], ["GET", "POST", "GET"])
 
     def test_pending_confirmation_returns_only_safe_contract_with_expiry(self):

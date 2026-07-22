@@ -316,6 +316,7 @@ class PeerRequestInspection:
     response: PeerResponseSummary | None = None
     thread_id: str | None = None
     pending_expires_at: datetime | None = None
+    error_code: str | None = None
 
 
 @dataclass(frozen=True)

@@ -371,6 +371,7 @@ def _inspection(inspection: object) -> dict[str, object]:
         if inspection.pending_expires_at is None
         else inspection.pending_expires_at.isoformat(),
         "response": response,
+        "errorCode": inspection.error_code,
     }
 
 

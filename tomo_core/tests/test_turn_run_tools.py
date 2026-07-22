@@ -50,7 +50,7 @@ class TurnRunToolTests(unittest.TestCase):
 
         self.assertEqual(
             [frame.text for frame in result.frames],
-            ["i couldn't get an answer from that tomo. check the connection permissions in tomo connections, then try again."],
+            ["i couldn't get an answer from that tomo. try again in a moment."],
         )
         self.assertEqual(len(provider.calls), 1)
 
@@ -332,8 +332,44 @@ class TurnRunToolTests(unittest.TestCase):
 
         result = ConversationEngine(provider, tool_registry=registry(peer_resume)).respond(self.request())
 
-        self.assertEqual([frame.text for frame in result.frames], ["i couldn't get an answer from that tomo. check the connection permissions in tomo connections, then try again."])
+        self.assertEqual([frame.text for frame in result.frames], ["i couldn't get an answer from that tomo. try again in a moment."])
         self.assertEqual(len(provider.calls), 1)
+
+    def test_peer_execution_failure_reports_unavailability_not_permissions(self):
+        provider = ScriptedProvider([[
+            ProviderTextDelta(PLAN),
+            ProviderToolCallReady("peer-1", "peer_resume", "{}"),
+            ProviderStreamCompleted("tool_calls"),
+        ]])
+        peer_resume = BoundTool(
+            ToolSpec("peer_resume", "resume peer", {"type": "object", "properties": {}}, read_only=True, parallel_safe=True),
+            lambda _: {"ok": True, "status": "failed", "error_code": "peer_unavailable"},
+        )
+
+        result = ConversationEngine(provider, tool_registry=registry(peer_resume)).respond(self.request())
+
+        self.assertEqual(
+            [frame.text for frame in result.frames],
+            ["that tomo is unavailable right now. try again in a moment."],
+        )
+
+    def test_denied_peer_request_reports_changed_connection(self):
+        provider = ScriptedProvider([[
+            ProviderTextDelta(PLAN),
+            ProviderToolCallReady("peer-1", "peer_resume", "{}"),
+            ProviderStreamCompleted("tool_calls"),
+        ]])
+        peer_resume = BoundTool(
+            ToolSpec("peer_resume", "resume peer", {"type": "object", "properties": {}}, read_only=True, parallel_safe=True),
+            lambda _: {"ok": True, "status": "denied"},
+        )
+
+        result = ConversationEngine(provider, tool_registry=registry(peer_resume)).respond(self.request())
+
+        self.assertEqual(
+            [frame.text for frame in result.frames],
+            ["the connection or its permissions changed before that tomo could answer. check tomo connections, then try again."],
+        )
 
     def test_completed_direct_peer_resume_emits_only_returned_safe_frames(self):
         provider = ScriptedProvider([
@@ -363,7 +399,7 @@ class TurnRunToolTests(unittest.TestCase):
 
         self.assertEqual(
             [frame.text for frame in result.frames],
-            ["Checking.", "i couldn't get an answer from that tomo. check the connection permissions in tomo connections, then try again."],
+            ["Checking.", "i couldn't get an answer from that tomo. try again in a moment."],
         )
 
     def test_terminal_peer_frames_respect_per_segment_frame_budget(self):
@@ -381,7 +417,7 @@ class TurnRunToolTests(unittest.TestCase):
             budget=TurnBudget(2, 1, 1, 1, 1, 2, 800),
         ).respond(self.request())
 
-        self.assertEqual([frame.text for frame in result.frames], ["i couldn't get an answer from that tomo. check the connection permissions in tomo connections, then try again."])
+        self.assertEqual([frame.text for frame in result.frames], ["i couldn't get an answer from that tomo. try again in a moment."])
 
     def test_oversized_terminal_peer_frame_fails_closed(self):
         provider = ScriptedProvider([
@@ -394,7 +430,7 @@ class TurnRunToolTests(unittest.TestCase):
 
         result = ConversationEngine(provider, tool_registry=registry(peer_ask)).respond(self.request())
 
-        self.assertEqual([frame.text for frame in result.frames], ["i couldn't get an answer from that tomo. check the connection permissions in tomo connections, then try again."])
+        self.assertEqual([frame.text for frame in result.frames], ["i couldn't get an answer from that tomo. try again in a moment."])
 
     def test_terminal_peer_frame_over_sentence_budget_fails_closed(self):
         provider = ScriptedProvider([
@@ -407,7 +443,7 @@ class TurnRunToolTests(unittest.TestCase):
 
         result = ConversationEngine(provider, tool_registry=registry(peer_ask)).respond(self.request())
 
-        self.assertEqual([frame.text for frame in result.frames], ["i couldn't get an answer from that tomo. check the connection permissions in tomo connections, then try again."])
+        self.assertEqual([frame.text for frame in result.frames], ["i couldn't get an answer from that tomo. try again in a moment."])
 
     def test_malformed_direct_peer_resume_emits_only_no_answer_frame(self):
         provider = ScriptedProvider([
@@ -424,7 +460,7 @@ class TurnRunToolTests(unittest.TestCase):
 
         result = ConversationEngine(provider, tool_registry=registry(peer_resume)).respond(self.request())
 
-        self.assertEqual([frame.text for frame in result.frames], ["i couldn't get an answer from that tomo. check the connection permissions in tomo connections, then try again."])
+        self.assertEqual([frame.text for frame in result.frames], ["i couldn't get an answer from that tomo. try again in a moment."])
 
     def test_validation_failure_peer_fallback_respects_tight_frame_budget(self):
         provider = ScriptedProvider([
@@ -459,7 +495,7 @@ class TurnRunToolTests(unittest.TestCase):
 
         result = ConversationEngine(provider, tool_registry=registry(peer_ask)).respond(self.request())
 
-        self.assertEqual([frame.text for frame in result.frames], ["i couldn't get an answer from that tomo. check the connection permissions in tomo connections, then try again."])
+        self.assertEqual([frame.text for frame in result.frames], ["i couldn't get an answer from that tomo. try again in a moment."])
 
     def request(self):
         return ConversationRequest.from_history(

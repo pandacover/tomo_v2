@@ -18,6 +18,22 @@ _POLL_TIMEOUT_SECONDS = 60
 _TERMINAL_STATUSES = frozenset(
     {"completed", "failed", "denied", "confirmation_pending"}
 )
+_UNAVAILABLE_FAILURE_CODES = frozenset(
+    {
+        "access_token_failed",
+        "auth_expired",
+        "peer_execution_failed",
+        "peer_installation_missing",
+        "peer_request_failed",
+        "sandbox_create_failed",
+        "sandbox_delete_failed",
+        "sandbox_exec_failed",
+        "sandbox_lookup_failed",
+        "sandbox_not_ready",
+        "sandbox_smoke_failed",
+        "volume_create_failed",
+    }
+)
 _SECRET_FIELDS = frozenset(
     {
         "authorization",
@@ -125,7 +141,11 @@ class PeerApiClient:
             and relationship.get("can_ask") is True
             and relationship.get("peer_auto_reply") is True
         ):
-            return {"ok": False, "status": "failed"}
+            return {
+                "ok": False,
+                "status": "failed",
+                "error_code": "peer_connection_unavailable",
+            }
         body = {
             "peerHandle": arguments["peer_handle"],
             "purpose": arguments["purpose"],
@@ -221,8 +241,14 @@ def peer_registry(client: PeerApiClient) -> ToolRegistry:
 def _observation(value: object) -> dict[str, object]:
     if not isinstance(value, dict):
         return {"ok": False, "status": "failed"}
+    error_code = _public_error_code(
+        value.get("errorCode", value.get("error_code", value.get("error")))
+    )
     if value.get("ok") is False:
-        return {"ok": False, "status": "failed"}
+        result: dict[str, object] = {"ok": False, "status": "failed"}
+        if error_code is not None:
+            result["error_code"] = error_code
+        return result
     status = value.get("status")
     result: dict[str, object] = {"ok": True, "status": status[:64] if isinstance(status, str) else "unknown"}
     handle = value.get("peerHandle", value.get("peer_handle"))
@@ -235,7 +261,30 @@ def _observation(value: object) -> dict[str, object]:
     expiry = value.get("expiresAt", value.get("expires_at"))
     if result["status"] in {"pending", "confirmation_pending"} and isinstance(expiry, str):
         result["expires_at"] = expiry[:64]
+    if result["status"] in {"failed", "denied"} and error_code is not None:
+        result["error_code"] = error_code
     return result
+
+
+def _public_error_code(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    if value in {
+        "peer_connection_unavailable",
+        "peer_invalid_response",
+        "peer_timeout",
+        "peer_unavailable",
+    }:
+        return value
+    if value == "sandbox_timeout":
+        return "peer_timeout"
+    if value == "invalid_result":
+        return "peer_invalid_response"
+    if value in _UNAVAILABLE_FAILURE_CODES:
+        return "peer_unavailable"
+    if value in {"peer_not_found", "peer_unauthorized"}:
+        return "peer_connection_unavailable"
+    return None
 
 
 def _effective_grant_flags(status: str, grant: object, peer_grant: object, now: datetime) -> tuple[bool, bool, bool]:

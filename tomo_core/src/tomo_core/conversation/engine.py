@@ -648,9 +648,12 @@ def _tool_continuation(observation) -> dict[str, object]:
     return {"role": "tool", "tool_call_id": observation.call_id, "content": json.dumps(content, ensure_ascii=True, separators=(",", ":"), allow_nan=False)}
 
 
-_PEER_NO_ANSWER = "i couldn't get an answer from that tomo. check the connection permissions in tomo connections, then try again."
+_PEER_NO_ANSWER = "i couldn't get an answer from that tomo. try again in a moment."
 _PEER_APPROVAL_PENDING = "that tomo needs their owner's approval before answering. check back after they approve it."
 _PEER_PENDING = "that tomo hasn't answered yet. i don't have an answer yet."
+_PEER_UNAVAILABLE = "that tomo is unavailable right now. try again in a moment."
+_PEER_CONNECTION_CHANGED = "the connection or its permissions changed before that tomo could answer. check tomo connections, then try again."
+_PEER_INVALID_RESPONSE = "that tomo couldn't produce a safe answer. try asking another way."
 
 
 def _peer_is_pending(batch) -> bool:
@@ -728,4 +731,14 @@ def _terminal_peer_frames(
             return [Frame(index, ordinal, frame) for ordinal, frame in enumerate(raw_frames)]
     if status == "confirmation_pending":
         return [Frame(index, 0, _bounded_peer_text(_PEER_APPROVAL_PENDING, max_chars_per_frame, max_sentences_per_frame))]
+    if status == "denied":
+        return [Frame(index, 0, _bounded_peer_text(_PEER_CONNECTION_CHANGED, max_chars_per_frame, max_sentences_per_frame))]
+    if status == "failed":
+        error_code = value.get("error_code")
+        if error_code in {"peer_timeout", "peer_unavailable"}:
+            return [Frame(index, 0, _bounded_peer_text(_PEER_UNAVAILABLE, max_chars_per_frame, max_sentences_per_frame))]
+        if error_code == "peer_connection_unavailable":
+            return [Frame(index, 0, _bounded_peer_text(_PEER_CONNECTION_CHANGED, max_chars_per_frame, max_sentences_per_frame))]
+        if error_code == "peer_invalid_response":
+            return [Frame(index, 0, _bounded_peer_text(_PEER_INVALID_RESPONSE, max_chars_per_frame, max_sentences_per_frame))]
     return fallback

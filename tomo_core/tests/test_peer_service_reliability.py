@@ -3,6 +3,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from tomo_core.peer_exchange import PeerExchange
+from tomo_core.sandbox_dispatch import SandboxDispatchError
 from tomo_core.peer_service import PeerService
 from tomo_core.sandbox_protocol import SandboxCompletedEvent, SandboxFrameEvent
 
@@ -100,6 +101,46 @@ class PeerServiceReliabilityTests(unittest.TestCase):
             self.assertTrue(service.run_once())
             inspected = exchange.inspect("a", request.request_id)
             self.assertEqual(inspected.response.frames, ("unable to answer right now",))
+
+    def test_typed_dispatch_failure_is_logged_and_persisted_across_retries(self):
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as directory:
+            exchange = self._exchange(directory, now)
+            request = exchange.submit(
+                "a", "bobby", "generation", "call", "ordinary_message", "hello", now=now
+            )
+            current = [now]
+            installation = type("Installation", (), {"tomo_id": "b"})()
+            installations = type(
+                "Installations",
+                (),
+                {"installation_for_tomo": lambda *_: installation},
+            )()
+
+            class Dispatch:
+                def iter_peer_events(self, *_args, **_kwargs):
+                    raise SandboxDispatchError("sandbox_exec_failed") from RuntimeError(
+                        "private provider detail"
+                    )
+                    yield
+
+            service = PeerService(
+                exchange, installations, Dispatch(), clock=lambda: current[0]
+            )
+            with self.assertLogs("tomo_core.peer_service", level="WARNING") as captured:
+                for seconds in (0, 2, 6):
+                    current[0] = now + timedelta(seconds=seconds)
+                    self.assertTrue(service.run_once())
+
+            inspected = exchange.inspect("a", request.request_id)
+            self.assertEqual(inspected.status, "failed")
+            self.assertEqual(inspected.error_code, "sandbox_exec_failed")
+            logs = "\n".join(captured.output)
+            self.assertIn(f"request_id={request.request_id}", logs)
+            self.assertIn("attempt=1", logs)
+            self.assertIn("attempt=3", logs)
+            self.assertIn("error_code=sandbox_exec_failed", logs)
+            self.assertNotIn("private provider detail", logs)
 
     @staticmethod
     def _exchange(directory, now):
