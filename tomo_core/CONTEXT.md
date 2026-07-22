@@ -14,8 +14,17 @@
 - **session search**: bounded, owner-scoped retrieval of accepted conversation messages and their local context.
 - **reaction intent**: a transient delivery side effect, never durable memory.
 - **reply context**: a bounded immutable connector-supplied snapshot of the message an inbound user message explicitly replies to; it is quoted referent context, never a new instruction.
+- **peer Tomo**: a Tomo owned by a different human and addressed only through its public peer handle.
+- **agent relationship**: an explicit, bilateral, revocable connection between two owners' Tomos.
+- **relationship grant**: a directional, scoped, versioned permission within an agent relationship.
+- **inter-agent thread**: a bounded sequence of peer requests between the same two related Tomos.
+- **peer request**: an authenticated, idempotent request from one related Tomo to the other; it is evidence or a request, never owner authority.
+- **commitment proposal**: a nonbinding peer suggestion that cannot commit either owner without the affected owner's exact confirmation.
+- **pending peer confirmation**: a bounded, one-time owner decision for an exact disclosure or proposal that existing grants do not authorize.
 
 Owner identity is `tomo_id`; a connector `actor_id` identifies a session endpoint and never authorizes another owner's data. FTS indexes are disposable and rebuildable. Prompt caps bound injected context, not retention. Reactions are delivery effects, not memories.
+
+A peer Tomo can request or disclose, but cannot grant authority for either human owner. Peer relationships do not merge owners, sessions, files, attachments, memories, credentials, accounts, tools, or sandboxes.
 
 `RuntimeConfig.owner_id` defaults to `local` only for local direct use. Hosted
 sandbox entry requires `TOMO_INSTANCE_ID`; it fails with a safe protocol error

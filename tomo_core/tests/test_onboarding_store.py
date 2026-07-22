@@ -1,5 +1,7 @@
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -7,6 +9,29 @@ from tomo_core.onboarding_store import TelegramOnboardingStore
 
 
 class TelegramOnboardingStoreTests(unittest.TestCase):
+    def test_generation_guard_blocks_cross_process_supersession_until_notice_finishes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first = TelegramOnboardingStore(tmp)
+            first.enqueue_update(1, "chat", "first", now=0, update_kind="message", message_id="m1", tomo_id="tomo-1")
+            work = first.claim_next_work(now=1)
+            second = TelegramOnboardingStore(tmp)
+            finished = threading.Event()
+
+            def supersede():
+                second.enqueue_update(2, "chat", "second", now=2, update_kind="message", message_id="m2", tomo_id="tomo-1")
+                finished.set()
+
+            with first.generation_guard("tomo-1", work.generation_id) as active:
+                self.assertTrue(active)
+                thread = threading.Thread(target=supersede)
+                thread.start()
+                time.sleep(0.1)
+                self.assertFalse(finished.is_set())
+
+            thread.join(timeout=2)
+            self.assertTrue(finished.is_set())
+            self.assertFalse(first.is_generation_active(work.generation_id, work.revision))
+
     def test_fresh_delivery_schema_supports_coordinate_rows_without_legacy_move(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = TelegramOnboardingStore(tmp)
@@ -203,6 +228,33 @@ class TelegramOnboardingStoreTests(unittest.TestCase):
 
             self.assertEqual(store.installation_for_chat("999"), installation)
 
+    def test_public_tomo_id_derivation_and_tomo_installation_lookup_fail_closed_on_ambiguity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TelegramOnboardingStore(tmp)
+            self.assertEqual(store.tomo_id_for_user("User 1"), "tomo-user-1-e735fcdd4c")
+            tomo_id = store.tomo_id_for_user("user-1")
+            first = store.create_install_link("user-1", "bot")
+            second = store.create_install_link("user-1", "bot")
+            store.consume_start_token(first.token, "chat-1", "actor-1")
+            self.assertEqual(store.installation_for_tomo(tomo_id).actor_id, "actor-1")
+            store.consume_start_token(second.token, "chat-2", "actor-2")
+            self.assertIsNone(store.installation_for_tomo(tomo_id))
+
+    def test_active_generation_context_is_safe_and_includes_installation_actor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TelegramOnboardingStore(tmp)
+            link = store.create_install_link("user-1", "bot")
+            installation = store.consume_start_token(link.token, "chat-1", "actor-1")
+            store.enqueue_update(1, "chat-1", "message", now=0, update_kind="message", message_id="m1", tomo_id=installation.tomo_id)
+            work = store.claim_next_work(now=1)
+
+            context = store.active_generation_context(installation.tomo_id, work.generation_id)
+
+            self.assertEqual(
+                (context.tomo_id, context.chat_id, context.revision, context.session_id, context.status, context.actor_id),
+                (installation.tomo_id, "chat-1", work.revision, work.session_id, "active", "actor-1"),
+            )
+
     def test_enqueue_persists_a_unique_pending_update(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = TelegramOnboardingStore(tmp)
@@ -327,7 +379,10 @@ class TelegramOnboardingStoreTests(unittest.TestCase):
             replacement = store.claim_next_work(now=3.0)
             self.assertEqual(replacement.revision, 2)
             self.assertEqual([item.update_id for item in replacement.inputs], [101, 102])
-            self.assertEqual([item.session_id for item in store.recover_interrupted_generations()], [replacement.session_id])
+            self.assertEqual(
+                [item.session_id for item in store.recover_interrupted_generations()],
+                [work.session_id, replacement.session_id],
+            )
 
     def test_normal_message_cannot_escape_debounce_through_legacy_queue(self):
         with tempfile.TemporaryDirectory() as tmp:

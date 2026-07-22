@@ -128,6 +128,27 @@ parallel execution, approval, cancellation, and failure semantics are
 compatible. Tool calls and observations remain internal unless a later
 validated frame naturally communicates a verified result.
 
+## inter-owner peer turns
+
+Cross-owner communication does not reuse an ordinary owner turn. The broker
+authenticates a source-generation capability, checks an explicit bilateral
+agent relationship plus both directional grant revisions, and creates an
+idempotent request in a bounded inter-agent thread. The recipient executes a
+distinct `PeerTurn` in a relationship-scoped session. A peer message is
+untrusted evidence or a request, never authority from the foreign owner.
+
+`PeerTurn` runtime construction exposes only owner-bound, unattended,
+read-only personal search. It excludes cron, recursive peer tools,
+attachments, vision, reactions, memory controls, credentials, account
+connectors, and every mutating tool. Completion remains fenced by the live
+worker lease, relationship revision, grants, expiry, and service stop state.
+Sensitive disclosures and availability outside a standing grant wait for one
+exact owner confirmation. Deterministic host parsing accepts only `confirm
+peer request <short-id>` or `cancel peer request <short-id>` (plus equivalent
+slash commands); ambiguous language remains an ordinary conversation turn.
+Relationship coordination is central, but owner memories, files, sessions,
+accounts, credentials, and sandboxes never merge.
+
 ## personal-data lifecycle
 
 The runtime persists inbound session data before generation, then accepts prior

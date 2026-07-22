@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import queue
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -57,7 +58,11 @@ def compact_private_update(update: dict[str, Any]) -> CompactTelegramUpdate | No
     caption = message.get("caption")
     content = text if isinstance(text, str) else caption if isinstance(caption, str) else ""
     has_photo = isinstance(message.get("photo"), list) and bool(message["photo"])
-    kind = "message" if not is_callback and (has_photo or (content.strip() and not content.strip().startswith("/"))) else "control"
+    exact_peer_confirmation = re.fullmatch(
+        r"(?:/peer-(?:confirm|cancel)|(?:confirm|cancel) peer request) [0-9a-f]{8,64}",
+        content.strip().lower(),
+    ) is not None
+    kind = "message" if not is_callback and not exact_peer_confirmation and (has_photo or (content.strip() and not content.strip().startswith("/"))) else "control"
     return CompactTelegramUpdate(
         update_id=update_id,
         chat_id=str(chat["id"]),
@@ -84,6 +89,8 @@ class TelegramUpdateRouter:
     _stop_event: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
     _workers: list[threading.Thread] = field(default_factory=list, init=False, repr=False)
     _cancellations: queue.Queue[InterruptedGeneration] = field(init=False, repr=False)
+    _scheduled_cancellation_ids: set[str] = field(default_factory=set, init=False, repr=False)
+    _cancellation_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._cancellations = queue.Queue(maxsize=self.cancellation_queue_size)
@@ -208,31 +215,50 @@ class TelegramUpdateRouter:
             self.store.retry_update(update_id, error_code, now=now)
 
     def drain_cancellations(self) -> bool:
+        self._refill_cancellations()
         drained = False
-        while True:
+        all_succeeded = True
+        for _ in range(self._cancellations.qsize()):
             try:
                 interrupted = self._cancellations.get_nowait()
             except queue.Empty:
                 break
             drained = True
             if self.cancel_generation is None:
+                self.store.complete_generation_cleanup(interrupted.generation_id)
+                with self._cancellation_lock:
+                    self._scheduled_cancellation_ids.discard(interrupted.generation_id)
                 continue
             try:
                 self.cancel_generation(interrupted)
+                self.store.complete_generation_cleanup(interrupted.generation_id)
+                with self._cancellation_lock:
+                    self._scheduled_cancellation_ids.discard(interrupted.generation_id)
             except Exception as exc:
+                all_succeeded = False
+                with self._cancellation_lock:
+                    self._scheduled_cancellation_ids.discard(interrupted.generation_id)
+                self._schedule_cancellation(interrupted)
                 if self.on_error:
                     self.on_error(exc)
-        return drained
+        self._refill_cancellations()
+        return drained and all_succeeded
 
     def _schedule_cancellation(self, interrupted: InterruptedGeneration) -> None:
-        try:
-            self._cancellations.put_nowait(interrupted)
-        except queue.Full:
+        with self._cancellation_lock:
+            if interrupted.generation_id in self._scheduled_cancellation_ids:
+                return
             try:
-                self._cancellations.get_nowait()
-            except queue.Empty:
-                pass
-            self._cancellations.put_nowait(interrupted)
+                self._cancellations.put_nowait(interrupted)
+            except queue.Full:
+                return
+            self._scheduled_cancellation_ids.add(interrupted.generation_id)
+
+    def _refill_cancellations(self) -> None:
+        for interrupted in self.store.pending_generation_cleanups(
+            limit=self.cancellation_queue_size
+        ):
+            self._schedule_cancellation(interrupted)
 
     def _work_forever(self) -> None:
         while not self._stop_event.is_set():

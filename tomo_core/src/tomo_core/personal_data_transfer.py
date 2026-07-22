@@ -14,13 +14,15 @@ from .personal_data import PersonalDataTransferRepository
 FORMAT_VERSION = 1
 
 
-def export_owner(repository: PersonalDataTransferRepository, owner_id: str, output: TextIO) -> None:
+def export_owner(repository: PersonalDataTransferRepository, owner_id: str, output: TextIO, *, peer_records: Iterable[dict[str, object]] = ()) -> None:
     output.write(json.dumps({"format": "tomo_personal_data", "version": FORMAT_VERSION, "owner_id": owner_id}, sort_keys=True) + "\n")
     for record in repository.export_owner_records(owner_id):
         output.write(json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n")
+    for record in peer_records:
+        output.write(json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n")
 
 
-def import_owner(repository: PersonalDataTransferRepository, owner_id: str, source: Iterable[str]) -> None:
+def import_owner(repository: PersonalDataTransferRepository, owner_id: str, source: Iterable[str], *, peer_exchange=None) -> None:
     iterator = iter(source)
     try:
         header_line = next(iterator)
@@ -42,7 +44,16 @@ def import_owner(repository: PersonalDataTransferRepository, owner_id: str, sour
                     raise ValueError("malformed canonical stream")
                 if record.get("owner_id", owner_id) != owner_id:
                     raise ValueError("cross-owner canonical record")
+                table = record.get("table")
+                if isinstance(table, str) and table.startswith("peer_"):
+                    if peer_exchange is None:
+                        raise ValueError("unsupported_peer_import")
+                    peer_records.append(record)
+                    continue
                 yield record
         except (json.JSONDecodeError, TypeError) as error:
             raise ValueError("malformed canonical stream") from error
+    peer_records: list[dict[str, object]] = []
     repository.import_owner_records(owner_id, validated_records())
+    if peer_records:
+        peer_exchange.import_owner_records(owner_id, peer_records)

@@ -85,7 +85,10 @@ export function LandingStory() {
         <section className="landing-closing" aria-label="start a conversation">
           <div className="landing-story-inner">
             <p>Start with a conversation. The rest can take shape from there.</p>
-            <Link className="landing-closing-link" href="/login?next=/api/onboarding/telegram">text tomo</Link>
+            <div className="landing-closing-actions">
+              <Link className="landing-closing-link" href="/login?next=/api/onboarding/telegram">text tomo</Link>
+              <Link className="landing-closing-link landing-closing-link-secondary" href="/login?next=/tomos">manage connections</Link>
+            </div>
           </div>
         </section>
       </motion.div>

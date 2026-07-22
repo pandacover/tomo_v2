@@ -9,16 +9,16 @@ from typing import Callable, Iterator, Literal, TypeAlias
 from .conversation import ConversationEngine, ConversationRequest, FrameReady, MemoryControlReady, ReactionIntent, ReactionWindowReady, TurnRunCompleted, TurnRunStarted
 from .delivery import sanitize_style, strip_markdown
 from .graph import build_langgraph_or_linear
-from .models import AutomationTurn, InboundEnvelope, InputBurst, OutboundBubble, RuntimeConfig
+from .models import AutomationTurn, InboundEnvelope, InputBurst, OutboundBubble, PeerTurn, RuntimeConfig
 from .providers import ProviderAdapter
 from .reaction_service import ReactionDeliveryKey, ReactionService
 from .memory_governance import MemoryGovernanceService
 from .personal_data import (MemoryContextQuery, MemoryWriteControl,
                             PersonalDataRepository, StorageBusyError,
                             StorageCapabilityError, StorageSearchError)
-from .personal_search_tools import personal_search_registry
+from .personal_search_tools import peer_personal_search_registry, personal_search_registry
 from .sqlite_personal_data import SqlitePersonalDataRepository
-from .sessions import StoredMessage
+from .sessions import ConversationSession, StoredMessage
 from .soul import load_soul
 from .telegram import TelegramDeliverySink
 from .tool_execution import ToolExecutor
@@ -28,6 +28,25 @@ from . import latency_trace
 
 
 _MAX_VISION_IMAGES_PER_TURN = 8
+
+
+def _peer_frame_grounded(
+    text: str, scope: str, candidates: list[dict[str, object]]
+) -> bool:
+    if scope in {"none", "commitment_proposal"}:
+        return True
+    try:
+        value = json.loads(text)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(value, dict):
+        return False
+    if scope == "availability" and value == {
+        "status": "unknown",
+        "window": "unknown",
+    }:
+        return True
+    return value in candidates
 
 
 def _selected_image_attachments(burst: InputBurst):
@@ -192,31 +211,60 @@ class PersonalAgentRuntime:
             self.conversation.tool_registry = original_registry
             self.conversation.tool_executor = original_executor
 
+    def handle_peer_turn_iter(self, turn: PeerTurn, *, is_active: Callable[[], bool] | None = None) -> Iterator[RuntimeEvent]:
+        if not isinstance(turn, PeerTurn):
+            raise TypeError("turn must be a PeerTurn")
+        original_registry, original_executor = self.conversation.tool_registry, self.conversation.tool_executor
+        peer_candidates: list[dict[str, object]] = []
+        peer_safe = peer_personal_search_registry(
+            self.personal_data,
+            self.owner_id,
+            turn.disclosure_scope,
+            observe=lambda values: peer_candidates.extend(values),
+        )
+        self.conversation.tool_registry, self.conversation.tool_executor = (
+            peer_safe,
+            ToolExecutor(peer_safe),
+        )
+        try:
+            yield from self._handle_turn_iter(
+                turn, is_active=is_active, peer_candidates=peer_candidates
+            )
+        finally:
+            self.conversation.tool_registry, self.conversation.tool_executor = original_registry, original_executor
+
     def _handle_turn_iter(
         self,
-        burst: InputBurst | AutomationTurn,
+        burst: InputBurst | AutomationTurn | PeerTurn,
         *,
         is_active: Callable[[], bool] | None = None,
+        peer_candidates: list[dict[str, object]] | None = None,
     ) -> Iterator[RuntimeEvent]:
-        automation = isinstance(burst, AutomationTurn)
-        if not automation and burst.latest.connector != "telegram":
+        automation, peer = isinstance(burst, AutomationTurn), isinstance(burst, PeerTurn)
+        if not automation and not peer and burst.latest.connector != "telegram":
             raise ValueError("runtime only supports telegram bursts")
         is_active = is_active or (lambda: True)
-        actor_id = burst.actor_id if automation else burst.latest.actor_id
-        session_key = burst.session_key if automation else burst.latest.session_key
-        self.telegram.start_typing(actor_id)
+        if peer and not is_active():
+            return
+        actor_id = burst.actor_id if automation else "peer" if peer else burst.latest.actor_id
+        session_key = burst.session_key if (automation or peer) else burst.latest.session_key
+        if not peer:
+            self.telegram.start_typing(actor_id)
         session_load_started_at = time.monotonic()
-        session = self.personal_data.load_session(self.owner_id, session_key)
+        # Peer input and model output are ephemeral; PeerStore is their only durable home.
+        session = ConversationSession(session_key) if peer else self.personal_data.load_session(self.owner_id, session_key)
         if is_active():
             latency_trace.emit_sandbox("sandbox_session_load", elapsed_ms=max(0, int((time.monotonic() - session_load_started_at) * 1000)))
         if automation:
             session.append_automation_once(burst)
+        elif peer:
+            session.append_peer_once(burst)
         else:
             session.accept_generations(burst.accepted_generation_ids)
             for message in burst.messages:
                 session.append_inbound_once(message, burst.burst_id)
         checkpoint_started_at = time.monotonic()
-        saved = self.personal_data.save_session(self.owner_id, session, generation_id=burst.generation_id, revision=burst.revision)
+        saved = True if peer else self.personal_data.save_session(self.owner_id, session, generation_id=burst.generation_id, revision=burst.revision)
         if is_active():
             latency_trace.emit_sandbox("sandbox_checkpoint_inbound", outcome="ok" if saved else "error", elapsed_ms=max(0, int((time.monotonic() - checkpoint_started_at) * 1000)))
         if not saved:
@@ -228,7 +276,7 @@ class PersonalAgentRuntime:
             return
 
         observations: tuple[VisionObservation, ...] = ()
-        if not automation and self.vision_interpreter is not None:
+        if not automation and not peer and self.vision_interpreter is not None:
             observed: list[VisionObservation] = []
             for message, attachment_index, attachment in _selected_image_attachments(burst):
                 if not is_active():
@@ -251,9 +299,9 @@ class PersonalAgentRuntime:
 
         memory_started_at = time.monotonic()
         try:
-            query_text = burst.intent if automation else "\n".join(m.envelope.text for m in burst.messages)
-            memories = self.personal_data.memory_context(MemoryContextQuery(self.owner_id, query_text))
-            pending_actions = self.personal_data.pending_memory_actions(self.owner_id, session_key)
+            query_text = burst.intent if automation else burst.message if peer else "\n".join(m.envelope.text for m in burst.messages)
+            memories = () if peer else self.personal_data.memory_context(MemoryContextQuery(self.owner_id, query_text))
+            pending_actions = () if peer else self.personal_data.pending_memory_actions(self.owner_id, session_key)
         except (StorageBusyError, StorageSearchError, StorageCapabilityError):
             memories = ()
             pending_actions = ()
@@ -261,7 +309,7 @@ class PersonalAgentRuntime:
             latency_trace.emit_sandbox("sandbox_memory_hydration", elapsed_ms=max(0, int((time.monotonic() - memory_started_at) * 1000)))
         memory_block = _memory_data_block(memories, pending_actions)
         prompt_started_at = time.monotonic()
-        history = list(session.model_history_for_burst(burst.run_id if automation else burst.burst_id))
+        history = list(session.model_history_for_burst(burst.run_id if automation else burst.request_id if peer else burst.burst_id))
         if memory_block:
             history.append({"role": "user", "content": memory_block})
         request = ConversationRequest(
@@ -270,17 +318,17 @@ class PersonalAgentRuntime:
             history=tuple(history),
             vision_observations=observations,
         )
-        governance_revision = self.personal_data.memory_settings(self.owner_id).governance_revision
+        governance_revision = 0 if peer else self.personal_data.memory_settings(self.owner_id).governance_revision
         if is_active():
             latency_trace.emit_sandbox("sandbox_prompt_prepare", elapsed_ms=max(0, int((time.monotonic() - prompt_started_at) * 1000)))
         conversation_events = self.conversation.respond_iter(request, is_active=is_active)
         delivered: list[OutboundBubble] = []
         reaction_emoji: str | None = None
-        chat_id = burst.chat_id if automation else str(burst.latest.native_metadata.get("chat_id") or burst.latest.actor_id)
-        reaction_key = None if automation else ReactionDeliveryKey(self.owner_id, chat_id, burst.generation_id, burst.revision, burst.latest.message_id)
+        chat_id = burst.chat_id if automation else "" if peer else str(burst.latest.native_metadata.get("chat_id") or burst.latest.actor_id)
+        reaction_key = None if automation or peer else ReactionDeliveryKey(self.owner_id, chat_id, burst.generation_id, burst.revision, burst.latest.message_id)
 
         def emit_reaction() -> RuntimeReactionReady | None:
-            if automation or reaction_emoji is None:
+            if automation or peer or reaction_emoji is None:
                 return None
             try:
                 enabled = self.personal_data.memory_settings(self.owner_id).reactions_enabled
@@ -302,7 +350,7 @@ class PersonalAgentRuntime:
                 reaction_emoji = event.plan.reaction.emoji if event.plan.reaction is not None else None
                 continue
             if isinstance(event, MemoryControlReady):
-                if automation:
+                if automation or peer:
                     self._record_memory_diagnostic("invalid_provenance")
                 elif isinstance(event.control, MemoryWriteControl) and _safe_memory_control(event.control, burst, session, set(event.tool_observation_ids)):
                     try:
@@ -330,12 +378,16 @@ class PersonalAgentRuntime:
                     yield ready
                 continue
             if isinstance(event, FrameReady):
+                if peer and not _peer_frame_grounded(
+                    event.text, burst.disclosure_scope, peer_candidates or []
+                ):
+                    return
                 ready = emit_reaction()
                 if ready is not None:
                     yield ready
                 if not is_active():
                     return
-                bubble = self._compose_progressive_bubble(event, None if automation else burst.latest.message_id, bool(delivered))
+                bubble = self._compose_progressive_bubble(event, None if automation or peer else burst.latest.message_id, bool(delivered))
                 if not is_active():
                     return
                 delivered.append(bubble)
@@ -470,13 +522,15 @@ class PersonalAgentRuntime:
     def _persist_completed_burst(
         self,
         session,
-        burst: InputBurst | AutomationTurn,
+        burst: InputBurst | AutomationTurn | PeerTurn,
         event: TurnRunCompleted,
         delivered: list[OutboundBubble],
         is_active: Callable[[], bool],
     ) -> bool:
         if not is_active():
             return False
+        if isinstance(burst, PeerTurn):
+            return True
         result = event.result
         logical_parts = (*getattr(burst, "visible_assistant_utterances", ()), *(frame.text for frame in result.frames))
         session.append(
@@ -487,7 +541,7 @@ class PersonalAgentRuntime:
                     "provider": self.provider.name,
                     "generation_id": burst.generation_id,
                     "generation_status": "provisional",
-                    "burst_id": burst.run_id if isinstance(burst, AutomationTurn) else burst.burst_id,
+                    "burst_id": burst.run_id if isinstance(burst, AutomationTurn) else burst.request_id if isinstance(burst, PeerTurn) else burst.burst_id,
                     "revision": burst.revision,
                     "conversation": self._compact_plan(result),
                     "turn_status": result.status.value,
@@ -504,13 +558,15 @@ class PersonalAgentRuntime:
             latency_trace.emit_sandbox("sandbox_checkpoint_complete", outcome="ok" if saved else "error", elapsed_ms=max(0, int((time.monotonic() - checkpoint_started_at) * 1000)))
         return saved
 
-    def _persist_provisional_frame(self, session, burst: InputBurst | AutomationTurn, event, delivered, is_active) -> bool:
+    def _persist_provisional_frame(self, session, burst: InputBurst | AutomationTurn | PeerTurn, event, delivered, is_active) -> bool:
         if not is_active():
             return False
+        if isinstance(burst, PeerTurn):
+            return True
         parts = (*getattr(burst, "visible_assistant_utterances", ()), *(bubble.text for bubble in delivered))
         metadata = {
             "provider": self.provider.name, "generation_id": burst.generation_id,
-            "generation_status": "provisional", "burst_id": burst.run_id if isinstance(burst, AutomationTurn) else burst.burst_id,
+            "generation_status": "provisional", "burst_id": burst.run_id if isinstance(burst, AutomationTurn) else burst.request_id if isinstance(burst, PeerTurn) else burst.burst_id,
             "revision": burst.revision,
             "delivery_bubbles": [bubble.text for bubble in delivered],
         }

@@ -6,7 +6,7 @@ from math import isfinite
 from types import MappingProxyType
 from typing import Mapping, Sequence, TypeAlias
 
-from ..models import AutomationTurn, InboundEnvelope, InboundMessage, InputBurst
+from ..models import AutomationTurn, InboundEnvelope, InboundMessage, InputBurst, PeerTurn
 from ..vision import VisionObservation
 from ..personal_data import MemoryControl, MemoryGovernanceControl, MemoryWriteControl, OwnerSettingControl, PendingMemoryActionControl
 
@@ -342,14 +342,14 @@ class TurnRunCompleted:
 
 @dataclass(frozen=True)
 class ConversationRequest:
-    burst: InputBurst | AutomationTurn
+    burst: InputBurst | AutomationTurn | PeerTurn
     soul: str
     history: tuple[dict[str, str], ...]
     vision_observations: tuple[VisionObservation, ...] = ()
 
     def __post_init__(self) -> None:
         observations = tuple(self.vision_observations)
-        if isinstance(self.burst, AutomationTurn):
+        if isinstance(self.burst, (AutomationTurn, PeerTurn)):
             if observations:
                 raise ValueError("automation requests cannot include vision observations")
         elif isinstance(self.burst, InputBurst):

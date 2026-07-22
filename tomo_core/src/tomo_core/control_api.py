@@ -20,6 +20,7 @@ from .onboarding_store import TelegramOnboardingStore
 from .attachment_capability import AttachmentCapability, AttachmentCapabilityError, load_or_create_attachment_key, verify_attachment_capability
 from .telegram_bot import TelegramBotApiClient, TelegramBotApiError
 from .vision import DownloadedAttachment
+from .peer_api import create_peer_router
 
 
 class TelegramFileSource(Protocol):
@@ -135,6 +136,7 @@ def create_app(data_dir: str | Path | None = None, api_key: str | None = None, b
     attachment_source = telegram_files
     clock = now or (lambda: datetime.now(timezone.utc))
     app = FastAPI(title="tomo core control api")
+    app.include_router(create_peer_router(resolved_data_dir, api_key=resolved_api_key, clock=lambda: int(clock().timestamp())))
 
     @app.exception_handler(RequestValidationError)
     async def request_validation_error(_: Request, error: RequestValidationError) -> JSONResponse:

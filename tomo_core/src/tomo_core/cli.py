@@ -29,16 +29,19 @@ from .telegram_bot import TelegramBotApiClient, TelegramPollingBot
 from .onboarding_store import TelegramOnboardingStore
 from .telegram_router import TelegramUpdateRouter
 from .shared_gateway import InProcessTelegramRuntimeDispatch, SharedTelegramGateway
+from .peer_exchange import PeerExchange
+from .peer_service import PeerService
 from .sandbox_dispatch import SandboxDispatch
 from .sandbox_registry import SandboxRegistry
 from .sandbox_protocol import RESULT_MARKER, decode_inbound, encode_result
 from .cron_service import CronSchedulerService
 from .cron_store import CronStore
 from .cron_capability import load_or_create_key
+from .peer_capability import load_or_create_key as load_or_create_peer_key
 from .attachment_capability import load_or_create_attachment_key
 from .attachment_reader import ControlAttachmentReader
 from .vision import ProviderVisionInterpreter
-from .personal_data_transfer import export_owner
+from .personal_data_transfer import export_owner, import_owner
 from .sqlite_personal_data import SqlitePersonalDataRepository
 
 
@@ -254,7 +257,13 @@ def run_shared_gateway_foreground(args: argparse.Namespace, config: HostedRuntim
         client = TelegramBotApiClient(token=config.bot_token)
         store = TelegramOnboardingStore(config.data_dir, input_debounce_seconds=config.telegram_input_debounce_seconds)
         capability_key = load_or_create_key(config.data_dir)
+        peer_capability_key = load_or_create_peer_key(config.data_dir)
         cron_store = CronStore(config.data_dir)
+        peer_exchange = PeerExchange(
+            config.data_dir,
+            source_generation_active=store.generation_not_superseded,
+            source_generation_guard=store.generation_guard,
+        )
         if config.runtime == "local":
             oauth = build_oauth_manager(args)
             provider_factory = lambda _: StaticProvider(args.static_response) if args.static_response else build_provider(args, oauth)
@@ -278,9 +287,11 @@ def run_shared_gateway_foreground(args: argparse.Namespace, config: HostedRuntim
                     instances,
                     control_url=config.control_public_url,
                     capability_key=capability_key,
+                    peer_capability_key=peer_capability_key,
                 ),
                 pace_seconds=config.telegram_delivery_pace_seconds,
                 cron_store=cron_store,
+                peer_exchange=peer_exchange,
             )
         else:
             attachment_capability_key = load_or_create_attachment_key(config.data_dir)
@@ -308,6 +319,7 @@ def run_shared_gateway_foreground(args: argparse.Namespace, config: HostedRuntim
                 xai_vision_reasoning_effort=config.xai_vision_reasoning_effort,
                 control_url=config.control_public_url,
                 capability_key=capability_key,
+                peer_capability_key=peer_capability_key,
                 attachment_capability_key=attachment_capability_key,
             )
             gateway = SharedTelegramGateway(
@@ -316,6 +328,7 @@ def run_shared_gateway_foreground(args: argparse.Namespace, config: HostedRuntim
                 dispatch=dispatch,
                 pace_seconds=config.telegram_delivery_pace_seconds,
                 cron_store=cron_store,
+                peer_exchange=peer_exchange,
             )
         cron_service = CronSchedulerService(
             cron_store,
@@ -323,6 +336,7 @@ def run_shared_gateway_foreground(args: argparse.Namespace, config: HostedRuntim
             gateway.send_cron_delivery,
             delivery_pace_seconds=config.telegram_delivery_pace_seconds,
         )
+        peer_service = PeerService(peer_exchange, store, gateway.dispatch, send_notice=gateway.send_peer_notice)
         print("shared telegram gateway polling started. press ctrl+c to stop.")
 
         def stop_on_sigterm(_signum: int, _frame: object) -> None:
@@ -331,6 +345,7 @@ def run_shared_gateway_foreground(args: argparse.Namespace, config: HostedRuntim
         previous_sigterm = signal.signal(signal.SIGTERM, stop_on_sigterm)
         try:
             cron_service.start()
+            peer_service.start()
             TelegramUpdateRouter(
                 client=client,
                 store=store,
@@ -345,6 +360,8 @@ def run_shared_gateway_foreground(args: argparse.Namespace, config: HostedRuntim
     finally:
         if "cron_service" in locals():
             cron_service.stop()
+        if "peer_service" in locals():
+            peer_service.stop()
         if _read_pid(pid_path) == os.getpid():
             pid_path.unlink(missing_ok=True)
 
@@ -435,6 +452,8 @@ def main(argv: list[str] | None = None) -> int:
         command.add_argument("--owner")
     export = personal_data_sub.add_parser("export", help="export one owner's canonical JSONL")
     export.add_argument("--data-dir", default=os.getenv("TOMO_CORE_DATA_DIR", ".tomo_core")); export.add_argument("--owner", required=True); export.add_argument("--output", required=True)
+    import_data = personal_data_sub.add_parser("import", help="import one owner's canonical JSONL; peer records remain inert")
+    import_data.add_argument("--data-dir", default=os.getenv("TOMO_CORE_DATA_DIR", ".tomo_core")); import_data.add_argument("--owner", required=True); import_data.add_argument("--input", required=True)
     delete_owner = personal_data_sub.add_parser("delete-owner", help="permanently delete one owner's data")
     delete_owner.add_argument("--data-dir", default=os.getenv("TOMO_CORE_DATA_DIR", ".tomo_core")); delete_owner.add_argument("--owner", required=True); delete_owner.add_argument("--confirm", action="store_true")
     settings = personal_data_sub.add_parser("settings", help="inspect or update owner memory settings")
@@ -464,11 +483,21 @@ def main(argv: list[str] | None = None) -> int:
         if args.personal_data_command == "integrity-check":
             healthy = repository.integrity_check(); print("ok" if healthy else "failed"); return 0 if healthy else 1
         if args.personal_data_command == "export":
-            with Path(args.output).open("w", encoding="utf-8") as output: export_owner(repository, args.owner, output)
+            peer_records = PeerExchange(args.data_dir).export_owner_records(
+                owner_id=args.owner
+            )
+            with Path(args.output).open("w", encoding="utf-8") as output:
+                export_owner(repository, args.owner, output, peer_records=peer_records)
+            return 0
+        if args.personal_data_command == "import":
+            with Path(args.input).open(encoding="utf-8") as source:
+                import_owner(repository, args.owner, source, peer_exchange=PeerExchange(args.data_dir))
             return 0
         if args.personal_data_command == "delete-owner":
             if not args.confirm:
                 print("refusing owner deletion without --confirm", file=sys.stderr); return 2
+            PeerExchange(args.data_dir).delete_owner(args.owner)
+            TelegramOnboardingStore(args.data_dir).delete_owner(args.owner)
             repository.delete_owner(args.owner); return 0
         for setting in ("capture_enabled", "retrieval_enabled", "reactions_enabled"):
             value = getattr(args, setting)
@@ -521,7 +550,7 @@ def main(argv: list[str] | None = None) -> int:
             sys.stdout.write(f"{RESULT_MARKER}{encode_result('health-1', [OutboundBubble('healthy')])}\n")
             sys.stdout.flush()
             return 0
-        payload = os.getenv("TOMO_AUTOMATION_JSON") or os.getenv("TOMO_INBOUND_JSON")
+        payload = os.getenv("TOMO_PEER_TURN_JSON") or os.getenv("TOMO_AUTOMATION_JSON") or os.getenv("TOMO_INBOUND_JSON")
         if payload is None:
             emit_failure(sys.stdout, "missing_inbound")
             return 1
@@ -562,7 +591,7 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 provider=provider,
                 vision_interpreter=vision,
-                secret_values=tuple(value for value in (access_token, os.getenv("TOMO_CRON_CAPABILITY"), os.getenv("TOMO_ATTACHMENT_CAPABILITY")) if value),
+                secret_values=tuple(value for value in (access_token, os.getenv("TOMO_CRON_CAPABILITY"), os.getenv("TOMO_PEER_CAPABILITY"), os.getenv("TOMO_ATTACHMENT_CAPABILITY")) if value),
             )
         except SandboxInboundError:
             return 1

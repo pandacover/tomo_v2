@@ -68,6 +68,21 @@ class ControlApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("expiresAt", payload)
             self.assertNotIn("botToken", payload)
 
+    async def test_peer_router_is_mounted_and_applies_the_control_api_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = create_app(data_dir=tmp, api_key="secret")
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+                denied = await client.get("/v1/peers/relationships", params={"userId": "u1"})
+                accepted = await client.get(
+                    "/v1/peers/relationships",
+                    headers={"x-api-key": "secret"},
+                    params={"userId": "u1"},
+                )
+
+            self.assertEqual(denied.status_code, 401)
+            self.assertEqual(accepted.status_code, 200)
+            self.assertEqual(accepted.json(), {"relationships": []})
+
     async def test_attachment_resolution_uses_safe_statuses_and_never_calls_unauthorized_source(self):
         class Files:
             called = False

@@ -149,3 +149,23 @@ class ToolRegistry:
             tuple(tool for tool in self._tools if tool.spec.unattended_safe),
             blocked=self._blocked | frozenset(tool.spec.name for tool in self._tools if not tool.spec.unattended_safe),
         )
+
+    def peer_safe(self) -> "ToolRegistry":
+        """Expose only owner-bound personal search during an untrusted peer turn."""
+        allowed = tuple(
+            tool
+            for tool in self._tools
+            if tool.spec.name == "personal_search"
+            and tool.spec.read_only
+            and tool.spec.unattended_safe
+        )
+        allowed_names = frozenset(tool.spec.name for tool in allowed)
+        return ToolRegistry(
+            allowed,
+            blocked=self._blocked
+            | frozenset(
+                tool.spec.name
+                for tool in self._tools
+                if tool.spec.name not in allowed_names
+            ),
+        )

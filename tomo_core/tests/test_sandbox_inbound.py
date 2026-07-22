@@ -135,6 +135,27 @@ class SandboxInboundTests(unittest.TestCase):
         events = list(iter_event_markers(stdout.getvalue().splitlines(keepends=True), "request-1", "gen-1"))
         self.assertEqual([event.text for event in events if isinstance(event, SandboxFrameEvent)], ["hello back."])
 
+    def test_build_runtime_adds_peer_tools_only_for_a_complete_matching_interactive_binding(self):
+        env = {
+            "TOMO_PEER_CONTROL_URL": "https://control.example.test",
+            "TOMO_PEER_CAPABILITY": "peer-capability",
+            "TOMO_PEER_OWNER_ID": "owner",
+            "TOMO_PEER_ACTOR_ID": "actor",
+            "TOMO_PEER_DESTINATION": "telegram:chat",
+            "TOMO_PEER_SESSION_ID": "telegram:actor:actor",
+            "TOMO_PEER_GENERATION_ID": "gen-1",
+        }
+        provider = Mock(supports_tool_calls=True)
+        with tempfile.TemporaryDirectory() as data_dir, patch.dict("os.environ", env, clear=True):
+            runtime = build_runtime(provider, RuntimeConfig(data_dir=data_dir), generation_id="gen-1")
+            self.assertEqual({item["function"]["name"] for item in runtime.tool_registry.schemas()}, {"search_memories", "search_sessions", "peer_list", "peer_ask", "peer_resume"})
+            automation = build_runtime(provider, RuntimeConfig(data_dir=data_dir), generation_id="gen-1", automation=True)
+            self.assertNotIn("peer_list", {item["function"]["name"] for item in automation.tool_registry.schemas()})
+        incomplete = dict(env); incomplete.pop("TOMO_PEER_SESSION_ID")
+        with tempfile.TemporaryDirectory() as data_dir, patch.dict("os.environ", incomplete, clear=True):
+            runtime = build_runtime(provider, RuntimeConfig(data_dir=data_dir), generation_id="gen-1")
+            self.assertNotIn("peer_list", {item["function"]["name"] for item in runtime.tool_registry.schemas()})
+
     def test_run_once_maps_http_401_to_auth_expired_without_exception_text(self):
         token, stdout, runtime = "secret-access-token", io.StringIO(), Mock()
         response = httpx.Response(401, request=httpx.Request("POST", "https://api.x.ai/v1/chat/completions"))

@@ -14,6 +14,7 @@ from tomo_core.cron_models import CronJob, JobIntent, ScheduleSpec
 from tomo_core.cron_store import CronStore
 from tomo_core.telegram_router import RetryableTelegramUpdateError
 from tomo_core.providers import XaiApiProvider
+from tomo_core.peer_exchange import PeerExchange
 
 
 class CliTests(unittest.TestCase):
@@ -139,6 +140,7 @@ class CliTests(unittest.TestCase):
             patch("tomo_core.cli.TelegramBotApiClient"),
             patch("tomo_core.cli.TelegramOnboardingStore"),
             patch("tomo_core.cli.load_or_create_key", return_value=b"k" * 32),
+            patch("tomo_core.cli.load_or_create_peer_key", return_value=b"p" * 32),
             patch("tomo_core.cli.CronStore"),
             patch("tomo_core.cli.RuntimeInstanceRegistry") as instances,
             patch("tomo_core.cli.build_vision_interpreter") as vision_builder,
@@ -159,6 +161,7 @@ class CliTests(unittest.TestCase):
             vision_builder.call_args.kwargs,
             {"model": "shared-vision-model", "reasoning_effort": "medium"},
         )
+        self.assertEqual(gateway.call_args.kwargs["dispatch"].peer_capability_key, b"p" * 32)
 
     def test_telegram_shared_ignores_static_response_environment_without_explicit_flag(self):
         with patch.dict("os.environ", {"TOMO_CORE_STATIC_RESPONSE": "test"}, clear=True):
@@ -181,6 +184,17 @@ class CliTests(unittest.TestCase):
         self.assertEqual(run_once.call_args.args[0].read(), "payload")
         self.assertIs(run_once.call_args.kwargs["config"], runtime_config.return_value)
         self.assertEqual(run_once.call_args.kwargs["secret_values"], (token,))
+
+    def test_sandbox_inbound_redacts_peer_capability_as_a_secret(self):
+        token, peer_capability = "supergrok-access-token", "peer-capability-derived-from-key"
+        with (
+            patch.dict("os.environ", {"TOMO_SUPERGROK_ACCESS_TOKEN": token, "TOMO_INBOUND_JSON": "payload", "TOMO_CORE_DATA_DIR": "/data", "TOMO_INSTANCE_ID": "tomo-1", "TOMO_PEER_CAPABILITY": peer_capability}, clear=True),
+            patch("tomo_core.cli.supergrok_oauth_provider_from_access_token"),
+            patch("tomo_core.cli.run_once", return_value=0) as run_once,
+            patch("sys.stdout", io.StringIO()),
+        ):
+            self.assertEqual(main(["sandbox-inbound"]), 0)
+        self.assertEqual(run_once.call_args.kwargs["secret_values"], (token, peer_capability))
 
     def test_sandbox_inbound_uses_xai_model_and_reasoning_effort_environment_overrides(self):
         token = "supergrok-access-token"

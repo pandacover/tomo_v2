@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass, field
 import json
 from typing import Literal
 
-from .models import AutomationTurn, InboundMessage, MessageAttachment, utc_now_iso
+from .models import AutomationTurn, InboundMessage, MessageAttachment, PeerTurn, utc_now_iso
 from .vision import VisionObservation
 
 Role = Literal["user", "assistant", "automation"]
@@ -69,6 +69,14 @@ class ConversationSession:
             "burst_id": turn.run_id, "chat_id": turn.chat_id, "trigger": turn.trigger,
             "will_end_after_run": turn.will_end_after_run,
         }))
+        return True
+
+    def append_peer_once(self, turn: PeerTurn) -> bool:
+        if not isinstance(turn, PeerTurn):
+            raise TypeError("turn must be a PeerTurn")
+        if any(message.metadata.get("source") == "untrusted_peer" and message.metadata.get("burst_id") == turn.request_id for message in self.messages):
+            return False
+        self.messages.append(StoredMessage("user", turn.event_text, metadata={"source": "untrusted_peer", "request_id": turn.request_id, "burst_id": turn.request_id}))
         return True
 
     def accept_generations(self, generation_ids: tuple[str, ...]) -> None:

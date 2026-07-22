@@ -5,23 +5,26 @@ from __future__ import annotations
 import os
 import json
 import logging
+import math
 import re
 import time
 import traceback
+from datetime import datetime, timezone
 from collections import defaultdict
-from threading import Lock
+from threading import Event, Lock, Thread
 from typing import Callable, Iterator, Protocol
 
 from .daytona_client import DaytonaClient, DaytonaClientError, SessionCommandHandle
 from .daytona_supervisor import DaytonaSupervisor
 from .attachment_capability import AttachmentCapability, hash_file_id, issue_attachment_capability
 from .conversation import TurnBudget
-from .models import AutomationTurn, InboundEnvelope, InboundMessage, InputBurst, OutboundBubble, RuntimeConfig
+from .models import AutomationTurn, InboundEnvelope, InboundMessage, InputBurst, OutboundBubble, PeerTurn, RuntimeConfig
 from .onboarding_store import InterruptedGeneration, TelegramGenerationInput, TelegramGenerationWork, TelegramInstallation
-from .sandbox_protocol import SandboxCompletedEvent, SandboxErrorEvent, SandboxEvent, SandboxFrameEvent, SandboxProtocolError, encode_automation, encode_inbound, iter_event_markers, parse_result_marker
+from .sandbox_protocol import SandboxCompletedEvent, SandboxErrorEvent, SandboxEvent, SandboxFrameEvent, SandboxProtocolError, SandboxReactionEvent, encode_automation, encode_inbound, encode_peer, iter_event_markers, parse_result_marker
 from .telegram import photo_attachments_from_message, reply_context_from_message
 from . import latency_trace
 from .cron_capability import CronCapability, issue_capability
+from .peer_capability import PeerCapability, issue_capability as issue_peer_capability
 
 
 _COMMAND = "/opt/tomo/.venv/bin/tomo-core sandbox-inbound"
@@ -81,6 +84,7 @@ class SandboxDispatch:
         budget: TurnBudget | None = None,
         control_url: str | None = None,
         capability_key: bytes | None = None,
+        peer_capability_key: bytes | None = None,
         attachment_capability_key: bytes | None = None,
     ) -> None:
         self.supervisor = supervisor
@@ -94,6 +98,7 @@ class SandboxDispatch:
         self.budget = budget or RuntimeConfig().tool_turn_budget
         self.control_url = control_url
         self.capability_key = capability_key
+        self.peer_capability_key = peer_capability_key
         self.attachment_capability_key = attachment_capability_key
 
     def ensure_worker(self, installation: TelegramInstallation) -> None:
@@ -170,6 +175,7 @@ class SandboxDispatch:
                         "TOMO_XAI_REASONING_EFFORT": os.getenv("TOMO_XAI_REASONING_EFFORT", self.xai_reasoning_effort),
                         **self._attachment_env(installation, burst),
                         **self._interactive_cron_env(installation),
+                        **self._interactive_peer_env(installation, work.generation_id, session_id),
                         **_latency_env(),
                     },
                     timeout=_interactive_timeout_seconds(burst),
@@ -260,6 +266,27 @@ class SandboxDispatch:
             "TOMO_CRON_SESSION_ID": f"telegram:actor:{installation.actor_id}",
         }
 
+    def _interactive_peer_env(self, installation: TelegramInstallation, generation_id: str, session_id: str) -> dict[str, str]:
+        if self.control_url is None or self.peer_capability_key is None:
+            return {}
+        now = int(time.time())
+        destination = f"telegram:{installation.chat_id}"
+        capability = PeerCapability(
+            installation.tomo_id, installation.actor_id, destination, session_id, generation_id,
+            now,
+            now + 300,
+            frozenset({"list_relationships", "ask", "inspect_request"}),
+        )
+        return {
+            "TOMO_PEER_CONTROL_URL": self.control_url,
+            "TOMO_PEER_CAPABILITY": issue_peer_capability(self.peer_capability_key, capability),
+            "TOMO_PEER_OWNER_ID": capability.owner_id,
+            "TOMO_PEER_ACTOR_ID": capability.actor_id,
+            "TOMO_PEER_DESTINATION": capability.destination,
+            "TOMO_PEER_SESSION_ID": capability.session_id,
+            "TOMO_PEER_GENERATION_ID": capability.generation_id,
+        }
+
     def _attachment_env(self, installation: TelegramInstallation, burst: InputBurst) -> dict[str, str]:
         """Grant a sandbox exactly the image file IDs in this interactive burst."""
         if self.control_url is None or self.attachment_capability_key is None:
@@ -348,6 +375,76 @@ class SandboxDispatch:
                         except DaytonaClientError:
                             pass
         raise SandboxDispatchError("auth_expired")
+
+    def iter_peer_events(self, installation: TelegramInstallation, turn: PeerTurn, generation_id: str, session_id: str, is_active: Callable[[], bool] | None = None) -> Iterator[SandboxEvent]:
+        if generation_id != turn.generation_id or not session_id.startswith("peer:"):
+            raise SandboxDispatchError("invalid_result")
+        is_active = is_active or (lambda: True)
+        request_id = turn.request_id
+        expires_at = datetime.fromisoformat(turn.expires_at.replace("Z", "+00:00"))
+        remaining = (expires_at - datetime.now(timezone.utc)).total_seconds()
+        timeout = min(60, max(0, math.ceil(remaining)))
+        if timeout <= 0:
+            return
+        with self._locks[installation.tomo_id]:
+            command = None
+            sandbox = None
+            cancelled = Event()
+            deleted = Event()
+            delete_lock = Lock()
+
+            def delete_once() -> None:
+                if sandbox is None or deleted.is_set():
+                    return
+                with delete_lock:
+                    if deleted.is_set():
+                        return
+                    try:
+                        self.client.delete_session(sandbox, session_id)
+                    except DaytonaClientError:
+                        return
+                    deleted.set()
+
+            def monitor() -> None:
+                while not cancelled.wait(0.25):
+                    if not is_active() or datetime.now(timezone.utc) >= expires_at:
+                        delete_once()
+                        if deleted.is_set():
+                            return
+            try:
+                if not is_active(): return
+                record = self.supervisor.reconcile(installation.tomo_id)
+                if not record.sandbox_id: raise SandboxDispatchError("sandbox_not_ready")
+                sandbox = self.client.get(record.sandbox_id)
+                token = self.auth_broker.access_token()
+                command = self.client.start_session_command(sandbox, session_id, _COMMAND, env={
+                    "TOMO_PEER_TURN_JSON": encode_peer(request_id, turn), "TOMO_CORE_DATA_DIR": self.data_dir,
+                    "TOMO_INSTANCE_ID": installation.tomo_id, "TOMO_SUPERGROK_ACCESS_TOKEN": token,
+                    "TOMO_CORE_SOUL": "/opt/tomo/SOUL.md", "TOMO_XAI_MODEL": os.getenv("TOMO_XAI_MODEL", self.xai_model),
+                    "TOMO_XAI_REASONING_EFFORT": os.getenv("TOMO_XAI_REASONING_EFFORT", self.xai_reasoning_effort), **_latency_env(),
+                }, timeout=timeout)
+                monitor_thread = Thread(target=monitor, daemon=True)
+                monitor_thread.start()
+                for event in iter_event_markers(self.client.iter_session_logs(sandbox, command), request_id, generation_id, budget=self.budget):
+                    if isinstance(event, SandboxReactionEvent): raise SandboxDispatchError("invalid_result")
+                    if not is_active(): return
+                    if isinstance(event, SandboxErrorEvent): raise SandboxDispatchError(event.code)
+                    yield event
+                if self.client.session_command_exit_code(sandbox, command): raise SandboxDispatchError("sandbox_exec_failed")
+            except (DaytonaClientError, TimeoutError) as error:
+                raise SandboxDispatchError("sandbox_timeout" if isinstance(error, TimeoutError) else "sandbox_exec_failed") from error
+            except ValueError as error:
+                raise SandboxDispatchError("invalid_result") from error
+            finally:
+                cancelled.set()
+                if 'monitor_thread' in locals():
+                    monitor_thread.join(timeout=1)
+                if command is not None:
+                    for _ in range(3):
+                        delete_once()
+                        if deleted.is_set():
+                            break
+                        time.sleep(0.1)
 
     def cancel_generation(self, interrupted: InterruptedGeneration) -> None:
         try:

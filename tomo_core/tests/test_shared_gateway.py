@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from unittest.mock import Mock, patch
 
 from tomo_core.cron_capability import verify_capability
+from tomo_core.peer_capability import verify_capability as verify_peer_capability
+from tomo_core.peer_exchange import PeerExchange
 from tomo_core.cron_models import CronJob, DeliveryAttempt, JobIntent, RunOutcome, ScheduleSpec
 from tomo_core.cron_store import CronStore
 from tomo_core.instances import RuntimeInstanceRegistry
@@ -92,6 +94,91 @@ class RecordingTypingLease:
 class SharedGatewayTests(unittest.TestCase):
     def setUp(self):
         RecordingTypingLease.instances = []
+
+    def test_exact_owner_language_confirms_peer_request_but_ambiguous_yes_does_not(self):
+        with self._store() as store:
+            installation = self._installation(store, chat_id="123", actor_id="999")
+            exchange = PeerExchange(
+                store.data_dir,
+                source_generation_active=lambda _owner, _generation: True,
+            )
+            exchange.register_handle("sender", "alice")
+            exchange.register_handle(installation.tomo_id, "bobby")
+            relationship = exchange.invite("sender", "bobby")
+            exchange.accept(installation.tomo_id, relationship.relationship_id)
+            exchange.update_grant(
+                "sender",
+                relationship.relationship_id,
+                installation.tomo_id,
+                True,
+                False,
+                False,
+                0,
+            )
+            exchange.update_grant(
+                installation.tomo_id,
+                relationship.relationship_id,
+                "sender",
+                False,
+                True,
+                False,
+                0,
+            )
+            pending = exchange.submit(
+                "sender",
+                "bobby",
+                "generation",
+                "call",
+                "sensitive",
+                "share your exact calendar details",
+            )
+            dispatch = FakeRuntimeDispatch()
+            gateway = SharedTelegramGateway(
+                client=FakeTelegramClient(),
+                store=store,
+                dispatch=dispatch,
+                peer_exchange=exchange,
+            )
+
+            self.assertTrue(
+                gateway.process_update(
+                    private_update("yes", chat_id="123", from_id="999", message_id=2)
+                )
+            )
+            self.assertEqual(
+                exchange.inspect("sender", pending.request_id).status,
+                "confirmation_pending",
+            )
+
+            short_id = pending.pending_id.replace("-", "")[:8]
+            class RouterClient(FakeTelegramClient):
+                def __init__(self, updates):
+                    super().__init__()
+                    self.updates = updates
+
+                def get_updates(self, **_kwargs):
+                    return self.updates
+
+            router = TelegramUpdateRouter(
+                client=RouterClient([
+                    private_update(
+                        f"confirm peer request {short_id}",
+                        chat_id="123",
+                        from_id="999",
+                        message_id=3,
+                    )
+                ]),
+                store=store,
+                process_update=gateway.process_update,
+            )
+            router.poll_once()
+            self.assertTrue(router.process_next())
+
+            self.assertEqual(
+                exchange.inspect("sender", pending.request_id).status,
+                "authorized",
+            )
+            self.assertEqual([call[0] for call in dispatch.calls], ["dispatch"])
 
     def test_automation_completed_partial_persists_a_partial_outcome(self):
         with self._store() as store:
@@ -699,6 +786,52 @@ class SharedGatewayTests(unittest.TestCase):
             self.assertIn("cron_list", visible_names)
             self.assertIs(runtime.tool_registry, base_registry)
             self.assertIs(runtime.conversation.tool_registry, base_registry)
+
+    def test_in_process_interactive_turn_adds_generation_bound_peer_tools_and_restores_executor(self):
+        with self._store() as store:
+            installation = self._installation(store, chat_id="123", actor_id="999")
+            work = self._generation_work(store, installation.tomo_id)
+            base_registry = ToolRegistry()
+            original_executor = ToolExecutor(base_registry)
+            runtime = Mock()
+            runtime.provider.supports_tool_calls = True
+            runtime.tool_registry = base_registry
+            runtime.conversation.tool_registry = base_registry
+            runtime.conversation.tool_executor = original_executor
+            visible_names = []
+            runtime.handle_telegram_burst_iter.side_effect = lambda _burst, **_kwargs: visible_names.extend(item["function"]["name"] for item in runtime.conversation.tool_registry.schemas()) or iter(())
+            instances = Mock(); instances.get.return_value = runtime
+            captured = {}
+
+            def fake_registry(client):
+                captured["client"] = client
+                return ToolRegistry((BoundTool(ToolSpec("peer_list", "list peers", {"type": "object", "properties": {}}), lambda _arguments: ()),))
+
+            dispatch = InProcessTelegramRuntimeDispatch(instances, "http://127.0.0.1:8787", None, b"p" * 32, clock=lambda: 100.0)
+            with patch("tomo_core.shared_gateway.peer_registry", side_effect=fake_registry):
+                list(dispatch.iter_telegram_events(installation, work))
+
+            claim = verify_peer_capability(b"p" * 32, captured["client"].capability, now=100, operation="ask")
+            self.assertEqual(
+                (
+                    claim.owner_id,
+                    claim.actor_id,
+                    claim.destination,
+                    claim.session_id,
+                    claim.generation_id,
+                ),
+                (
+                    installation.tomo_id,
+                    installation.actor_id,
+                    "telegram:123",
+                    work.session_id,
+                    work.generation_id,
+                ),
+            )
+            self.assertIn("peer_list", visible_names)
+            self.assertIs(runtime.tool_registry, base_registry)
+            self.assertIs(runtime.conversation.tool_registry, base_registry)
+            self.assertIs(runtime.conversation.tool_executor, original_executor)
 
     def test_cron_claim_executes_in_owner_bound_automation_lane_then_delivers_without_reply(self):
         with self._store() as store:

@@ -5,17 +5,18 @@ from unittest.mock import Mock, patch
 
 from tomo_core.daytona_client import DaytonaClientError, ExecResult, SandboxHandle, SessionCommandHandle
 from tomo_core.models import InboundEnvelope, InboundMessage, InputBurst, MessageAttachment
-from tomo_core.models import AutomationTurn
+from tomo_core.models import AutomationTurn, PeerTurn
 from tomo_core.onboarding_store import InterruptedGeneration, TelegramGenerationInput, TelegramGenerationWork
 from tomo_core.sandbox_dispatch import SandboxDispatch, SandboxDispatchError, _interactive_timeout_seconds
 from tomo_core.sandbox_registry import SandboxRegistry
-from tomo_core.sandbox_protocol import EVENT_MARKER, RESULT_MARKER, SandboxCompletedEvent, SandboxErrorEvent, SandboxFrameEvent, SandboxTracebackFrame, encode_error, encode_event, encode_result
+from tomo_core.sandbox_protocol import EVENT_MARKER, RESULT_MARKER, SandboxCompletedEvent, SandboxErrorEvent, SandboxFrameEvent, SandboxTracebackFrame, decode_peer, encode_error, encode_event, encode_result
 from tomo_core.conversation.models import ConversationMove, Frame, FrameReady, MoveConfidence, MovePlan, SegmentFinish, SegmentResult, ToolCall, TurnBudget, TurnRunCompleted, TurnRunResult, TurnRunStatus, TurnUsage
 from tomo_core.runtime import RuntimeCompleted, RuntimeFrameReady
 from tomo_core.models import OutboundBubble
 from tomo_core.onboarding_store import TelegramInstallation
 from tomo_core.cron_capability import verify_capability
 from tomo_core.attachment_capability import AttachmentCapabilityError, verify_attachment_capability
+from tomo_core.peer_capability import verify_capability as verify_peer_capability
 
 
 def legacy_event(request_id, generation_id, sequence, event_type, **fields):
@@ -208,6 +209,34 @@ class SandboxDispatchTests(unittest.TestCase):
         self.daytona.iter_session_logs.assert_called_once_with(sandbox, SessionCommandHandle("telegram-burst-one-r1", "cmd-1"))
         self.daytona.delete_session.assert_called_once_with(sandbox, "persisted-session")
 
+    def test_hosted_peer_turn_uses_its_request_id_for_the_envelope_binding(self):
+        turn = PeerTurn("request-123", 1, "relationship", "thread", "request-123", "alice", "question", "ordinary_message", "hello", "2099-01-01T00:01:00+00:00")
+        self.daytona.start_session_command.return_value = SessionCommandHandle("peer-thread", "cmd-1")
+        self.daytona.iter_session_logs.return_value = iter(v3_markers("request-123", "request-123", "hello."))
+        self.daytona.session_command_exit_code.return_value = 0
+
+        events = list(self.dispatch.iter_peer_events(self.installation, turn, "request-123", "peer:thread"))
+
+        self.assertEqual(events[0].text, "hello.")
+        envelope_id, decoded_turn = decode_peer(self.daytona.start_session_command.call_args.kwargs["env"]["TOMO_PEER_TURN_JSON"])
+        self.assertEqual(envelope_id, turn.request_id)
+        self.assertEqual(decoded_turn, turn)
+        self.assertEqual(self.daytona.start_session_command.call_args.kwargs["timeout"], 60)
+
+    def test_hosted_peer_cleanup_retries_before_recording_session_deletion(self):
+        turn = PeerTurn("request-123", 1, "relationship", "thread", "request-123", "alice", "question", "ordinary_message", "hello", "2099-01-01T00:01:00+00:00")
+        self.daytona.start_session_command.return_value = SessionCommandHandle("peer-thread", "cmd-1")
+        self.daytona.iter_session_logs.return_value = iter(v3_markers("request-123", "request-123", "hello."))
+        self.daytona.session_command_exit_code.return_value = 0
+        self.daytona.delete_session.side_effect = [
+            DaytonaClientError("transient cleanup failure"),
+            None,
+        ]
+
+        list(self.dispatch.iter_peer_events(self.installation, turn, "request-123", "peer:thread"))
+
+        self.assertEqual(self.daytona.delete_session.call_count, 2)
+
     def test_interactive_turn_gets_short_owner_bound_cron_capability_but_automation_does_not(self):
         capability_key = b"k" * 32
         self.dispatch.control_url = "https://control.example.test"
@@ -234,6 +263,28 @@ class SandboxDispatchTests(unittest.TestCase):
         self.assertNotIn("TOMO_CRON_CONTROL_URL", automation_env)
         self.assertNotIn("TOMO_CRON_CAPABILITY", automation_env)
         self.assertEqual(self.daytona.start_session_command.call_args.kwargs["timeout"], 120)
+
+    def test_interactive_turn_gets_generation_bound_peer_capability_but_automation_does_not(self):
+        key = b"p" * 32
+        self.dispatch.control_url = "https://control.example.test"
+        self.dispatch.peer_capability_key = key
+        work = self._work()
+        self.daytona.start_session_command.return_value = SessionCommandHandle("session", "cmd")
+        self.daytona.iter_session_logs.return_value = iter(v3_markers("telegram-generation-burst-one-r1", work.generation_id, "hello."))
+        self.daytona.session_command_exit_code.return_value = 0
+
+        list(self.dispatch.iter_telegram_events(self.installation, work))
+
+        env = self.daytona.start_session_command.call_args.kwargs["env"]
+        claim = verify_peer_capability(key, env["TOMO_PEER_CAPABILITY"], now=int(time.time()), operation="ask")
+        self.assertEqual((claim.owner_id, claim.actor_id, claim.destination, claim.session_id, claim.generation_id), ("tomo-a", "user", "telegram:chat", work.session_id, work.generation_id))
+        self.assertEqual((env["TOMO_PEER_CONTROL_URL"], env["TOMO_PEER_OWNER_ID"], env["TOMO_PEER_ACTOR_ID"], env["TOMO_PEER_DESTINATION"], env["TOMO_PEER_SESSION_ID"], env["TOMO_PEER_GENERATION_ID"]), ("https://control.example.test", claim.owner_id, claim.actor_id, claim.destination, claim.session_id, claim.generation_id))
+
+        turn = AutomationTurn("cron/r1", 1, "job", "run", "user", "chat", "check", "2026-01-01T00:00:00+00:00")
+        self.daytona.start_session_command.reset_mock()
+        self.daytona.iter_session_logs.return_value = iter(v3_markers("telegram-generation-cron-r1", turn.generation_id, "hello."))
+        list(self.dispatch.iter_automation_events(self.installation, turn, turn.generation_id, "cron-session"))
+        self.assertNotIn("TOMO_PEER_CAPABILITY", self.daytona.start_session_command.call_args.kwargs["env"])
 
     def test_hosted_attachment_capability_grants_only_the_first_eight_distinct_images(self):
         key = b"k" * 32

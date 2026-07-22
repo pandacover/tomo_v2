@@ -9,12 +9,13 @@ from typing import Any, Callable, Iterable, Iterator, TypeAlias
 
 from .conversation import ConversationMove, FrameReady, MoveConfidence, MovePlan, ReactionIntent, SegmentFinish, TurnBudget, TurnRunCompleted, TurnRunStatus, TurnUsage
 from .conversation.parsing import _validate_strict_frame_text, parse_utterance, parse_utterances
-from .models import AutomationTurn, InboundEnvelope, InboundMessage, InputBurst, MessageAttachment, OutboundBubble, ReplyContext, ResponseContract, RuntimeConfig
+from .models import AutomationTurn, InboundEnvelope, InboundMessage, InputBurst, MessageAttachment, OutboundBubble, PeerTurn, ReplyContext, ResponseContract, RuntimeConfig
 from .runtime import RuntimeCompleted, RuntimeFrameReady, RuntimeReactionReady
 from .latency_trace import SANDBOX_LATENCY_MARKER
 
 INBOUND_PROTOCOL_VERSION = 2
 AUTOMATION_PROTOCOL_VERSION = 6
+PEER_PROTOCOL_VERSION = 1
 PROTOCOL_VERSION = 5
 LEGACY_EVENT_PROTOCOL_VERSION = 2
 LEGACY_V3_EVENT_PROTOCOL_VERSION = 3
@@ -167,9 +168,34 @@ def decode_automation(payload: str) -> tuple[str, AutomationTurn]:
         raise ValueError("invalid automation turn") from error
 
 
-def decode_turn(payload: str) -> tuple[str, InputBurst | AutomationTurn]:
+def encode_peer(request_id: str, turn: PeerTurn) -> str:
+    _validate_request_id(request_id)
+    if not isinstance(turn, PeerTurn):
+        raise TypeError("turn must be a PeerTurn")
+    return _encode({"version": PEER_PROTOCOL_VERSION, "type": "peer", "request_id": request_id, "turn": asdict(turn)})
+
+
+def decode_peer(payload: str) -> tuple[str, PeerTurn]:
+    message = _decode(payload, "peer", {PEER_PROTOCOL_VERSION})
+    if set(message) != {"version", "type", "request_id", "turn"} or not isinstance(message["turn"], dict):
+        raise ValueError("peer payload contains unsupported fields")
+    expected = {"generation_id", "revision", "relationship_id", "thread_id", "request_id", "peer_handle", "purpose", "disclosure_kind", "message", "expires_at", "prior_exchanges", "disclosure_scope"}
+    if set(message["turn"]) != expected:
+        raise ValueError("peer turn contains unsupported fields")
+    try:
+        turn = PeerTurn(**message["turn"])
+    except (TypeError, ValueError) as error:
+        raise ValueError("invalid peer turn") from error
+    if turn.request_id != message["request_id"]:
+        raise ValueError("peer request binding does not match")
+    return message["request_id"], turn
+
+
+def decode_turn(payload: str) -> tuple[str, InputBurst | AutomationTurn | PeerTurn]:
     message = _json_object(payload)
-    return decode_automation(payload) if message.get("type") == "automation" else decode_inbound(payload)
+    if message.get("type") == "automation": return decode_automation(payload)
+    if message.get("type") == "peer": return decode_peer(payload)
+    return decode_inbound(payload)
 
 
 def encode_event(request_id: str, generation_id: str, sequence: int, event: object, *, expected_reaction_binding: tuple[str, str, str, str, str, int] | None = None) -> str:

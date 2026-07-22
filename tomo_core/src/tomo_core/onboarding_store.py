@@ -5,8 +5,10 @@ import re
 import secrets
 import sqlite3
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
 
 
 @dataclass(frozen=True)
@@ -98,6 +100,16 @@ class AutomationGenerationReservation:
     session_id: str
 
 
+@dataclass(frozen=True)
+class ActiveGenerationContext:
+    tomo_id: str
+    chat_id: str
+    revision: int
+    session_id: str
+    status: str
+    actor_id: str
+
+
 class TelegramOnboardingStore:
     def __init__(self, data_dir: str | Path, *, input_debounce_seconds: float = 0.7) -> None:
         if input_debounce_seconds < 0:
@@ -106,13 +118,14 @@ class TelegramOnboardingStore:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.data_dir / "onboarding.sqlite"
+        self._generation_lock = RLock()
         self._init_db()
 
     def create_install_link(self, user_id: str, bot_username: str, ttl_seconds: int = 600) -> InstallLink:
         token = secrets.token_urlsafe(32)
         now = int(time.time())
         expires_at = now + ttl_seconds
-        tomo_id = self._tomo_id_for_user(user_id)
+        tomo_id = self.tomo_id_for_user(user_id)
         db = self._connect()
         db.execute(
             """
@@ -177,7 +190,102 @@ class TelegramOnboardingStore:
         finally:
             db.close()
 
+    @staticmethod
+    def tomo_id_for_user(user_id: str) -> str:
+        suffix = hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:10]
+        safe_user = "".join(ch if ch.isalnum() else "-" for ch in user_id.lower()).strip("-")[:32] or "user"
+        return f"tomo-{safe_user}-{suffix}"
+
+    def installation_for_tomo(self, tomo_id: str) -> TelegramInstallation | None:
+        db = self._connect()
+        try:
+            rows = db.execute(
+                "select user_id, tomo_id, chat_id, actor_id, installed_at from telegram_installations where tomo_id = ? limit 2",
+                (tomo_id,),
+            ).fetchall()
+            if len(rows) != 1:
+                return None
+            row = rows[0]
+            return TelegramInstallation(row["user_id"], row["tomo_id"], row["chat_id"], row["actor_id"], int(row["installed_at"]))
+        finally:
+            db.close()
+
+    def active_generation_context(self, tomo_id: str, generation_id: str) -> ActiveGenerationContext | None:
+        db = self._connect()
+        try:
+            row = db.execute(
+                """
+                select g.tomo_id, g.chat_id, g.revision, g.session_id, g.status, i.actor_id
+                from telegram_generations g
+                join telegram_installations i on i.chat_id = g.chat_id and i.tomo_id = g.tomo_id
+                where g.tomo_id = ? and g.generation_id = ? and g.status = 'active'
+                """,
+                (tomo_id, generation_id),
+            ).fetchone()
+            if row is None:
+                return None
+            return ActiveGenerationContext(row["tomo_id"], row["chat_id"], int(row["revision"]), row["session_id"], row["status"], row["actor_id"])
+        finally:
+            db.close()
+
+    def generation_not_superseded(self, tomo_id: str, generation_id: str) -> bool:
+        """Completed generations may still have a pending peer proposal; superseded ones may not."""
+        with self._generation_lock:
+            db = self._connect()
+            try:
+                row = db.execute(
+                    "select 1 from telegram_generations where tomo_id=? and generation_id=? and status in ('active','completed')",
+                    (tomo_id, generation_id),
+                ).fetchone()
+                return row is not None
+            finally:
+                db.close()
+
+    @contextmanager
+    def generation_guard(self, tomo_id: str, generation_id: str):
+        """Linearize a peer notice send against cross-process supersession."""
+        with self._generation_lock:
+            db = self._connect()
+            try:
+                db.execute("begin immediate")
+                active = db.execute(
+                    "select 1 from telegram_generations where tomo_id=? and generation_id=? "
+                    "and status in ('active','completed')",
+                    (tomo_id, generation_id),
+                ).fetchone() is not None
+                yield active
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+            finally:
+                db.close()
+
     def enqueue_update(
+        self,
+        update_id: int,
+        chat_id: str,
+        payload: str,
+        *,
+        now: float | None = None,
+        update_kind: str = "control",
+        message_id: str | None = None,
+        telegram_sent_at: float | None = None,
+        tomo_id: str = "",
+    ) -> EnqueueResult:
+        with self._generation_lock:
+            return self._enqueue_update(
+                update_id,
+                chat_id,
+                payload,
+                now=now,
+                update_kind=update_kind,
+                message_id=message_id,
+                telegram_sent_at=telegram_sent_at,
+                tomo_id=tomo_id,
+            )
+
+    def _enqueue_update(
         self,
         update_id: int,
         chat_id: str,
@@ -216,7 +324,7 @@ class TelegramOnboardingStore:
             if turn is not None and turn["active_generation_id"]:
                 active_generation_id = turn["active_generation_id"]
                 generation = db.execute("select session_id from telegram_generations where generation_id=? and status='active'", (active_generation_id,)).fetchone()
-                db.execute("update telegram_generations set status='superseded',updated_at=? where generation_id=? and status='active'", (now, active_generation_id))
+                db.execute("update telegram_generations set status='superseded',cleanup_pending=1,updated_at=? where generation_id=? and status='active'", (now, active_generation_id))
                 superseded_generation_id = active_generation_id
                 superseded_session_id = generation["session_id"] if generation is not None else None
             if turn is None or turn["burst_id"] is None:
@@ -248,7 +356,7 @@ class TelegramOnboardingStore:
                         (active_generation_id,),
                     ).fetchone()
                     db.execute(
-                        "update telegram_generations set status = 'superseded', updated_at = ? where generation_id = ? and status = 'active'",
+                        "update telegram_generations set status = 'superseded', cleanup_pending = 1, updated_at = ? where generation_id = ? and status = 'active'",
                         (now, active_generation_id),
                     )
                     superseded_generation_id = active_generation_id
@@ -582,15 +690,19 @@ class TelegramOnboardingStore:
         try:
             db.execute("begin immediate")
             rows = db.execute(
-                "select generation_id, chat_id, tomo_id, revision, session_id from telegram_generations where status = 'active' order by created_at"
+                "select generation_id,chat_id,tomo_id,revision,session_id,status "
+                "from telegram_generations where status='active' "
+                "or (status='superseded' and cleanup_pending=1) order by created_at"
             ).fetchall()
             for row in rows:
+                if row["status"] != "active":
+                    continue
                 db.execute(
                     "update telegram_delivery_events set status = 'unknown', updated_at = ? where generation_id = ? and status = 'reserved'",
                     (now, row["generation_id"]),
                 )
                 db.execute(
-                    "update telegram_generations set status = 'superseded', updated_at = ? where generation_id = ? and status = 'active'",
+                    "update telegram_generations set status = 'superseded', cleanup_pending = 1, updated_at = ? where generation_id = ? and status = 'active'",
                     (now, row["generation_id"]),
                 )
                 db.execute(
@@ -602,6 +714,45 @@ class TelegramOnboardingStore:
                     (now, now, row["chat_id"], row["generation_id"]),
                 )
             db.commit()
+            return tuple(
+                InterruptedGeneration(
+                    row["generation_id"],
+                    row["chat_id"],
+                    row["tomo_id"],
+                    int(row["revision"]),
+                    row["session_id"],
+                )
+                for row in rows
+            )
+        finally:
+            db.close()
+
+    def complete_generation_cleanup(self, generation_id: str) -> bool:
+        db = self._connect()
+        try:
+            result = db.execute(
+                "update telegram_generations set cleanup_pending=0 "
+                "where generation_id=? and cleanup_pending=1",
+                (generation_id,),
+            )
+            db.commit()
+            return result.rowcount == 1
+        finally:
+            db.close()
+
+    def pending_generation_cleanups(
+        self, *, limit: int = 100
+    ) -> tuple[InterruptedGeneration, ...]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("invalid cleanup limit")
+        db = self._connect()
+        try:
+            rows = db.execute(
+                "select generation_id,chat_id,tomo_id,revision,session_id "
+                "from telegram_generations where status='superseded' "
+                "and cleanup_pending=1 order by created_at limit ?",
+                (limit,),
+            ).fetchall()
             return tuple(
                 InterruptedGeneration(
                     row["generation_id"],
@@ -718,6 +869,23 @@ class TelegramOnboardingStore:
         finally:
             db.close()
 
+    def delete_owner(self, tomo_id: str) -> None:
+        """Remove Telegram installation, generation, and queued personal state idempotently."""
+        db = self._connect()
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            chats = [row[0] for row in db.execute("SELECT chat_id FROM telegram_installations WHERE tomo_id=?", (tomo_id,))]
+            db.execute("DELETE FROM telegram_install_tokens WHERE tomo_id=?", (tomo_id,))
+            db.execute("DELETE FROM telegram_generations WHERE tomo_id=?", (tomo_id,))
+            if chats:
+                placeholders = ",".join("?" for _ in chats)
+                db.execute(f"DELETE FROM telegram_inbox WHERE chat_id IN ({placeholders})", chats)
+                db.execute(f"DELETE FROM telegram_chat_turns WHERE chat_id IN ({placeholders})", chats)
+            db.execute("DELETE FROM telegram_installations WHERE tomo_id=?", (tomo_id,))
+            db.commit()
+        finally:
+            db.close()
+
     def _init_db(self) -> None:
         db = sqlite3.connect(self.db_path)
         db.row_factory = sqlite3.Row
@@ -790,10 +958,16 @@ class TelegramOnboardingStore:
                   session_id text not null,
                   status text not null check(status in ('active','superseded','completed','failed')),
                   error_code text,
+                  cleanup_pending integer not null default 0,
                   created_at real not null,
                   updated_at real not null
                 )
             """)
+            self._ensure_columns(
+                db,
+                "telegram_generations",
+                {"cleanup_pending": "integer not null default 0"},
+            )
             db.execute("""
                 create unique index if not exists telegram_one_active_generation_per_chat
                 on telegram_generations(chat_id) where status = 'active'
@@ -925,9 +1099,7 @@ class TelegramOnboardingStore:
 
     @staticmethod
     def _tomo_id_for_user(user_id: str) -> str:
-        suffix = hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:10]
-        safe_user = "".join(ch if ch.isalnum() else "-" for ch in user_id.lower()).strip("-")[:32] or "user"
-        return f"tomo-{safe_user}-{suffix}"
+        return TelegramOnboardingStore.tomo_id_for_user(user_id)
 
     @staticmethod
     def _safe_error_code(error_code: str) -> str:

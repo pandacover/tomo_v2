@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections import defaultdict
 from contextlib import contextmanager
@@ -14,9 +15,12 @@ from .cron_models import CronExecutionClaim, DeliveryAttempt, RunOutcome
 from .cron_service import CronExecutionDeferred
 from .cron_store import CronStore
 from .cron_tools import CronApiClient, cron_registry
+from .peer_capability import PeerCapability, issue_capability as issue_peer_capability
+from .peer_tools import PeerApiClient, peer_registry
+from .peer_exchange import PeerExchange, PeerError
 from . import latency_trace
 from .instances import RuntimeInstanceRegistry
-from .models import AutomationTurn, InboundEnvelope, OutboundBubble
+from .models import AutomationTurn, InboundEnvelope, OutboundBubble, PeerTurn
 from .onboarding_store import TelegramGenerationWork, TelegramInstallation, TelegramOnboardingStore
 from .conversation.models import REACTION_EMOJI_ALLOWLIST
 from .runtime import RuntimeCompleted, RuntimeFrameReady, RuntimeReactionReady
@@ -44,6 +48,9 @@ class TelegramRuntimeDispatch(Protocol):
     def iter_automation_events(self, installation: TelegramInstallation, turn: AutomationTurn, generation_id: str, session_id: str, is_active: Callable[[], bool] | None = None):
         ...
 
+    def iter_peer_events(self, installation: TelegramInstallation, turn: PeerTurn, generation_id: str, session_id: str, is_active: Callable[[], bool] | None = None):
+        ...
+
 
 @dataclass
 class InProcessTelegramRuntimeDispatch:
@@ -52,6 +59,7 @@ class InProcessTelegramRuntimeDispatch:
     instances: RuntimeInstanceRegistry
     control_url: str | None = None
     capability_key: bytes | None = None
+    peer_capability_key: bytes | None = None
     clock: Callable[[], float] = time.time
     _locks: ClassVar[defaultdict[str, Lock]] = defaultdict(Lock)
 
@@ -77,7 +85,12 @@ class InProcessTelegramRuntimeDispatch:
         with self._locks[installation.tomo_id]:
             runtime = self.instances.get(installation.tomo_id)
             burst = burst_from_work(installation, work)
-            with self._interactive_tools(runtime, installation, work.generation_id):
+            with self._interactive_tools(
+                runtime,
+                installation,
+                work.generation_id,
+                peer_session_id=work.session_id,
+            ):
                 for sequence, event in enumerate(runtime.handle_telegram_burst_iter(burst, is_active=is_active)):
                     if isinstance(event, RuntimeReactionReady):
                         yield SandboxReactionEvent(sequence, event.owner_id, event.actor_id, event.chat_id, event.target_message_id, event.generation_id, event.revision, event.emoji)
@@ -99,21 +112,70 @@ class InProcessTelegramRuntimeDispatch:
                     payload = json.loads(encode_event("local-runtime", generation_id, sequence, event))
                     yield SandboxCompletedEvent(sequence, payload["result"])
 
+    def iter_peer_events(self, installation: TelegramInstallation, turn: PeerTurn, generation_id: str, session_id: str, is_active: Callable[[], bool] | None = None):
+        if generation_id != turn.generation_id:
+            raise ValueError("invalid peer generation")
+        with self._locks[installation.tomo_id]:
+            runtime = self.instances.get(installation.tomo_id)
+            for sequence, event in enumerate(runtime.handle_peer_turn_iter(turn, is_active=is_active)):
+                if isinstance(event, RuntimeReactionReady):
+                    raise ValueError("peer turn emitted reaction")
+                if isinstance(event, RuntimeFrameReady):
+                    frame = event.event.frame
+                    yield SandboxFrameEvent(sequence, frame.segment_index, frame.frame_index, event.bubble.text)
+                elif isinstance(event, RuntimeCompleted):
+                    payload = json.loads(encode_event("local-peer", generation_id, sequence, event))
+                    yield SandboxCompletedEvent(sequence, payload["result"])
+
     @contextmanager
-    def _interactive_tools(self, runtime: Any, installation: TelegramInstallation, generation_id: str) -> Iterator[None]:
-        if self.control_url is None or self.capability_key is None or not runtime.provider.supports_tool_calls:
+    def _interactive_tools(
+        self,
+        runtime: Any,
+        installation: TelegramInstallation,
+        generation_id: str,
+        *,
+        peer_session_id: str | None = None,
+    ) -> Iterator[None]:
+        if self.control_url is None or not runtime.provider.supports_tool_calls:
             yield
             return
         now = int(self.clock())
-        capability = issue_capability(
-            self.capability_key,
-            CronCapability(installation.tomo_id, installation.actor_id, f"telegram:{installation.chat_id}", f"telegram:actor:{installation.actor_id}", now, now + 300),
-        )
-        extra = cron_registry(CronApiClient(self.control_url, capability, installation.tomo_id, installation.actor_id, f"telegram:{installation.chat_id}", f"telegram:actor:{installation.actor_id}"), generation_id)
+        destination = f"telegram:{installation.chat_id}"
+        session_id = f"telegram:actor:{installation.actor_id}"
         original_runtime_registry = runtime.tool_registry
         original_engine_registry = runtime.conversation.tool_registry
         original_executor = runtime.conversation.tool_executor
-        combined = original_runtime_registry.extend(extra)
+        combined = original_runtime_registry
+        if self.capability_key is not None:
+            capability = issue_capability(self.capability_key, CronCapability(installation.tomo_id, installation.actor_id, destination, session_id, now, now + 300))
+            combined = combined.extend(cron_registry(CronApiClient(self.control_url, capability, installation.tomo_id, installation.actor_id, destination, session_id), generation_id))
+        if self.peer_capability_key is not None and peer_session_id is not None:
+            capability = issue_peer_capability(
+                self.peer_capability_key,
+                PeerCapability(
+                    installation.tomo_id,
+                    installation.actor_id,
+                    destination,
+                    peer_session_id,
+                    generation_id,
+                    now,
+                    now + 300,
+                    frozenset({"list_relationships", "ask", "inspect_request"}),
+                ),
+            )
+            combined = combined.extend(
+                peer_registry(
+                    PeerApiClient(
+                        self.control_url,
+                        capability,
+                        installation.tomo_id,
+                        installation.actor_id,
+                        destination,
+                        peer_session_id,
+                        generation_id,
+                    )
+                )
+            )
         runtime.tool_registry = combined
         runtime.conversation.tool_registry = combined
         runtime.conversation.tool_executor = ToolExecutor(combined)
@@ -149,6 +211,18 @@ class _BubbleCollector:
         self.reactions.append((actor_id, message_id, emoji))
 
 
+def _peer_confirmation_control(text: str) -> tuple[bool, str] | None:
+    """Parse only exact, direct owner language; ambiguous replies stay ordinary turns."""
+    match = re.fullmatch(
+        r"(?:/peer-(confirm|cancel)|(confirm|cancel) peer request) ([0-9a-f]{8,64})",
+        text.strip().lower(),
+    )
+    if match is None:
+        return None
+    action = match.group(1) or match.group(2)
+    return action == "confirm", match.group(3)
+
+
 @dataclass
 class SharedTelegramGateway:
     client: TelegramClient
@@ -159,6 +233,7 @@ class SharedTelegramGateway:
     sleeper: Callable[[float], None] = time.sleep
     typing_lease_factory: Callable[..., TypingLease] = TypingLease
     cron_store: CronStore | None = None
+    peer_exchange: PeerExchange | None = None
 
     def __post_init__(self) -> None:
         if self.dispatch is None:
@@ -167,6 +242,18 @@ class SharedTelegramGateway:
             self.dispatch = InProcessTelegramRuntimeDispatch(instances=self.instances)
         if self.cron_store is None:
             self.cron_store = CronStore(self.store.data_dir)
+        if self.peer_exchange is None:
+            self.peer_exchange = PeerExchange(
+                self.store.data_dir,
+                source_generation_active=self.store.generation_not_superseded,
+            )
+        else:
+            self.peer_exchange.set_source_generation_active(
+                self.store.generation_not_superseded
+            )
+
+    def send_peer_notice(self, installation, text: str):
+        return self.client.send_message(installation.chat_id, text)
 
     def process_update(self, update: dict[str, Any] | TelegramGenerationWork) -> bool:
         if isinstance(update, TelegramGenerationWork):
@@ -193,6 +280,33 @@ class SharedTelegramGateway:
 
         if installation.actor_id != actor_id:
             self.client.send_message(chat_id, "open tomo from the dashboard first, then press start here.", reply_to_message_id=message_id)
+            return True
+
+        confirmation_control = _peer_confirmation_control(text)
+        if confirmation_control is not None:
+            approve, short_id = confirmation_control
+            try:
+                assert self.peer_exchange is not None
+                self.peer_exchange.decide_confirmation_prefix(
+                    installation.tomo_id,
+                    short_id,
+                    approve,
+                )
+            except PeerError:
+                self.client.send_message(chat_id, "that peer request is no longer available.", reply_to_message_id=message_id)
+            else:
+                self.client.send_message(
+                    chat_id,
+                    "peer request approved." if approve else "peer request cancelled.",
+                    reply_to_message_id=message_id,
+                )
+            return True
+        if text.startswith("/peer-confirm") or text.startswith("/peer-cancel"):
+            self.client.send_message(
+                chat_id,
+                "that peer request is no longer available.",
+                reply_to_message_id=message_id,
+            )
             return True
 
         self.client.send_typing(installation.chat_id)

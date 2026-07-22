@@ -15,6 +15,26 @@ class ContextHydratorTests(unittest.TestCase):
         ):
             self.assertIn(term, glossary)
 
+    def test_glossary_defines_peer_vocabulary_without_redefining_core_identity(self):
+        glossary = (Path(__file__).parents[1] / "CONTEXT.md").read_text(
+            encoding="utf-8"
+        ).lower()
+        for term in (
+            "peer tomo",
+            "agent relationship",
+            "relationship grant",
+            "inter-agent thread",
+            "peer request",
+            "commitment proposal",
+            "pending peer confirmation",
+        ):
+            self.assertIn(term, glossary)
+        self.assertIn(
+            "a peer tomo can request or disclose, but cannot grant authority for either human owner",
+            glossary,
+        )
+        self.assertEqual(glossary.count("owner identity is `tomo_id`"), 1)
+
     def test_hydrate_copies_current_history_and_visible_frames_without_the_new_burst(self):
         burst = InputBurst(
             burst_id="burst-1",

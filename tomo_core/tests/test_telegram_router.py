@@ -244,6 +244,111 @@ class TelegramUpdateRouterTests(unittest.TestCase):
 
             self.assertEqual(cancelled[0].generation_id, active.generation_id)
 
+    def test_failed_superseded_session_cleanup_is_retried_and_receipted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TelegramOnboardingStore(tmp)
+            installation = install_chat(store)
+            store.enqueue_update(1, "123", '{"update_id":1}', now=0, update_kind="message", message_id="1", tomo_id=installation.tomo_id)
+            active = store.claim_next_work(now=1)
+            calls = []
+
+            def flaky_cancel(interrupted):
+                calls.append(interrupted.generation_id)
+                if len(calls) == 1:
+                    raise RuntimeError("transient delete failure")
+
+            router = TelegramUpdateRouter(
+                client=FakeTelegramClient([private_update(2)]),
+                store=store,
+                process_update=lambda _: None,
+                cancel_generation=flaky_cancel,
+            )
+            router.poll_once()
+
+            self.assertFalse(router.drain_cancellations())
+            recovered = TelegramUpdateRouter(
+                client=FakeTelegramClient([]),
+                store=store,
+                process_update=lambda _: None,
+                cancel_generation=lambda interrupted: calls.append(interrupted.generation_id),
+            )
+            self.assertTrue(recovered.drain_cancellations())
+            self.assertEqual(calls, [active.generation_id, active.generation_id])
+
+            restarted = TelegramUpdateRouter(
+                client=FakeTelegramClient([]),
+                store=store,
+                process_update=lambda _: None,
+                cancel_generation=lambda _: self.fail("cleanup replayed after receipt"),
+            )
+            self.assertFalse(restarted.drain_cancellations())
+
+    def test_bounded_cleanup_queue_refills_without_dropping_durable_work(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TelegramOnboardingStore(tmp)
+            pending = []
+            for index in range(2):
+                reservation = store.reserve_automation_generation(
+                    f"chat-{index}", f"tomo-{index}", f"run-{index}", now=index
+                )
+                store.enqueue_update(
+                    index + 1,
+                    f"chat-{index}",
+                    "message",
+                    now=index + 0.1,
+                    update_kind="message",
+                    message_id=f"m{index}",
+                    tomo_id=f"tomo-{index}",
+                )
+                pending.append(reservation.generation_id)
+            cancelled = []
+            router = TelegramUpdateRouter(
+                client=FakeTelegramClient([]),
+                store=store,
+                process_update=lambda _: None,
+                cancel_generation=lambda interrupted: cancelled.append(interrupted.generation_id),
+                cancellation_queue_size=1,
+            )
+
+            self.assertTrue(router.drain_cancellations())
+            self.assertTrue(router.drain_cancellations())
+            self.assertCountEqual(cancelled, pending)
+            self.assertEqual(store.pending_generation_cleanups(), ())
+
+    def test_concurrent_workers_do_not_duplicate_inflight_cleanup_receipts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TelegramOnboardingStore(tmp)
+            reservation = store.reserve_automation_generation(
+                "chat", "tomo", "run", now=0
+            )
+            store.enqueue_update(1, "chat", "message", now=0.1, update_kind="message", message_id="m1", tomo_id="tomo")
+            started = threading.Event()
+            release = threading.Event()
+            calls = []
+
+            def cancel(interrupted):
+                calls.append(interrupted.generation_id)
+                started.set()
+                release.wait(timeout=2)
+
+            router = TelegramUpdateRouter(
+                client=FakeTelegramClient([]),
+                store=store,
+                process_update=lambda _: None,
+                cancel_generation=cancel,
+                cancellation_queue_size=1,
+            )
+            worker = threading.Thread(target=router.drain_cancellations)
+            worker.start()
+            self.assertTrue(started.wait(timeout=1))
+
+            self.assertFalse(router.drain_cancellations())
+            release.set()
+            worker.join(timeout=2)
+
+            self.assertEqual(calls, [reservation.generation_id])
+            self.assertEqual(store.pending_generation_cleanups(), ())
+
     def test_startup_schedules_recovered_generation_cancellation(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = TelegramOnboardingStore(tmp)

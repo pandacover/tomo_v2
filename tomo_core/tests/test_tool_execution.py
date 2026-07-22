@@ -146,6 +146,15 @@ class ToolExecutionTests(unittest.TestCase):
 
         self.assertEqual(result.tool_calls[0].arguments, {"nested": {"items": ["original"]}})
 
+    def test_peer_ask_uses_the_provider_call_id_without_exposing_it_to_the_model(self):
+        received = []
+        result = ToolExecutor(_registry(_tool("peer_ask", lambda arguments: received.append(arguments) or "ok"))).execute_batch(
+            (ProviderToolCallReady("provider-call-1", "peer_ask", '{"message":"hello"}'),), 1, lambda: True
+        )
+
+        self.assertEqual(received, [{"message": "hello", "call_id": "provider-call-1"}])
+        self.assertEqual(result.tool_calls[0].arguments, {"message": "hello"})
+
     def test_cancellation_before_and_after_a_serial_side_effect_returns_nothing(self):
         executor = ToolExecutor(_registry(_tool("known", lambda _: "finished", read_only=False)))
         calls = (ProviderToolCallReady("id", "known", "{}"),)

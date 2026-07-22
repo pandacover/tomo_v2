@@ -133,13 +133,21 @@ class ToolExecutor:
                 _PreparedToolCall(
                     ToolCall(provider_call.call_id, provider_call.name, arguments),
                     tool.invoke,
-                    copy.deepcopy(arguments),
+                    self._trusted_arguments(provider_call.name, arguments, provider_call.call_id),
                     not tool.spec.read_only or not tool.spec.parallel_safe,
                 )
             )
         if any(call.serial for call in prepared) and len(prepared) != 1:
             raise ToolBatchValidationError("incompatible_tool_batch")
         return tuple(prepared)
+
+    @staticmethod
+    def _trusted_arguments(name: str, arguments: dict[str, object], native_call_id: str) -> dict[str, object]:
+        trusted = copy.deepcopy(arguments)
+        if name == "peer_ask":
+            # The native provider call identity is the idempotency key; models cannot supply it.
+            trusted["call_id"] = native_call_id
+        return trusted
 
     def execute_batch(
         self,

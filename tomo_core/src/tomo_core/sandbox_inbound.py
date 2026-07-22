@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 import os
 import time
+from datetime import datetime, timezone
 from typing import TextIO
 import traceback
 
@@ -12,7 +13,9 @@ import httpx
 
 from .conversation.parsing import ConversationOutputError
 from .cron_tools import CronApiClient, cron_registry
-from .models import AutomationTurn, OutboundBubble, RuntimeConfig
+from .peer_tools import PeerApiClient, peer_registry
+from .tools import ToolRegistry
+from .models import AutomationTurn, OutboundBubble, PeerTurn, RuntimeConfig
 from .providers import ProviderAdapter
 from .runtime import PersonalAgentRuntime, RuntimeCompleted, RuntimeFrameReady, RuntimeReactionReady, StaleSessionRevisionError
 from .vision import VisionInterpreter
@@ -50,14 +53,21 @@ class CollectingTelegramSink:
         pass
 
 
-def build_runtime(provider: ProviderAdapter, config: RuntimeConfig, *, generation_id: str | None = None, automation: bool = False, vision_interpreter: VisionInterpreter | None = None) -> PersonalAgentRuntime:
+def build_runtime(provider: ProviderAdapter, config: RuntimeConfig, *, generation_id: str | None = None, automation: bool = False, peer: bool = False, vision_interpreter: VisionInterpreter | None = None) -> PersonalAgentRuntime:
     if config.owner_id is None:
         raise SandboxInboundError("missing_owner_id")
     config = replace(config, local_work_dir=config.local_work_dir or "/tmp/tomo-core-sqlite")
+    tools = ToolRegistry()
     control_url = os.getenv("TOMO_CRON_CONTROL_URL")
     capability = os.getenv("TOMO_CRON_CAPABILITY")
     context = (os.getenv("TOMO_CRON_OWNER_ID"), os.getenv("TOMO_CRON_ACTOR_ID"), os.getenv("TOMO_CRON_DESTINATION"), os.getenv("TOMO_CRON_SESSION_ID"))
-    tools = cron_registry(CronApiClient(control_url, capability, *context), generation_id) if not automation and generation_id and control_url and capability and all(context) else None
+    if not automation and not peer and generation_id and control_url and capability and all(context):
+        tools = tools.extend(cron_registry(CronApiClient(control_url, capability, *context), generation_id))
+    peer_control_url = os.getenv("TOMO_PEER_CONTROL_URL")
+    peer_capability = os.getenv("TOMO_PEER_CAPABILITY")
+    peer_context = (os.getenv("TOMO_PEER_OWNER_ID"), os.getenv("TOMO_PEER_ACTOR_ID"), os.getenv("TOMO_PEER_DESTINATION"), os.getenv("TOMO_PEER_SESSION_ID"), os.getenv("TOMO_PEER_GENERATION_ID"))
+    if not automation and not peer and generation_id and peer_control_url and peer_capability and all(peer_context) and peer_context[-1] == generation_id:
+        tools = tools.extend(peer_registry(PeerApiClient(peer_control_url, peer_capability, *peer_context)))
     return PersonalAgentRuntime(provider=provider, telegram=CollectingTelegramSink(), config=config, tool_registry=tools, vision_interpreter=vision_interpreter)
 
 
@@ -88,17 +98,25 @@ def run_once(
         runtime_kwargs = {"generation_id": generation_id}
         if isinstance(turn, AutomationTurn):
             runtime_kwargs["automation"] = True
+        elif isinstance(turn, PeerTurn):
+            runtime_kwargs["peer"] = True
         if vision_interpreter is not None:
             runtime_kwargs["vision_interpreter"] = vision_interpreter
         runtime = build_runtime(provider, config, **runtime_kwargs)
         latency_trace.emit_sandbox("sandbox_runtime_build", elapsed_ms=max(0, int((time.monotonic() - build_started_at) * 1000)))
-        iterator = runtime.handle_automation_turn_iter(turn) if isinstance(turn, AutomationTurn) else runtime.handle_telegram_burst_iter(turn)
+        if isinstance(turn, PeerTurn):
+            expires_at = datetime.fromisoformat(turn.expires_at.replace("Z", "+00:00"))
+            iterator = runtime.handle_peer_turn_iter(
+                turn, is_active=lambda: datetime.now(timezone.utc) < expires_at
+            )
+        else:
+            iterator = runtime.handle_automation_turn_iter(turn) if isinstance(turn, AutomationTurn) else runtime.handle_telegram_burst_iter(turn)
         for event in iterator:
             if not isinstance(event, (RuntimeReactionReady, RuntimeFrameReady, RuntimeCompleted)):
                 raise TypeError("runtime emitted an unsupported sandbox event")
             expected_reaction_binding = None
             if isinstance(event, RuntimeReactionReady):
-                if isinstance(turn, AutomationTurn):
+                if isinstance(turn, (AutomationTurn, PeerTurn)):
                     raise TypeError("automation turns cannot emit reactions")
                 expected_reaction_binding = (
                     config.owner_id,
