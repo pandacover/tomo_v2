@@ -17,28 +17,30 @@ In scope:
 
 `PersonalAgentRuntime` owns transport and delivery while `PersonalDataRepository` is the only runtime boundary for owner-scoped sessions, memories, and settings. SQLite is its first adapter; SQL, FTS, and connection mechanics do not enter conversation code. The owner is the Tomo instance ID, never a connector actor ID. Local direct use defaults to owner `local`; hosted sandbox use requires `TOMO_INSTANCE_ID`. SQLite is authoritative; legacy JSON session files are not read.
 
+## Image understanding
+
+Telegram photos are resolved before the base segment as a pre-segment knowledge boundary. A bounded vision specialist produces a structured observation, which is rendered only as untrusted user evidence; OCR and visible image instructions never receive system, tool, memory, or execution authority. The base provider receives the observation, never image bytes.
+
+The vision provider shares the configured provider authentication source with the conversation provider while using the role-specific `grok-4.3` model, `low` reasoning effort, and `store: false`. V1 accepts one largest Telegram image per message, with 10 MiB compressed, 20 megapixel decoded, and 2048-pixel longest-edge limits. It retains no raw bytes, URLs, capabilities, or image data; only the bounded observation can remain in session history. Unsupported, corrupt, unavailable, or unauthorized image resolution becomes an honest unavailable observation rather than a guessed description.
+
+Local shared mode reads the image directly through the Telegram client. Daytona mode gives the sandbox only a five-minute owner, generation, and exact-file capability to retrieve bytes from the control host; it never receives the bot token. See [image understanding](image-understanding.md).
+
 Explicitly deferred:
 
-- mutating tools, approvals, idempotent side effects, and action-result observation;
-- durable background jobs and milestone notifications;
 - group chat, `room_id`, other connectors, and typing refresh;
 - Railway/Daytona deployment and immutable snapshot rollout, which require a separate user-approved operation.
 - dashboard UI for personal-data settings and application-managed encryption.
 
+Cron mutations are serial, idempotent native tools available only to verified
+interactive owner turns. Durable scheduled work is a first-class `automation`
+TurnRun, not a fabricated user message. The control host owns occurrence and
+delivery state; the owner's runtime supplies fresh personal context and a
+restricted unattended tool registry. See
+[`adr/0003-control-host-durable-agent-cron.md`](adr/0003-control-host-durable-agent-cron.md).
+
 ## canonical terms
 
-- conversation situation: the current input burst, silently hydrated context, and Tomo's soul.
-- conversational move: the social or cognitive purpose Tomo chooses next, not a wording template.
-- primary move: the main purpose that must make the turn useful.
-- supporting move: an optional ordered move that helps the primary move land naturally.
-- move plan: the compact, non-chain-of-thought turn-level decision containing moves, goal, and confidence; it does not determine frame or bubble count.
-- TurnRun: the complete interaction initiated by one input burst, potentially spanning tools and several model segments.
-- segment: one continuous model generation between knowledge boundaries.
-- frame: one complete, validated outward text unit emitted by a segment.
-- bubble: Telegram's delivery representation of a frame.
-- tool batch: native tool calls requested by one segment and executed as one tool round.
-- context snapshot: silently hydrated context available before the first segment.
-- repair: one bounded replacement generation for malformed first-segment output before any frame or tool call, not a reflective agent loop.
+The canonical, implementation-free vocabulary lives in [`../CONTEXT.md`](../CONTEXT.md). The lifecycle visual is [`user-message-turnrun-lifecycle.html`](user-message-turnrun-lifecycle.html).
 
 ## move catalog
 
