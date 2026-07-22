@@ -14,6 +14,7 @@ from .sandbox_protocol import (
     SandboxErrorEvent,
     SandboxFrameEvent,
     SandboxStaleEvent,
+    SandboxTracebackFrame,
 )
 
 
@@ -282,7 +283,7 @@ class PeerService:
                     error_code=error_code,
                     now=self.clock(),
                 )
-                self._log_failure(claim, error_code, deferred=False)
+                self._log_failure(claim, error_code, deferred=False, error=error)
         except Exception as error:
             if active():
                 error_code = _failure_code(error)
@@ -303,7 +304,7 @@ class PeerService:
                         error_code=error_code,
                         now=self.clock(),
                     )
-                self._log_failure(claim, error_code, deferred=deferred)
+                self._log_failure(claim, error_code, deferred=deferred, error=error)
         finally:
             heartbeat_stop.set()
             if 'heartbeat' in locals():
@@ -311,14 +312,34 @@ class PeerService:
         return True
 
     @staticmethod
-    def _log_failure(claim, error_code: str, *, deferred: bool) -> None:
+    def _log_failure(
+        claim,
+        error_code: str,
+        *,
+        deferred: bool,
+        error: Exception | None = None,
+    ) -> None:
+        exception_class = getattr(error, "exception_class", None)
+        raw_frames = getattr(error, "traceback_frames", ())
+        traceback_frames = tuple(
+            frame for frame in raw_frames if isinstance(frame, SandboxTracebackFrame)
+        )
+        diagnostics = ""
+        if isinstance(exception_class, str):
+            diagnostics += f" exception_class={exception_class}"
+        if traceback_frames:
+            diagnostics += " traceback=" + ",".join(
+                f"{frame.basename}:{frame.function}:{frame.line}"
+                for frame in traceback_frames
+            )
         _logger.warning(
-            "peer request execution %s request_id=%s recipient=%s attempt=%d error_code=%s",
+            "peer request execution %s request_id=%s recipient=%s attempt=%d error_code=%s%s",
             "deferred" if deferred else "failed",
             claim.request.request_id,
             claim.request.recipient_owner_id,
             claim.attempt_count,
             error_code,
+            diagnostics,
         )
 
 

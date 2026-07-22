@@ -20,7 +20,7 @@ from .attachment_capability import AttachmentCapability, hash_file_id, issue_att
 from .conversation import TurnBudget
 from .models import AutomationTurn, InboundEnvelope, InboundMessage, InputBurst, OutboundBubble, PeerTurn, RuntimeConfig
 from .onboarding_store import InterruptedGeneration, TelegramGenerationInput, TelegramGenerationWork, TelegramInstallation
-from .sandbox_protocol import SandboxCompletedEvent, SandboxErrorEvent, SandboxEvent, SandboxFrameEvent, SandboxProtocolError, SandboxReactionEvent, encode_automation, encode_inbound, encode_peer, iter_event_markers, parse_result_marker
+from .sandbox_protocol import SandboxCompletedEvent, SandboxErrorEvent, SandboxEvent, SandboxFrameEvent, SandboxProtocolError, SandboxReactionEvent, SandboxTracebackFrame, encode_automation, encode_inbound, encode_peer, iter_event_markers, parse_result_marker
 from .telegram import photo_attachments_from_message, reply_context_from_message
 from . import latency_trace
 from .cron_capability import CronCapability, issue_capability
@@ -62,7 +62,17 @@ class TelegramRuntimeDispatchError(RuntimeError):
 
 
 class SandboxDispatchError(TelegramRuntimeDispatchError):
-    pass
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.exception_class: str | None = None
+        self.traceback_frames: tuple[SandboxTracebackFrame, ...] = ()
+
+    @classmethod
+    def from_event(cls, event: SandboxErrorEvent) -> "SandboxDispatchError":
+        error = cls(event.code)
+        error.exception_class = event.exception_class
+        error.traceback_frames = event.traceback
+        return error
 
 
 class SandboxDispatch:
@@ -428,7 +438,7 @@ class SandboxDispatch:
                 for event in iter_event_markers(self.client.iter_session_logs(sandbox, command), request_id, generation_id, budget=self.budget):
                     if isinstance(event, SandboxReactionEvent): raise SandboxDispatchError("invalid_result")
                     if not is_active(): return
-                    if isinstance(event, SandboxErrorEvent): raise SandboxDispatchError(event.code)
+                    if isinstance(event, SandboxErrorEvent): raise SandboxDispatchError.from_event(event)
                     yield event
                 if self.client.session_command_exit_code(sandbox, command): raise SandboxDispatchError("sandbox_exec_failed")
             except (DaytonaClientError, TimeoutError) as error:

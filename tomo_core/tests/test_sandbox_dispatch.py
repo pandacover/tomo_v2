@@ -223,6 +223,29 @@ class SandboxDispatchTests(unittest.TestCase):
         self.assertEqual(decoded_turn, turn)
         self.assertEqual(self.daytona.start_session_command.call_args.kwargs["timeout"], 60)
 
+    def test_hosted_peer_failure_preserves_safe_sandbox_diagnostics(self):
+        turn = PeerTurn("request-123", 1, "relationship", "thread", "request-123", "alice", "question", "ordinary_message", "hello", "2099-01-01T00:01:00+00:00")
+        diagnostic = SandboxErrorEvent(
+            0,
+            "runtime_failed",
+            "AttributeError",
+            (SandboxTracebackFrame("runtime_py", "_handle_turn_iter", 344),),
+        )
+        self.daytona.start_session_command.return_value = SessionCommandHandle("peer-thread", "cmd-1")
+        self.daytona.iter_session_logs.return_value = iter((
+            EVENT_MARKER + encode_event("request-123", "request-123", 0, diagnostic) + "\n",
+        ))
+
+        with self.assertRaises(SandboxDispatchError) as raised:
+            list(self.dispatch.iter_peer_events(self.installation, turn, "request-123", "peer:thread"))
+
+        self.assertEqual(raised.exception.code, "runtime_failed")
+        self.assertEqual(raised.exception.exception_class, "AttributeError")
+        self.assertEqual(
+            raised.exception.traceback_frames,
+            (SandboxTracebackFrame("runtime_py", "_handle_turn_iter", 344),),
+        )
+
     def test_hosted_peer_cleanup_retries_before_recording_session_deletion(self):
         turn = PeerTurn("request-123", 1, "relationship", "thread", "request-123", "alice", "question", "ordinary_message", "hello", "2099-01-01T00:01:00+00:00")
         self.daytona.start_session_command.return_value = SessionCommandHandle("peer-thread", "cmd-1")

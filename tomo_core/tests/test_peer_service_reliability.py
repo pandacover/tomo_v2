@@ -5,7 +5,12 @@ from datetime import datetime, timedelta, timezone
 from tomo_core.peer_exchange import PeerExchange
 from tomo_core.sandbox_dispatch import SandboxDispatchError
 from tomo_core.peer_service import PeerService
-from tomo_core.sandbox_protocol import SandboxCompletedEvent, SandboxFrameEvent
+from tomo_core.sandbox_protocol import (
+    SandboxCompletedEvent,
+    SandboxErrorEvent,
+    SandboxFrameEvent,
+    SandboxTracebackFrame,
+)
 
 
 class PeerServiceReliabilityTests(unittest.TestCase):
@@ -176,6 +181,46 @@ class PeerServiceReliabilityTests(unittest.TestCase):
             self.assertIn(
                 "error_code=provider_stream_failure", "\n".join(captured.output)
             )
+
+    def test_runtime_failure_logs_only_safe_sandbox_diagnostics(self):
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as directory:
+            exchange = self._exchange(directory, now)
+            exchange.submit(
+                "a", "bobby", "generation", "call", "ordinary_message", "hello", now=now
+            )
+            installation = type("Installation", (), {"tomo_id": "b"})()
+            installations = type(
+                "Installations",
+                (),
+                {"installation_for_tomo": lambda *_: installation},
+            )()
+
+            class Dispatch:
+                def iter_peer_events(self, *_args, **_kwargs):
+                    event = SandboxErrorEvent(
+                        0,
+                        "runtime_failed",
+                        "AttributeError",
+                        (SandboxTracebackFrame("runtime_py", "_handle_turn_iter", 344),),
+                    )
+                    raise SandboxDispatchError.from_event(event)
+                    yield
+
+            service = PeerService(
+                exchange, installations, Dispatch(), clock=lambda: now
+            )
+            with self.assertLogs("tomo_core.peer_service", level="WARNING") as captured:
+                self.assertTrue(service.run_once())
+
+            logs = "\n".join(captured.output)
+            self.assertIn("error_code=runtime_failed", logs)
+            self.assertIn("exception_class=AttributeError", logs)
+            self.assertIn(
+                "traceback=runtime_py:_handle_turn_iter:344",
+                logs,
+            )
+            self.assertNotIn("peer request execution failed: runtime_failed", logs)
 
     @staticmethod
     def _exchange(directory, now):
