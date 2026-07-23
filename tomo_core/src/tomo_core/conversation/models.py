@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from enum import Enum
 from math import isfinite
 from types import MappingProxyType
-from typing import Mapping, Sequence, TypeAlias
+from typing import Literal, Mapping, Sequence, TypeAlias
 
 from ..models import AutomationTurn, InboundEnvelope, InboundMessage, InputBurst, PeerTurn
 from ..vision import VisionObservation
@@ -87,11 +87,14 @@ class Frame:
     segment_index: int
     frame_index: int
     text: str
+    source: Literal["model", "peer_exchange"] = "model"
 
     def __post_init__(self) -> None:
         _nonnegative_integer(self.segment_index, "frame segment_index")
         _nonnegative_integer(self.frame_index, "frame frame_index")
         object.__setattr__(self, "text", _compact_text(self.text, "frame text"))
+        if self.source not in {"model", "peer_exchange"}:
+            raise ValueError("frame source is invalid")
 
 
 @dataclass(frozen=True)

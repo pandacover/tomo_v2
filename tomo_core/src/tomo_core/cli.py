@@ -8,6 +8,7 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -41,7 +42,7 @@ from .peer_capability import load_or_create_key as load_or_create_peer_key
 from .attachment_capability import load_or_create_attachment_key
 from .attachment_reader import ControlAttachmentReader
 from .vision import ProviderVisionInterpreter
-from .personal_data_transfer import export_owner, import_owner
+from .personal_data_transfer import export_owner, import_owner, write_owner_export
 from .sqlite_personal_data import SqlitePersonalDataRepository
 
 
@@ -456,6 +457,13 @@ def main(argv: list[str] | None = None) -> int:
     import_data.add_argument("--data-dir", default=os.getenv("TOMO_CORE_DATA_DIR", ".tomo_core")); import_data.add_argument("--owner", required=True); import_data.add_argument("--input", required=True)
     delete_owner = personal_data_sub.add_parser("delete-owner", help="permanently delete one owner's data")
     delete_owner.add_argument("--data-dir", default=os.getenv("TOMO_CORE_DATA_DIR", ".tomo_core")); delete_owner.add_argument("--owner", required=True); delete_owner.add_argument("--confirm", action="store_true")
+    purge_window = personal_data_sub.add_parser("purge-window", help="purge owner chats and derived memory in a timestamp window")
+    purge_window.add_argument("--data-dir", default=os.getenv("TOMO_CORE_DATA_DIR", ".tomo_core"))
+    owner_group = purge_window.add_mutually_exclusive_group(required=True)
+    owner_group.add_argument("--owner")
+    owner_group.add_argument("--all-owners", action="store_true")
+    purge_window.add_argument("--start", required=True); purge_window.add_argument("--end", required=True)
+    purge_window.add_argument("--backup"); purge_window.add_argument("--backup-dir"); purge_window.add_argument("--confirm", action="store_true")
     settings = personal_data_sub.add_parser("settings", help="inspect or update owner memory settings")
     settings.add_argument("--data-dir", default=os.getenv("TOMO_CORE_DATA_DIR", ".tomo_core")); settings.add_argument("--owner", required=True)
     settings.add_argument("--capture-enabled", choices=("true", "false")); settings.add_argument("--retrieval-enabled", choices=("true", "false")); settings.add_argument("--reactions-enabled", choices=("true", "false"))
@@ -499,6 +507,86 @@ def main(argv: list[str] | None = None) -> int:
             PeerExchange(args.data_dir).delete_owner(args.owner)
             TelegramOnboardingStore(args.data_dir).delete_owner(args.owner)
             repository.delete_owner(args.owner); return 0
+        if args.personal_data_command == "purge-window":
+            if not args.confirm:
+                print("refusing window purge without --confirm", file=sys.stderr); return 2
+            if args.all_owners:
+                if args.backup is not None or not args.backup_dir:
+                    print("refusing window purge because --all-owners requires --backup-dir and forbids --backup", file=sys.stderr); return 2
+            elif args.backup is None or args.backup_dir is not None:
+                print("refusing window purge because --owner requires --backup and forbids --backup-dir", file=sys.stderr); return 2
+            try:
+                repository.validate_purge_window(args.start, args.end)
+            except ValueError:
+                print("refusing window purge because the timestamp window is invalid", file=sys.stderr); return 2
+            if not repository.integrity_check():
+                print("refusing window purge because integrity check failed", file=sys.stderr); return 1
+            owners = repository.list_owners() if args.all_owners else (args.owner,)
+            if args.all_owners:
+                backup_dir = Path(args.backup_dir)
+                backup_dir.mkdir(parents=True, exist_ok=True)
+                names = {}
+                for owner in owners:
+                    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", owner) or "owner"
+                    name = f"{safe}.jsonl"
+                    if name in names:
+                        print("refusing window purge because owner backup names collide", file=sys.stderr); return 2
+                    names[name] = owner
+                    if (backup_dir / name).exists():
+                        print("refusing window purge because backup already exists", file=sys.stderr); return 2
+                targets = [(owner, backup_dir / f"{re.sub(r'[^A-Za-z0-9._-]+', '_', owner) or 'owner'}.jsonl") for owner in owners]
+            else:
+                targets = [(args.owner, Path(args.backup))]
+                if targets[0][1].exists():
+                    print("refusing window purge because backup already exists", file=sys.stderr); return 2
+
+            def publish_backup(owner, backup_path, records):
+                peer_records = PeerExchange(args.data_dir).export_owner_records(owner_id=owner)
+                temporary_path = None
+                try:
+                    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{backup_path.name}.", suffix=".tmp", dir=backup_path.parent)
+                    temporary_path = Path(temporary_name)
+                    with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+                        write_owner_export(owner, records, output, peer_records=peer_records)
+                        output.flush()
+                        os.fsync(output.fileno())
+                    os.link(temporary_path, backup_path)
+                    if os.name != "nt":
+                        directory_descriptor = os.open(backup_path.parent, os.O_RDONLY)
+                        try:
+                            os.fsync(directory_descriptor)
+                        finally:
+                            os.close(directory_descriptor)
+                finally:
+                    if temporary_path is not None:
+                        try:
+                            temporary_path.unlink()
+                        except OSError:
+                            pass
+
+            owner_results = []
+            totals = {"messages": 0, "memories": 0, "pending_actions": 0, "owners": 0}
+            try:
+                for owner, backup_path in targets:
+                    result = repository.purge_owner_window(
+                        owner,
+                        args.start,
+                        args.end,
+                        before_purge=lambda records, owner=owner, backup_path=backup_path: publish_backup(owner, backup_path, records),
+                    )
+                    repository.rebuild_index(owner)
+                    owner_results.append({"owner": owner, "backup": str(backup_path), **result})
+                    for key in ("messages", "memories", "pending_actions"):
+                        totals[key] += int(result.get(key, 0))
+                    totals["owners"] += 1
+            except FileExistsError:
+                print("refusing window purge because backup already exists", file=sys.stderr); return 2
+            except Exception:
+                print("refusing window purge because backup export or purge failed", file=sys.stderr); return 1
+            if not repository.integrity_check():
+                print("window purge completed but integrity verification failed", file=sys.stderr); return 1
+            payload = {"owners": owner_results, "totals": totals} if args.all_owners else owner_results[0]
+            print(json.dumps(payload, sort_keys=True, separators=(",", ":"))); return 0
         for setting in ("capture_enabled", "retrieval_enabled", "reactions_enabled"):
             value = getattr(args, setting)
             if value is not None: repository.update_memory_setting(args.owner, setting, value == "true")

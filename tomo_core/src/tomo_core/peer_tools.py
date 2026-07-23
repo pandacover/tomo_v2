@@ -9,6 +9,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
+from .peer_safety import ordinary_request_requires_grounding
 from .tools import BoundTool, ToolRegistry, ToolSpec
 
 
@@ -150,6 +151,12 @@ class PeerApiClient:
                 "status": "failed",
                 "error_code": "peer_connection_unavailable",
             }
+        if arguments.get("disclosure_kind") == "ordinary_message" and ordinary_request_requires_grounding(arguments.get("message"), handle):
+            return {
+                "ok": False,
+                "status": "failed",
+                "error_code": "peer_grounding_required",
+            }
         body = {
             "peerHandle": arguments["peer_handle"],
             "purpose": arguments["purpose"],
@@ -275,6 +282,7 @@ def _public_error_code(value: object) -> str | None:
         return None
     if value in {
         "peer_connection_unavailable",
+        "peer_grounding_required",
         "peer_invalid_response",
         "peer_timeout",
         "peer_unavailable",

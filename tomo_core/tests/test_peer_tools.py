@@ -147,6 +147,18 @@ class PeerToolsTests(unittest.TestCase):
         self.assertEqual(client.ask(ask | {"peer_handle": "guessed"}), {"ok": False, "status": "failed", "error_code": "peer_connection_unavailable"})
         self.assertEqual([request.get_method() for request in requests], ["GET"])
 
+    def test_ask_rejects_ungrounded_owner_fact_before_network_submission(self):
+        requests = []
+        client = _client(lambda request, **_kwargs: requests.append(request) or _Response({
+            "relationships": [{"peerHandle": "bob", "status": "active", "grant": {"communicate": True}, "peerGrant": {"autoReply": True}}]
+        }))
+        client.list_relationships()
+
+        result = client.ask({"peer_handle": "bob", "purpose": "question", "disclosure_kind": "ordinary_message", "message": "what is bob's favorite color?", "call_id": "call"})
+
+        self.assertEqual(result, {"ok": False, "status": "failed", "error_code": "peer_grounding_required"})
+        self.assertEqual([request.get_method() for request in requests], ["GET"])
+
     def test_safe_worker_error_is_reduced_to_a_public_failure_category(self):
         result = _client(lambda _request, **_kwargs: _Response({
             "requestId": "private-request",
@@ -172,6 +184,19 @@ class PeerToolsTests(unittest.TestCase):
             "ok": True,
             "status": "failed",
             "error_code": "peer_unavailable",
+        })
+
+    def test_authority_grounding_failure_remains_a_public_evidence_boundary(self):
+        result = _client(lambda _request, **_kwargs: _Response({
+            "ok": False,
+            "status": "failed",
+            "errorCode": "peer_grounding_required",
+        })).inspect_request("request")
+
+        self.assertEqual(result, {
+            "ok": False,
+            "status": "failed",
+            "error_code": "peer_grounding_required",
         })
 
     def test_ask_uses_only_an_exact_listed_ready_handle_and_replaces_the_cache(self):

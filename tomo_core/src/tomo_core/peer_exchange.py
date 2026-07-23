@@ -21,7 +21,7 @@ from .peer_models import (
     RequestStatus,
 )
 from .peer_policy import PeerPolicy
-from .peer_safety import contains_unauthorized_output, contains_unsafe_content
+from .peer_safety import contains_unauthorized_output, contains_unsafe_content, ordinary_request_requires_grounding
 from .peer_broker import canonicalize_availability, classify, disclosure_scope
 from .peer_store import PeerStore, utc_now
 
@@ -153,6 +153,8 @@ class PeerExchange:
                 raise PeerError("superseded")
             return PeerSubmitResult(saved.request_id, saved.status.value, handle, saved.thread_id, pending)
         kind, action, purpose = classify(kind, " ".join(purpose.split()), text)
+        if kind == RequestKind.ORDINARY_MESSAGE and ordinary_request_requires_grounding(text, peer_handle):
+            raise PeerError("grounding_required")
         if kind == RequestKind.AVAILABILITY:
             text = canonicalize_availability(peer_handle, text)
             kind, action, purpose = classify(kind, purpose, text)

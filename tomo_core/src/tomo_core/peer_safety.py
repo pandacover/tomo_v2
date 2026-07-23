@@ -33,6 +33,27 @@ _PRIVATE_CATEGORY_PATTERN = re.compile(
     r"\b(?:third[- ]party|other person)\b",
     re.I,
 )
+_EXPLICIT_OWNER_REFERENCE_PATTERN = re.compile(
+    r"\b(?:my|the|your|our)\s+(?:owner|user|human)\b",
+    re.I,
+)
+_THIRD_PERSON_REFERENCE_PATTERN = re.compile(
+    r"\b(?:they|them|their|he|him|his|she|her|hers)\b",
+    re.I,
+)
+_THIRD_PERSON_FACT_OUTPUT_PATTERN = re.compile(
+    r"\b(?:they|he|she)\s+(?:is|are|was|were|has|have|had|works?|lives?|likes?|loves?|hates?)\b|"
+    r"\b(?:their|his|her)\s+(?:job|age|birthday|relationship|preference|project|plan)\b",
+    re.I,
+)
+_FACT_REQUEST_PATTERN = re.compile(
+    r"^\s*(?:please\s+)?(?:what|when|where|who|which|how|is|are|was|were|do|does|did|has|have|had|can|could|would|explain|tell\s+me|share|give\s+me|let\s+me\s+know|check|ask|i\s+(?:need|want)\s+to\s+know)\b",
+    re.I,
+)
+_OWNER_FACT_TOPIC_PATTERN = re.compile(
+    r"\b(?:favorite|preference|relationship|history|birthday|age|born|vegan|diet|likes?|loves?|hates?|lives?|works?|job|project|plan)\b",
+    re.I,
+)
 _SCOPE_PATTERNS = {
     "calendar_detail": re.compile(r"\b(?:calendar|event|meeting|at \d{1,2}(?::\d{2})?\b)", re.I),
     "contact_email": _PRIVATE_OUTPUT_PATTERNS[0],
@@ -66,7 +87,7 @@ def contains_unauthorized_output(text: object, kind: object, scope: object = "no
         return True
     bounded = text[:_MAX_SCAN_CHARS]
     if kind != "sensitive":
-        return _PRIVATE_CATEGORY_PATTERN.search(bounded) is not None or any(pattern.search(bounded) is not None for pattern in _PRIVATE_OUTPUT_PATTERNS)
+        return _EXPLICIT_OWNER_REFERENCE_PATTERN.search(bounded) is not None or _THIRD_PERSON_FACT_OUTPUT_PATTERN.search(bounded) is not None or _PRIVATE_CATEGORY_PATTERN.search(bounded) is not None or any(pattern.search(bounded) is not None for pattern in _PRIVATE_OUTPUT_PATTERNS)
     if scope == "commitment_proposal":
         rendered = re.fullmatch(
             r"Commitment proposal response: (?:accept|decline|counter)\. "
@@ -83,6 +104,27 @@ def contains_unauthorized_output(text: object, kind: object, scope: object = "no
     if allowed is None or not allowed.search(bounded):
         return True
     return any(pattern.search(bounded) is not None for pattern in _SCOPE_BLOCKED_PATTERNS[scope])
+
+
+def ordinary_request_requires_grounding(text: object, peer_handle: object) -> bool:
+    """Fail closed on owner-specific fact requests that have no typed evidence scope."""
+    if not isinstance(text, str) or not isinstance(peer_handle, str):
+        return True
+    bounded = text[:_MAX_SCAN_CHARS]
+    direct_address = re.compile(rf"^\s*{re.escape(peer_handle)}\s*[,!:]\s*", re.I)
+    subject_text = direct_address.sub("", bounded, count=1)
+    handle = re.search(rf"(?<![a-z0-9_]){re.escape(peer_handle)}(?![a-z0-9_])", subject_text, re.I)
+    owner_reference = (
+        handle is not None
+        or _EXPLICIT_OWNER_REFERENCE_PATTERN.search(subject_text) is not None
+        or _THIRD_PERSON_REFERENCE_PATTERN.search(subject_text) is not None
+    )
+    fact_request = (
+        "?" in subject_text
+        or _FACT_REQUEST_PATTERN.search(subject_text) is not None
+        or _OWNER_FACT_TOPIC_PATTERN.search(subject_text) is not None
+    )
+    return owner_reference and fact_request
 
 
 def render_peer_response(scope: object, text: object) -> str | None:

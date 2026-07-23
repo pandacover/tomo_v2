@@ -353,6 +353,24 @@ class TurnRunToolTests(unittest.TestCase):
             ["that tomo is unavailable right now. try again in a moment."],
         )
 
+    def test_ungrounded_peer_fact_question_reports_the_evidence_boundary(self):
+        provider = ScriptedProvider([[
+            ProviderTextDelta(PLAN),
+            ProviderToolCallReady("peer-1", "peer_ask", "{}"),
+            ProviderStreamCompleted("tool_calls"),
+        ]])
+        peer_ask = BoundTool(
+            ToolSpec("peer_ask", "ask peer", {"type": "object", "properties": {}}, read_only=False, parallel_safe=False),
+            lambda _: {"ok": False, "status": "failed", "error_code": "peer_grounding_required"},
+        )
+
+        result = ConversationEngine(provider, tool_registry=registry(peer_ask)).respond(self.request())
+
+        self.assertEqual(
+            [frame.text for frame in result.frames],
+            ["that question needs verified information this connection cannot provide, so i didn't ask that tomo to guess."],
+        )
+
     def test_denied_peer_request_reports_changed_connection(self):
         provider = ScriptedProvider([[
             ProviderTextDelta(PLAN),
@@ -619,8 +637,7 @@ class TurnRunToolTests(unittest.TestCase):
 
         events = tuple(ConversationEngine(provider, tool_registry=registry(peer_list)).respond_iter(self.request()))
 
-        ready = next(event for event in events if isinstance(event, MemoryControlReady))
-        self.assertEqual(ready.tool_observation_ids, ())
+        self.assertFalse(any(isinstance(event, MemoryControlReady) for event in events))
 
     def test_malformed_peer_list_observation_cannot_ground_later_memory(self):
         control = json.dumps({
@@ -641,8 +658,54 @@ class TurnRunToolTests(unittest.TestCase):
 
         events = tuple(ConversationEngine(provider, tool_registry=registry(peer_list)).respond_iter(self.request()))
 
-        ready = next(event for event in events if isinstance(event, MemoryControlReady))
-        self.assertEqual(ready.tool_observation_ids, ())
+        self.assertFalse(any(isinstance(event, MemoryControlReady) for event in events))
+
+    def test_peer_tools_cannot_author_memory_from_any_model_source_kind(self):
+        for tool_name in ("peer_list", "peer_ask", "peer_resume"):
+            for source_kind in ("tool_observation", "assistant_conclusion", "inference"):
+                with self.subTest(tool=tool_name, source=source_kind):
+                    source_id = "call-1" if source_kind == "tool_observation" else "generation"
+                    control = json.dumps({
+                        "type": "memory_control", "action": "add", "authority": "autonomous", "user_intent_excerpt": None,
+                        "memory_id": None, "kind": "fact", "subject_key": "self", "topic": "identity.birthplace",
+                        "value": "the moon", "statement": "the owner was born on the moon", "confidence": 1.0, "salience": 1.0,
+                        "surface_scope": "always", "valid_from": None, "valid_until": None,
+                        "sources": [{"source_kind": source_kind, "source_id": source_id, "observed_at": "2026-01-01T00:00:00Z"}],
+                    })
+                    observation = (
+                        {"ok": True, "status": "completed", "relationships": []}
+                        if tool_name == "peer_list"
+                        else {"ok": True, "status": "pending", "thread_id": "thread"}
+                    )
+                    provider = ScriptedProvider([
+                        [ProviderTextDelta(PLAN), ProviderToolCallReady("call-1", tool_name, "{}"), ProviderStreamCompleted("tool_calls")],
+                        [ProviderTextDelta(control + '\n{"type":"frame","text":"fabricated"}\n'), ProviderStreamCompleted("stop")],
+                    ])
+                    peer_tool = BoundTool(
+                        ToolSpec(tool_name, tool_name, {"type": "object", "properties": {}}, read_only=tool_name != "peer_ask", parallel_safe=tool_name != "peer_ask"),
+                        lambda _arguments, value=observation: value,
+                    )
+
+                    events = tuple(ConversationEngine(provider, tool_registry=registry(peer_tool)).respond_iter(self.request()))
+
+                    self.assertFalse(any(isinstance(event, MemoryControlReady) for event in events))
+                    result = next(event.result for event in events if isinstance(event, TurnRunCompleted))
+                    self.assertTrue(all(not segment.memory_controls for segment in result.segments))
+
+    def test_peer_list_post_tool_frame_retains_peer_exchange_provenance(self):
+        provider = ScriptedProvider([
+            [ProviderTextDelta(PLAN), ProviderToolCallReady("list-1", "peer_list", "{}"), ProviderStreamCompleted("tool_calls")],
+            [ProviderTextDelta('{"type":"frame","text":"No connected Tomos."}\n'), ProviderStreamCompleted("stop")],
+        ])
+        peer_list = BoundTool(
+            ToolSpec("peer_list", "list peers", {"type": "object", "properties": {}}, read_only=True, parallel_safe=True),
+            lambda _: {"ok": True, "status": "completed", "relationships": []},
+        )
+
+        events = tuple(ConversationEngine(provider, tool_registry=registry(peer_list)).respond_iter(self.request()))
+
+        frame = next(event.frame for event in events if isinstance(event, FrameReady))
+        self.assertEqual(frame.source, "peer_exchange")
 
     def test_malformed_continuation_after_tool_only_segment_does_not_repair(self):
         provider = ScriptedProvider([

@@ -32,6 +32,7 @@ deployment's approved maintenance workflow.
 PYTHONPATH=src python -m tomo_core.cli personal-data integrity-check --data-dir /secure/tomo
 PYTHONPATH=src python -m tomo_core.cli personal-data rebuild-index --data-dir /secure/tomo --owner tomo-123
 PYTHONPATH=src python -m tomo_core.cli personal-data export --data-dir /secure/tomo --owner tomo-123 --output /secure/backups/tomo-123.jsonl
+PYTHONPATH=src python -m tomo_core.cli personal-data purge-window --data-dir /secure/tomo --owner tomo-123 --start 2026-07-20T18:30:00Z --end 2026-07-23T06:00:00Z --backup /secure/backups/tomo-123-before-purge.jsonl --confirm
 PYTHONPATH=src python -m tomo_core.cli personal-data settings --data-dir /secure/tomo --owner tomo-123
 PYTHONPATH=src python -m tomo_core.cli personal-data settings --data-dir /secure/tomo --owner tomo-123 --capture-enabled false
 PYTHONPATH=src python -m tomo_core.cli personal-data settings --data-dir /secure/tomo --owner tomo-123 --retrieval-enabled false
@@ -45,6 +46,13 @@ tables. Export writes canonical format version 1 JSONL and scopes every record
 to the requested owner. Treat `delete-owner --confirm` as irreversible: it
 removes that owner's sessions, messages, memories, provenance, settings,
 pending actions, tombstones, and search rows while leaving other owners alone.
+`purge-window` requires an exclusive canonical backup path and `--confirm`. It
+deletes only that owner's messages in the half-open `[start, end)` window,
+associated accepted generations, derived memory revisions and pending memory
+actions. When a deleted memory revision superseded an older retained record,
+the older record is restored. The command rebuilds owner search indexes and
+checks database integrity before reporting counts; peer relationship history,
+onboarding identity, credentials, and other owners are untouched.
 
 There is no CLI command for canonical import, session deletion, or provisional
 artifact pruning. The repository provides `import_owner`, `delete_session`,

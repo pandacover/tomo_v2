@@ -16,6 +16,9 @@ from tomo_core.telegram_router import RetryableTelegramUpdateError
 from tomo_core.providers import XaiApiProvider
 from tomo_core.peer_exchange import PeerExchange
 from tomo_core.sandbox_dispatch import SandboxDispatchError
+from tomo_core.sessions import ConversationSession, StoredMessage
+from tomo_core.sqlite_personal_data import SqlitePersonalDataRepository
+from tomo_core.personal_data import SessionSearchQuery
 
 
 class CliTests(unittest.TestCase):
@@ -252,3 +255,69 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(main(["personal-data", "delete-owner", "--data-dir", tmp, "--owner", "owner"]), 2)
             self.assertEqual(main(["personal-data", "integrity-check", "--data-dir", tmp]), 0)
+
+    def test_personal_data_window_purge_requires_confirmation_and_exclusive_backup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repository = SqlitePersonalDataRepository(Path(tmp) / "tomo.sqlite3")
+            session = ConversationSession("telegram:actor:one")
+            session.append(StoredMessage("user", "delete this chat", "2026-07-21T10:00:00+00:00", {"burst_id": "b1", "update_id": 1}))
+            repository.save_session("owner", session)
+            backup = Path(tmp) / "backup.jsonl"
+            command = ["personal-data", "purge-window", "--data-dir", tmp, "--owner", "owner", "--start", "2026-07-20T18:30:00Z", "--end", "2026-07-23T06:00:00Z", "--backup", str(backup)]
+
+            with patch("sys.stderr", io.StringIO()):
+                self.assertEqual(main(command), 2)
+            self.assertFalse(backup.exists())
+            invalid_backup = Path(tmp) / "invalid-window.jsonl"
+            invalid_command = [
+                "personal-data", "purge-window", "--data-dir", tmp, "--owner", "owner",
+                "--start", "2026-07-23T00:00:00Z", "--end", "2026-07-23T00:00:00Z",
+                "--backup", str(invalid_backup), "--confirm",
+            ]
+            with patch("sys.stderr", io.StringIO()):
+                self.assertEqual(main(invalid_command), 2)
+            self.assertFalse(invalid_backup.exists())
+            backup.write_text("do not overwrite", encoding="utf-8")
+            with patch("sys.stderr", io.StringIO()):
+                self.assertEqual(main(command + ["--confirm"]), 2)
+            self.assertEqual(repository.search_sessions(SessionSearchQuery("owner", "delete"))[0].matched_text, "delete this chat")
+            backup.unlink()
+            with patch("tomo_core.cli.write_owner_export", side_effect=RuntimeError("export failed")), patch("sys.stderr", io.StringIO()):
+                self.assertEqual(main(command + ["--confirm"]), 1)
+            self.assertFalse(backup.exists())
+            self.assertEqual(repository.search_sessions(SessionSearchQuery("owner", "delete"))[0].matched_text, "delete this chat")
+            with patch("sys.stdout", io.StringIO()) as stdout:
+                self.assertEqual(main(command + ["--confirm"]), 0)
+
+            self.assertTrue(backup.is_file())
+            self.assertIn("delete this chat", backup.read_text(encoding="utf-8"))
+            self.assertEqual(json.loads(stdout.getvalue())["messages"], 1)
+            self.assertEqual(repository.search_sessions(SessionSearchQuery("owner", "delete")), ())
+
+    def test_personal_data_window_purge_all_owners_uses_backup_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repository = SqlitePersonalDataRepository(Path(tmp) / "tomo.sqlite3")
+            for owner in ("owner-a", "owner-b"):
+                session = ConversationSession(f"telegram:actor:{owner}")
+                session.append(StoredMessage("user", f"{owner} polluted", "2026-07-21T10:00:00+00:00", {"burst_id": "b1", "update_id": 1}))
+                session.append(StoredMessage("user", f"{owner} keep", "2026-07-20T10:00:00+00:00", {"burst_id": "b0", "update_id": 0}))
+                repository.save_session(owner, session)
+            backup_dir = Path(tmp) / "backups"
+            command = [
+                "personal-data", "purge-window", "--data-dir", tmp, "--all-owners",
+                "--start", "2026-07-20T18:30:00Z", "--end", "2026-07-23T18:30:00Z",
+                "--backup-dir", str(backup_dir),
+            ]
+            with patch("sys.stderr", io.StringIO()):
+                self.assertEqual(main(command), 2)
+            with patch("sys.stdout", io.StringIO()) as stdout:
+                self.assertEqual(main(command + ["--confirm"]), 0)
+                payload = json.loads(stdout.getvalue())
+            self.assertEqual(payload["totals"]["owners"], 2)
+            self.assertEqual(payload["totals"]["messages"], 2)
+            self.assertTrue((backup_dir / "owner-a.jsonl").is_file())
+            self.assertTrue((backup_dir / "owner-b.jsonl").is_file())
+            self.assertEqual(repository.search_sessions(SessionSearchQuery("owner-a", "polluted")), ())
+            self.assertEqual(repository.search_sessions(SessionSearchQuery("owner-b", "polluted")), ())
+            self.assertEqual(repository.search_sessions(SessionSearchQuery("owner-a", "keep"))[0].matched_text, "owner-a keep")
+            self.assertEqual(repository.search_sessions(SessionSearchQuery("owner-b", "keep"))[0].matched_text, "owner-b keep")

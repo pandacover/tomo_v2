@@ -55,6 +55,40 @@ class MemoryGovernanceTests(unittest.TestCase):
             repo.accept_generations("owner", session.session_key, ("g2",))
             self.assertEqual(len(repo.search_memories(MemorySearchQuery("owner", "tea"))), 1)
 
+    def test_stale_generation_cannot_apply_direct_memory_governance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = SqlitePersonalDataRepository(Path(tmp) / "tomo.sqlite3")
+            session = ConversationSession("telegram:actor:one")
+            session.append(StoredMessage("assistant", "answer", metadata={"generation_id": "g1"}))
+            repo.save_session("owner", session, generation_id="g1", revision=1)
+            repo.stage_memory_controls("owner", session.session_key, "g1", 0, 0, (control("tea", "m1"),), revision=1)
+            repo.accept_generations("owner", session.session_key, ("g1",))
+            memory_id = repo.search_memories(MemorySearchQuery("owner", "tea"))[0].memory.id
+            repo.save_session("owner", repo.load_session("owner", session.session_key), generation_id="g2", revision=2)
+
+            result = MemoryGovernanceService(repo).apply(
+                "owner",
+                session.session_key,
+                "Please forget tea",
+                MemoryGovernanceControl("disable_by_user", (memory_id,), "forget tea"),
+                expected_generation_id="g1",
+                expected_revision=1,
+            )
+
+            self.assertEqual(result.outcome, "rejected")
+            self.assertEqual(len(repo.search_memories(MemorySearchQuery("owner", "tea"))), 1)
+            cancelled = MemoryGovernanceService(repo).apply(
+                "owner",
+                session.session_key,
+                "Please forget tea",
+                MemoryGovernanceControl("disable_by_user", (memory_id,), "forget tea"),
+                expected_generation_id="g2",
+                expected_revision=2,
+                is_active=lambda: False,
+            )
+            self.assertEqual(cancelled.outcome, "rejected")
+            self.assertEqual(len(repo.search_memories(MemorySearchQuery("owner", "tea"))), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

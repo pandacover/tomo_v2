@@ -326,6 +326,12 @@ def create_peer_router(
                 thread_id=body.thread_id,
             )
         except PeerError as error:
+            if str(error) == "grounding_required":
+                return {
+                    "ok": False,
+                    "status": "failed",
+                    "errorCode": "peer_grounding_required",
+                }
             raise safe_peer_error(error) from None
         return {
             "requestId": result.request_id,

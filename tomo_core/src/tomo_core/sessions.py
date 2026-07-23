@@ -124,8 +124,9 @@ class ConversationSession:
     def model_history(self, limit: int = 20) -> list[dict[str, str]]:
         return [
             _model_message(message)
-            for message in self.messages[-limit:]
-        ]
+            for message in self.messages
+            if not message.metadata.get("peer_exchange")
+        ][-limit:]
 
     def model_history_for_burst(self, burst_id: str, limit: int = 20) -> list[dict[str, str]]:
         accepted = set(self.accepted_generation_ids)
@@ -133,6 +134,8 @@ class ConversationSession:
         for message in self.messages:
             metadata = message.metadata
             if metadata.get("burst_id") == burst_id:
+                continue
+            if metadata.get("peer_exchange"):
                 continue
             if metadata.get("generation_status") == "provisional" and metadata.get("generation_id") not in accepted:
                 continue

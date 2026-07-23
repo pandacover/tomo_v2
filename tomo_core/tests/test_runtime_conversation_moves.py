@@ -9,10 +9,11 @@ from tomo_core import InboundEnvelope, InboundMessage, InputBurst, PersonalAgent
 from tomo_core.models import MessageAttachment, PeerTurn
 from tomo_core.conversation import FrameReady
 from tomo_core.grok_auth import GrokAuthStore
-from tomo_core.providers import GrokAuthProvider, ProviderStreamCompleted, ProviderTextDelta
+from tomo_core.providers import GrokAuthProvider, ProviderStreamCompleted, ProviderTextDelta, ProviderToolCallReady
 from tomo_core.runtime import RuntimeCompleted, RuntimeFrameReady, RuntimeReactionReady, StaleSessionRevisionError, _safe_memory_control
-from tomo_core.personal_data import MemorySourceRef, MemoryWriteControl
+from tomo_core.personal_data import MemorySearchQuery, MemorySourceRef, MemoryWriteControl, SessionSearchQuery
 from tomo_core.sessions import ConversationSession, StoredMessage
+from tomo_core.tools import BoundTool, ToolRegistry, ToolSpec
 from tomo_core.vision import VisionObservation
 from tomo_core.sqlite_personal_data import SqlitePersonalDataRepository
 from tomo_core.telegram import FakeTelegramClient, TelegramDeliverySink
@@ -229,6 +230,136 @@ class RuntimeConversationMoveTests(unittest.TestCase):
         control = MemoryWriteControl("add", "autonomous", None, None, "fact", "self", "tool", "value", "observed", 1, 1, "contextual", None, None, (MemorySourceRef("tool_observation", "call-1", "2026-01-01T00:00:00Z"),))
         self.assertTrue(_safe_memory_control(control, burst, ConversationSession("telegram:actor:user"), {"call-1"}))
         self.assertFalse(_safe_memory_control(control, burst, ConversationSession("telegram:actor:user"), {"old-call"}))
+
+    def test_peer_list_cannot_ground_a_model_authored_personal_fact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            soul_path = Path(tmp) / "SOUL.md"
+            soul_path.write_text("SOUL", encoding="utf-8")
+            fabricated = json.dumps({
+                "type": "memory_control", "action": "add", "authority": "autonomous",
+                "user_intent_excerpt": None, "memory_id": None, "kind": "fact",
+                "subject_key": "self", "topic": "identity.birthplace",
+                "value": "the moon", "statement": "the owner was born on the moon",
+                "confidence": 1.0, "salience": 1.0, "surface_scope": "always",
+                "valid_from": None, "valid_until": None,
+                "sources": [{"source_kind": "tool_observation", "source_id": "peer-list-1", "observed_at": "2026-01-01T00:00:00Z"}],
+            })
+            provider = ScriptedProvider([
+                [ProviderTextDelta(PLAN), ProviderToolCallReady("peer-list-1", "peer_list", "{}"), ProviderStreamCompleted("tool_calls")],
+                [ProviderTextDelta(fabricated + '\n{"type":"frame","text":"No connected Tomos yet."}\n'), ProviderStreamCompleted("stop")],
+                stream("Next turn."),
+            ])
+            peer_list = BoundTool(
+                ToolSpec("peer_list", "list peers", {"type": "object", "properties": {}}, read_only=True, parallel_safe=True),
+                lambda _: {"ok": True, "status": "completed", "relationships": []},
+            )
+            repository = SqlitePersonalDataRepository(Path(tmp) / "tomo.sqlite3")
+            runtime = PersonalAgentRuntime(
+                provider,
+                TelegramDeliverySink(FakeTelegramClient()),
+                RuntimeConfig(data_dir=tmp, soul_path=str(soul_path)),
+                tool_registry=ToolRegistry((peer_list,)),
+                personal_data_repository=repository,
+            )
+
+            first = InputBurst("burst-1", "gen-1", 1, (InboundMessage(1, 1, InboundEnvelope("telegram", "user", "message-1", "who is connected?")),))
+            second = InputBurst("burst-2", "gen-2", 2, (InboundMessage(1, 2, InboundEnvelope("telegram", "user", "message-2", "hello again")),), accepted_generation_ids=("gen-1",))
+            list(runtime.handle_telegram_burst_iter(first))
+            list(runtime.handle_telegram_burst_iter(second))
+
+            self.assertEqual(repository.search_memories(MemorySearchQuery("local", "moon")), ())
+
+    def test_peer_answer_stays_out_of_owner_context_search_and_memory_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            soul_path = Path(tmp) / "SOUL.md"
+            soul_path.write_text("SOUL", encoding="utf-8")
+            provider = ScriptedProvider([[
+                ProviderTextDelta(PLAN),
+                ProviderToolCallReady("peer-ask-1", "peer_ask", "{}"),
+                ProviderStreamCompleted("tool_calls"),
+            ]])
+            peer_ask = BoundTool(
+                ToolSpec("peer_ask", "ask peer", {"type": "object", "properties": {}}, read_only=False, parallel_safe=False),
+                lambda _: {"ok": True, "status": "completed", "frames": ["the owner was born on the moon"]},
+            )
+            repository = SqlitePersonalDataRepository(Path(tmp) / "tomo.sqlite3")
+            runtime = PersonalAgentRuntime(
+                provider,
+                TelegramDeliverySink(FakeTelegramClient()),
+                RuntimeConfig(data_dir=tmp, soul_path=str(soul_path)),
+                tool_registry=ToolRegistry((peer_ask,)),
+                personal_data_repository=repository,
+            )
+            first = InputBurst("burst-1", "gen-1", 1, (InboundMessage(1, 1, InboundEnvelope("telegram", "user", "message-1", "ask the peer")),))
+
+            list(runtime.handle_telegram_burst_iter(first))
+            persisted = repository.load_session("local", first.latest.session_key)
+            peer_message = next(message for message in persisted.messages if message.role == "assistant")
+            self.assertTrue(peer_message.metadata["peer_exchange"])
+            peer_message_id = peer_message.metadata["_canonical_message_id"]
+            control = json.dumps({
+                "type": "memory_control", "action": "add", "authority": "autonomous",
+                "user_intent_excerpt": None, "memory_id": None, "kind": "fact",
+                "subject_key": "self", "topic": "identity.birthplace", "value": "the moon",
+                "statement": "the owner was born on the moon", "confidence": 1.0, "salience": 1.0,
+                "surface_scope": "always", "valid_from": None, "valid_until": None,
+                "sources": [{"source_kind": "session_message", "source_id": peer_message_id, "observed_at": "2026-01-01T00:00:00Z"}],
+            })
+            provider.streams.append([
+                ProviderTextDelta(PLAN + control + '\n{"type":"frame","text":"Next turn."}\n'),
+                ProviderStreamCompleted("stop"),
+            ])
+            second = InputBurst("burst-2", "gen-2", 2, (InboundMessage(1, 2, InboundEnvelope("telegram", "user", "message-2", "hello again")),), accepted_generation_ids=("gen-1",))
+
+            list(runtime.handle_telegram_burst_iter(second))
+
+            second_prompt = json.dumps(provider.calls[1][0], ensure_ascii=False)
+            self.assertNotIn("born on the moon", second_prompt)
+            self.assertEqual(repository.search_sessions(SessionSearchQuery("local", "moon")), ())
+            self.assertEqual(repository.search_memories(MemorySearchQuery("local", "moon")), ())
+            self.assertEqual([item.reason_code for item in runtime.memory_control_diagnostics], ["invalid_provenance"])
+
+    def test_progressive_peer_answer_is_tainted_before_completion_and_across_supersession(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            soul_path = Path(tmp) / "SOUL.md"
+            soul_path.write_text("SOUL", encoding="utf-8")
+            peer_text = "the owner was born on the moon"
+            provider = ScriptedProvider([
+                [ProviderTextDelta(PLAN), ProviderToolCallReady("peer-ask-1", "peer_ask", "{}"), ProviderStreamCompleted("tool_calls")],
+                stream("new answer"),
+            ])
+            peer_ask = BoundTool(
+                ToolSpec("peer_ask", "ask peer", {"type": "object", "properties": {}}, read_only=False, parallel_safe=False),
+                lambda _: {"ok": True, "status": "completed", "frames": [peer_text]},
+            )
+            repository = SqlitePersonalDataRepository(Path(tmp) / "tomo.sqlite3")
+            runtime = PersonalAgentRuntime(
+                provider,
+                TelegramDeliverySink(FakeTelegramClient()),
+                RuntimeConfig(data_dir=tmp, soul_path=str(soul_path)),
+                tool_registry=ToolRegistry((peer_ask,)),
+                personal_data_repository=repository,
+            )
+            first = InputBurst("burst-1", "gen-1", 1, (InboundMessage(1, 1, InboundEnvelope("telegram", "user", "message-1", "ask the peer")),))
+            first_events = runtime.handle_telegram_burst_iter(first)
+
+            self.assertIsInstance(next(first_events), RuntimeFrameReady)
+            provisional = repository.load_session("local", first.latest.session_key)
+            self.assertTrue(next(message for message in provisional.messages if message.role == "assistant").metadata["peer_exchange"])
+            second = InputBurst(
+                "burst-2", "gen-2", 2,
+                (InboundMessage(1, 2, InboundEnvelope("telegram", "user", "message-2", "new question")),),
+                visible_assistant_utterances=(peer_text,),
+                accepted_generation_ids=("gen-1",),
+            )
+            list(runtime.handle_telegram_burst_iter(second))
+            first_events.close()
+
+            persisted = repository.load_session("local", first.latest.session_key)
+            propagated = next(message for message in persisted.messages if message.metadata.get("generation_id") == "gen-2")
+            self.assertTrue(propagated.metadata["peer_exchange"])
+            self.assertNotIn(peer_text, json.dumps(provider.calls[1][0], ensure_ascii=False))
+            self.assertEqual(repository.search_sessions(SessionSearchQuery("local", "moon")), ())
     @staticmethod
     def _load_persisted_session(data_dir, session_key="telegram:actor:user-1"):
         return SqlitePersonalDataRepository(Path(data_dir) / "tomo.sqlite3").load_session("local", session_key)
@@ -445,7 +576,7 @@ class RuntimeConversationMoveTests(unittest.TestCase):
 
             self.assertEqual(list(iterator), [])
             session = self._load_persisted_session(tmp)
-            self.assertEqual([message.role for message in session.messages], ["user"])
+            self.assertEqual(session.messages, [])
 
     def test_handle_telegram_burst_iter_stops_before_next_provider_call_when_inactive_after_selection(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -14,12 +14,16 @@ from .personal_data import PersonalDataTransferRepository
 FORMAT_VERSION = 1
 
 
-def export_owner(repository: PersonalDataTransferRepository, owner_id: str, output: TextIO, *, peer_records: Iterable[dict[str, object]] = ()) -> None:
+def write_owner_export(owner_id: str, records: Iterable[dict[str, object]], output: TextIO, *, peer_records: Iterable[dict[str, object]] = ()) -> None:
     output.write(json.dumps({"format": "tomo_personal_data", "version": FORMAT_VERSION, "owner_id": owner_id}, sort_keys=True) + "\n")
-    for record in repository.export_owner_records(owner_id):
+    for record in records:
         output.write(json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n")
     for record in peer_records:
         output.write(json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n")
+
+
+def export_owner(repository: PersonalDataTransferRepository, owner_id: str, output: TextIO, *, peer_records: Iterable[dict[str, object]] = ()) -> None:
+    write_owner_export(owner_id, repository.export_owner_records(owner_id), output, peer_records=peer_records)
 
 
 def import_owner(repository: PersonalDataTransferRepository, owner_id: str, source: Iterable[str], *, peer_exchange=None) -> None:

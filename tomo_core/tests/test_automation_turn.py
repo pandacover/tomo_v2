@@ -179,7 +179,7 @@ class AutomationTurnTests(unittest.TestCase):
             self.assertEqual(session.messages[0].content, "kept searchable")
             check = sqlite3.connect(path)
             try:
-                self.assertEqual(check.execute("SELECT max(version) FROM schema_migrations").fetchone()[0], 4)
+                self.assertEqual(check.execute("SELECT max(version) FROM schema_migrations").fetchone()[0], 5)
                 self.assertEqual(check.execute("SELECT content FROM messages_fts WHERE record_id='message-1'").fetchone()[0], "kept searchable")
             finally:
                 check.close()
@@ -190,7 +190,7 @@ class AutomationTurnTests(unittest.TestCase):
             connection = sqlite3.connect(path)
             connection.executescript("""
                 CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
-                INSERT INTO schema_migrations VALUES(5, '2026-07-17T12:00:00+00:00');
+                INSERT INTO schema_migrations VALUES(6, '2026-07-17T12:00:00+00:00');
             """)
             connection.close()
             from tomo_core.personal_data import StorageCapabilityError

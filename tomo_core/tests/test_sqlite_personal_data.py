@@ -1,5 +1,7 @@
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 from tomo_core.personal_data import MemoryContextQuery, MemorySearchQuery, MemorySourceRef, MemoryWriteControl, SessionSearchQuery
@@ -167,6 +169,156 @@ class SqlitePersonalDataTests(unittest.TestCase):
             self.assertEqual(repository.search_sessions(SessionSearchQuery("owner-b", "cafe")), ())
             repository.accept_generations("owner-a", session.session_key, ("g1",))
             self.assertEqual([hit.matched_text for hit in repository.search_sessions(SessionSearchQuery("owner-a", "private"))], ["provisional private answer"])
+
+    def test_session_search_context_excludes_neighboring_peer_exchange_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repository = SqlitePersonalDataRepository(Path(tmp) / "tomo.sqlite3")
+            session = ConversationSession("telegram:actor:one")
+            session.append(StoredMessage("user", "earlier context", metadata={"burst_id": "b1", "update_id": 1}))
+            session.append(StoredMessage("assistant", "peer moon claim", metadata={"generation_id": "peer", "generation_status": "provisional", "peer_exchange": True}))
+            session.append(StoredMessage("user", "needle question", metadata={"burst_id": "b2", "update_id": 2}))
+            repository.save_session("owner-a", session)
+            repository.accept_generations("owner-a", session.session_key, ("peer",))
+
+            with closing(sqlite3.connect(repository.path)) as connection:
+                self.assertEqual(connection.execute("SELECT record_id FROM messages_fts WHERE messages_fts MATCH 'moon'").fetchall(), [])
+            repository.rebuild_index("owner-a")
+            with closing(sqlite3.connect(repository.path)) as connection:
+                self.assertEqual(connection.execute("SELECT record_id FROM messages_fts WHERE messages_fts MATCH 'moon'").fetchall(), [])
+
+            hit = repository.search_sessions(SessionSearchQuery("owner-a", "needle"))[0]
+
+            self.assertEqual(hit.matched_text, "needle question")
+            self.assertNotIn("peer moon claim", [message.content for message in hit.context])
+
+    def test_session_search_excludes_peer_rows_before_candidate_ranking_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repository = SqlitePersonalDataRepository(Path(tmp) / "tomo.sqlite3")
+            session = ConversationSession("telegram:actor:one")
+            generations = []
+            for index in range(8):
+                generation = f"peer-{index}"
+                generations.append(generation)
+                session.append(StoredMessage(
+                    "assistant",
+                    ("needle " * 20) + str(index),
+                    metadata={"generation_id": generation, "peer_exchange": True},
+                ))
+            session.append(StoredMessage("user", "legitimate needle", metadata={"burst_id": "valid", "update_id": 1}))
+            repository.save_session("owner-a", session)
+            repository.accept_generations("owner-a", session.session_key, tuple(generations))
+
+            hits = repository.search_sessions(SessionSearchQuery("owner-a", "needle", limit=1))
+
+            self.assertEqual([hit.matched_text for hit in hits], ["legitimate needle"])
+
+    def test_purge_owner_window_removes_affected_chat_and_memory_generations_and_restores_predecessor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repository = SqlitePersonalDataRepository(Path(tmp) / "tomo.sqlite3")
+            session = ConversationSession("telegram:actor:one")
+            session.append(StoredMessage("user", "legitimate before", "2025-01-01T10:00:00+00:00", {"burst_id": "before", "update_id": 1}))
+            session.append(StoredMessage("assistant", "before answer", "2025-01-01T10:01:00+00:00", {"generation_id": "before"}))
+            session.append(StoredMessage("user", "polluted question", "2025-01-02T10:00:00+00:00", {"burst_id": "affected", "update_id": 2}))
+            session.append(StoredMessage("assistant", "polluted answer", "2025-01-02T10:01:00+00:00", {"generation_id": "affected"}))
+            session.append(StoredMessage("user", "legitimate after", "2025-01-04T10:00:00+00:00", {"burst_id": "after", "update_id": 3}))
+            repository.save_session("owner-a", session, generation_id="affected", revision=3)
+            other = ConversationSession("telegram:actor:other")
+            other.append(StoredMessage("user", "other owner polluted text", "2025-01-02T10:00:00+00:00", {"burst_id": "other", "update_id": 1}))
+            repository.save_session("owner-b", other)
+            collision = ConversationSession("telegram:actor:collision")
+            collision.append(StoredMessage("assistant", "same generation, different session", "2025-01-04T11:00:00+00:00", {"generation_id": "affected"}))
+            repository.save_session("owner-a", collision, generation_id="affected", revision=7)
+            collision_control = MemoryWriteControl(
+                "upsert", "autonomous", None, None, "fact", "self", "unrelated", {"value": "safe"},
+                "Unrelated retained memory", 0.9, 0.8, "always", None, None,
+                (MemorySourceRef("assistant_conclusion", "affected", "2025-01-04T11:00:00Z"),),
+            )
+            repository.stage_memory_controls("owner-a", collision.session_key, "affected", 0, 0, (collision_control,), revision=7)
+            repository.accept_generations("owner-a", collision.session_key, ("affected",))
+            repository.stage_memory_controls("owner-a", session.session_key, "before", 0, 0, (self._control(value="tea"),))
+            repository.accept_generations("owner-a", session.session_key, ("before",))
+            original = repository.search_memories(MemorySearchQuery("owner-a", "tea"))[0].memory
+            repository.stage_memory_controls("owner-a", session.session_key, "affected", 0, 0, (self._control(value="coffee", memory_id=original.id),))
+            repository.accept_generations("owner-a", session.session_key, ("affected",))
+
+            result = repository.purge_owner_window(
+                "owner-a", "2025-01-02T00:00:00+00:00", "2025-01-03T00:00:00+00:00"
+            )
+
+            self.assertEqual(result, {"messages": 2, "memories": 1, "pending_actions": 0})
+            self.assertEqual(repository.current_session_revision("owner-a", session.session_key), 4)
+            self.assertFalse(repository.save_session("owner-a", session, generation_id="affected", revision=3))
+            self.assertFalse(repository.save_session("owner-a", session))
+            self.assertEqual(
+                {hit.memory.statement for hit in repository.search_memories(MemorySearchQuery("owner-a", None))},
+                {"Owner likes tea", "Unrelated retained memory"},
+            )
+            self.assertEqual(repository.search_sessions(SessionSearchQuery("owner-a", "polluted")), ())
+            self.assertEqual(repository.search_sessions(SessionSearchQuery("owner-b", "polluted"))[0].matched_text, "other owner polluted text")
+            persisted = repository.load_session("owner-a", session.session_key)
+            self.assertEqual(persisted.accepted_generation_ids, ("before",))
+            collision_persisted = repository.load_session("owner-a", collision.session_key)
+            self.assertEqual(collision_persisted.accepted_generation_ids, ("affected",))
+            self.assertEqual(repository.current_session_revision("owner-a", collision.session_key), 7)
+            self.assertTrue(repository.integrity_check())
+
+    def test_purge_owner_window_rejects_an_empty_or_reversed_window(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repository = SqlitePersonalDataRepository(Path(tmp) / "tomo.sqlite3")
+            for start, end in (
+                ("2026-07-23T00:00:00Z", "2026-07-23T00:00:00Z"),
+                ("2026-07-24T00:00:00Z", "2026-07-23T00:00:00Z"),
+            ):
+                with self.subTest(start=start, end=end), self.assertRaisesRegex(ValueError, "purge window"):
+                    repository.purge_owner_window("owner", start, end)
+
+    def test_purge_owner_window_preserves_full_microsecond_half_open_precision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repository = SqlitePersonalDataRepository(Path(tmp) / "tomo.sqlite3")
+            session = ConversationSession("telegram:actor:one")
+            for index, (content, timestamp) in enumerate((
+                ("before boundary", "2026-07-23T00:00:00.000000Z"),
+                ("at start", "2026-07-23T00:00:00.000001Z"),
+                ("inside", "2026-07-23T00:00:00.000002Z"),
+                ("at end", "2026-07-23T00:00:00.000003Z"),
+            )):
+                session.append(StoredMessage("user", content, timestamp, {"burst_id": f"b{index}", "update_id": index}))
+            repository.save_session("owner", session)
+
+            result = repository.purge_owner_window(
+                "owner", "2026-07-23T00:00:00.000001Z", "2026-07-23T00:00:00.000003Z"
+            )
+
+            self.assertEqual(result["messages"], 2)
+            remaining = repository.load_session("owner", session.session_key)
+            self.assertEqual([message.content for message in remaining.messages], ["before boundary", "at end"])
+
+    def test_purge_owner_window_removes_the_complete_generation_crossing_the_end_boundary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repository = SqlitePersonalDataRepository(Path(tmp) / "tomo.sqlite3")
+            session = ConversationSession("telegram:actor:crossing")
+            session.append(StoredMessage("user", "trigger inside", "2026-07-21T23:59:59+00:00", {"burst_id": "crossing"}))
+            session.append(StoredMessage("assistant", "response outside", "2026-07-22T00:00:01+00:00", {"burst_id": "crossing", "generation_id": "crossing", "generation_status": "accepted"}))
+            session.append(StoredMessage("automation", "generation peer outside", "2026-07-22T00:00:02+00:00", {"source": "automation", "burst_id": "chained", "generation_id": "crossing"}))
+            session.append(StoredMessage("user", "burst peer outside", "2026-07-22T00:00:03+00:00", {"burst_id": "chained"}))
+            session.accept_generations(("crossing",))
+            repository.save_session("owner-a", session, generation_id="crossing", revision=1)
+
+            result = repository.purge_owner_window("owner-a", "2026-07-21T00:00:00+00:00", "2026-07-22T00:00:00+00:00")
+
+            self.assertEqual(result["messages"], 4)
+            retained = repository.load_session("owner-a", session.session_key)
+            self.assertEqual(retained.messages, [])
+            self.assertEqual(retained.accepted_generation_ids, ())
+
+    def test_list_owners_includes_every_personal_data_owner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repository = SqlitePersonalDataRepository(Path(tmp) / "tomo.sqlite3")
+            session_a = ConversationSession("telegram:actor:a")
+            session_a.append(StoredMessage("user", "a", metadata={"burst_id": "a", "update_id": 1}))
+            repository.save_session("owner-a", session_a)
+            repository.update_memory_setting("owner-b", "capture_enabled", True)
+            self.assertEqual(repository.list_owners(), ("owner-a", "owner-b"))
 
     def test_memory_search_respects_owner_settings(self):
         with tempfile.TemporaryDirectory() as tmp:

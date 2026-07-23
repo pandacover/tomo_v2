@@ -139,6 +139,11 @@ class PeerApiTests(unittest.IsolatedAsyncioTestCase):
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
                 body = {"peerHandle": "bob", "purpose": "question", "disclosureKind": "ordinary_message", "callId": "call-1", "message": "hello"}
                 accepted = await client.post("/v1/peer-agent/requests", headers=headers, json=body)
+                grounding_rejected = await client.post(
+                    "/v1/peer-agent/requests",
+                    headers=headers,
+                    json=body | {"callId": "call-2", "message": "what is bob's favorite color?"},
+                )
                 rejected = await client.post("/v1/peer-agent/requests", headers=headers | {"x-tomo-actor-id": "other"}, json=body)
                 invalid = await client.post("/v1/peer-agent/requests", headers=headers, json=body | {"ownerId": "leak"})
                 claim = exchange.claim()
@@ -158,6 +163,8 @@ class PeerApiTests(unittest.IsolatedAsyncioTestCase):
                 )
 
             self.assertEqual(accepted.status_code, 200)
+            self.assertEqual(grounding_rejected.status_code, 200)
+            self.assertEqual(grounding_rejected.json(), {"ok": False, "status": "failed", "errorCode": "peer_grounding_required"})
             self.assertEqual(rejected.status_code, 401)
             self.assertEqual(invalid.status_code, 422)
             self.assertEqual(inspected.status_code, 200)

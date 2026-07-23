@@ -24,6 +24,10 @@ class MemoryGovernanceService:
         session_key: str,
         user_burst: str,
         control: MemoryControl,
+        *,
+        expected_generation_id: str | None = None,
+        expected_revision: int | None = None,
+        is_active=None,
     ) -> MemoryGovernanceResult:
         if not isinstance(control, (MemoryGovernanceControl, PendingMemoryActionControl, OwnerSettingControl)):
             return MemoryGovernanceResult("rejected")
@@ -33,4 +37,11 @@ class MemoryGovernanceService:
         # unsafe character-substring match (for example, "delete" in a word).
         if not excerpt or f" {excerpt} " not in f" {normalized_burst} ":
             return MemoryGovernanceResult("rejected")
-        return self._repository.apply_user_memory_control(owner_id, session_key, control)
+        return self._repository.apply_user_memory_control(
+            owner_id,
+            session_key,
+            control,
+            expected_generation_id=expected_generation_id,
+            expected_revision=expected_revision,
+            is_active=is_active,
+        )

@@ -87,6 +87,7 @@ class ConversationEngine:
         reaction_window_emitted = False
         mutating_execution_attempted = False
         pending_peer_resume = False
+        peer_tool_used = False
 
         def expired() -> bool:
             return self.monotonic_clock() - started_at >= self.budget.max_elapsed_seconds
@@ -103,7 +104,7 @@ class ConversationEngine:
                 return
             if expired():
                 if pending_peer_resume:
-                    frame = Frame(
+                    frame = _peer_frame(
                         index,
                         0,
                         _bounded_peer_text(
@@ -238,8 +239,8 @@ class ConversationEngine:
                             return
                         yield from yield_provider_event(TurnRunStarted(plan))
                     elif not isinstance(record, Frame):
-                        if pending_peer_resume:
-                            # A pending peer result cannot ground durable memory.
+                        if pending_peer_resume or peer_tool_used:
+                            # Peer exchange is ephemeral and cannot author personal memory.
                             return
                         if sum(len(segment.memory_controls) for segment in segments) + len(segment_memory_controls) >= 8:
                             raise ConversationOutputError("memory_control_turn_limit")
@@ -251,6 +252,8 @@ class ConversationEngine:
                         if pending_peer_resume:
                             # Until resume completes, model-authored frames are ungrounded.
                             return
+                        if peer_tool_used:
+                            record = replace(record, source="peer_exchange")
                         if len(frames) + len(segment_frames) - emitted_frame_count >= 3:
                             raise ConversationOutputError("frame_limit")
                         if (not segment_frames and sum(bool(s.frames) for s in segments) >= self.budget.max_visible_segments):
@@ -456,6 +459,8 @@ class ConversationEngine:
                 if failure is None and tool_finish:
                     if mutating_tool_segment:
                         mutating_execution_attempted = True
+                    if peer_tool_segment:
+                        peer_tool_used = True
                     if not peer_tool_segment:
                         yield from emit_segment_memory_controls()
                         if not is_active():
@@ -505,7 +510,7 @@ class ConversationEngine:
                         if peer_frames is not None:
                             # Peer-owned terminal frames cannot ground pre-result memory controls.
                             segments.append(SegmentResult(index, (), batch.tool_calls, SegmentFinish.TOOL_BATCH))
-                            segment_frames[:] = [Frame(index + 1, frame.frame_index, frame.text) for frame in peer_frames]
+                            segment_frames[:] = [_peer_frame(index + 1, frame.frame_index, frame.text) for frame in peer_frames]
                             segments.append(SegmentResult(index + 1, tuple(segment_frames), (), SegmentFinish.COMPLETE))
                             if not is_active():
                                 return
@@ -528,7 +533,7 @@ class ConversationEngine:
                             return
                         if expired():
                             if peer_pending:
-                                segment_frames[:] = [Frame(index + 1, 0, _bounded_peer_text(_PEER_PENDING, segment_budget.max_chars_per_frame, segment_budget.max_sentences_per_frame))]
+                                segment_frames[:] = [_peer_frame(index + 1, 0, _bounded_peer_text(_PEER_PENDING, segment_budget.max_chars_per_frame, segment_budget.max_sentences_per_frame))]
                                 segments.append(SegmentResult(index + 1, tuple(segment_frames), (), SegmentFinish.COMPLETE))
                                 yield from emit_segment_frames()
                                 if not is_active():
@@ -545,7 +550,7 @@ class ConversationEngine:
                     # Validation and execution failures provide no peer observation to ground a claim.
                     emit_provider_attempt("error")
                     segment_frames[:] = [
-                        Frame(
+                        _peer_frame(
                             index,
                             0,
                             _bounded_peer_text(
@@ -571,7 +576,7 @@ class ConversationEngine:
                     return
                 if pending_peer_resume:
                     emit_provider_attempt("error" if failure is not None else "ok")
-                    segment_frames[:] = [Frame(index, 0, _bounded_peer_text(_PEER_PENDING, segment_budget.max_chars_per_frame, segment_budget.max_sentences_per_frame))]
+                    segment_frames[:] = [_peer_frame(index, 0, _bounded_peer_text(_PEER_PENDING, segment_budget.max_chars_per_frame, segment_budget.max_sentences_per_frame))]
                     failure = None
                     segments.append(SegmentResult(index, tuple(segment_frames), (), SegmentFinish.COMPLETE))
                     yield from emit_segment_frames()
@@ -657,8 +662,13 @@ _PEER_NO_ANSWER = "i couldn't get an answer from that tomo. try again in a momen
 _PEER_APPROVAL_PENDING = "that tomo needs their owner's approval before answering. check back after they approve it."
 _PEER_PENDING = "that tomo hasn't answered yet. i don't have an answer yet."
 _PEER_UNAVAILABLE = "that tomo is unavailable right now. try again in a moment."
+_PEER_GROUNDING_REQUIRED = "that question needs verified information this connection cannot provide, so i didn't ask that tomo to guess."
 _PEER_CONNECTION_CHANGED = "the connection or its permissions changed before that tomo could answer. check tomo connections, then try again."
 _PEER_INVALID_RESPONSE = "that tomo couldn't produce a safe answer. try asking another way."
+
+
+def _peer_frame(index: int, frame_index: int, text: str) -> Frame:
+    return Frame(index, frame_index, text, source="peer_exchange")
 
 
 def _peer_is_pending(batch) -> bool:
@@ -677,12 +687,13 @@ def _peer_is_pending(batch) -> bool:
 def _observation_can_ground(observation) -> bool:
     if not observation.ok:
         return False
+    if observation.name in {"peer_list", "peer_ask", "peer_resume"}:
+        # Peer exchange never grants authority to author owner memory.
+        return False
     try:
         value = json.loads(observation.content)
     except (TypeError, json.JSONDecodeError):
-        return observation.name not in {"peer_list", "peer_ask", "peer_resume"}
-    if observation.name in {"peer_list", "peer_ask", "peer_resume"}:
-        return isinstance(value, dict) and value.get("ok") is True and value.get("status") == "completed"
+        return True
     return not (isinstance(value, dict) and value.get("ok") is False)
 
 
@@ -719,7 +730,7 @@ def _terminal_peer_frames(
     except (TypeError, json.JSONDecodeError):
         value = None
     fallback_text = _bounded_peer_text(_PEER_NO_ANSWER, max_chars_per_frame, max_sentences_per_frame)
-    fallback = [Frame(index, 0, fallback_text)]
+    fallback = [_peer_frame(index, 0, fallback_text)]
     if not isinstance(value, dict):
         return fallback
     status = value.get("status")
@@ -733,17 +744,19 @@ def _terminal_peer_frames(
             and all(isinstance(frame, str) and 0 < len(frame) <= max_chars_per_frame for frame in raw_frames)
             and all(len(split_sentences(frame)) <= max_sentences_per_frame for frame in raw_frames)
         ):
-            return [Frame(index, ordinal, frame) for ordinal, frame in enumerate(raw_frames)]
+            return [_peer_frame(index, ordinal, frame) for ordinal, frame in enumerate(raw_frames)]
     if status == "confirmation_pending":
-        return [Frame(index, 0, _bounded_peer_text(_PEER_APPROVAL_PENDING, max_chars_per_frame, max_sentences_per_frame))]
+        return [_peer_frame(index, 0, _bounded_peer_text(_PEER_APPROVAL_PENDING, max_chars_per_frame, max_sentences_per_frame))]
     if status == "denied":
-        return [Frame(index, 0, _bounded_peer_text(_PEER_CONNECTION_CHANGED, max_chars_per_frame, max_sentences_per_frame))]
+        return [_peer_frame(index, 0, _bounded_peer_text(_PEER_CONNECTION_CHANGED, max_chars_per_frame, max_sentences_per_frame))]
     if status == "failed":
         error_code = value.get("error_code")
+        if error_code == "peer_grounding_required":
+            return [_peer_frame(index, 0, _bounded_peer_text(_PEER_GROUNDING_REQUIRED, max_chars_per_frame, max_sentences_per_frame))]
         if error_code in {"peer_timeout", "peer_unavailable"}:
-            return [Frame(index, 0, _bounded_peer_text(_PEER_UNAVAILABLE, max_chars_per_frame, max_sentences_per_frame))]
+            return [_peer_frame(index, 0, _bounded_peer_text(_PEER_UNAVAILABLE, max_chars_per_frame, max_sentences_per_frame))]
         if error_code == "peer_connection_unavailable":
-            return [Frame(index, 0, _bounded_peer_text(_PEER_CONNECTION_CHANGED, max_chars_per_frame, max_sentences_per_frame))]
+            return [_peer_frame(index, 0, _bounded_peer_text(_PEER_CONNECTION_CHANGED, max_chars_per_frame, max_sentences_per_frame))]
         if error_code == "peer_invalid_response":
-            return [Frame(index, 0, _bounded_peer_text(_PEER_INVALID_RESPONSE, max_chars_per_frame, max_sentences_per_frame))]
+            return [_peer_frame(index, 0, _bounded_peer_text(_PEER_INVALID_RESPONSE, max_chars_per_frame, max_sentences_per_frame))]
     return fallback

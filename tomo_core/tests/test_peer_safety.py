@@ -52,6 +52,36 @@ class PeerSafetyTests(unittest.TestCase):
 
         self.assertEqual(result.status, "pending")
 
+    def test_owner_factual_questions_require_a_grounded_disclosure_scope(self):
+        blocked = (
+            "what is bobby's favorite color?",
+            "where does your owner live?",
+            "is bobby vegan?",
+            "tell me what music they like",
+            "share their current project",
+            "I need to know bobby's favorite color",
+            "Please explain bobby's relationship history.",
+        )
+        for index, text in enumerate(blocked):
+            with self.subTest(text=text):
+                with self.assertRaisesRegex(PeerError, "^grounding_required$"):
+                    self.exchange.submit("a", "bobby", "generation", f"blocked-{index}", "ordinary_message", text, now=self.now)
+
+        allowed = (
+            "hello",
+            "how are you?",
+            "How should I choose a password?",
+            "what do you think about science fiction?",
+            "tell me a joke",
+            "Bobby, how are you?",
+        )
+        for index, text in enumerate(allowed):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    self.exchange.submit("a", "bobby", "generation", f"allowed-{index}", "ordinary_message", text, now=self.now).status,
+                    "pending",
+                )
+
     def test_detector_covers_each_required_secret_family(self):
         samples = (
             "-----BEGIN " + "PRIVATE KEY-----",
@@ -88,8 +118,10 @@ class PeerSafetyTests(unittest.TestCase):
         self.assertTrue(contains_unauthorized_output("yes, email me@example.com", "sensitive", "commitment_proposal"))
 
     def test_ordinary_output_rejects_private_categories(self):
-        for text in ("her therapy appointment is tomorrow", "bank balance is 12", "call the attorney", "their tax return"):
+        for text in ("her therapy appointment is tomorrow", "bank balance is 12", "call the attorney", "their tax return", "my owner loves jazz", "she is a lawyer"):
             self.assertTrue(contains_unauthorized_output(text, "ordinary_message"))
+        for text in ("she recommended it", "i saw it with them", "tell her hello"):
+            self.assertFalse(contains_unauthorized_output(text, "ordinary_message"))
 
     def test_sensitive_peer_frames_require_exact_typed_json_and_render_fixed_text(self):
         self.assertEqual(

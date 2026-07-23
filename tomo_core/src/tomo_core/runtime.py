@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterator, Literal, TypeAlias
 
@@ -264,10 +264,12 @@ class PersonalAgentRuntime:
             for message in burst.messages:
                 session.append_inbound_once(message, burst.burst_id)
         checkpoint_started_at = time.monotonic()
-        saved = True if peer else self.personal_data.save_session(self.owner_id, session, generation_id=burst.generation_id, revision=burst.revision)
+        saved = True if peer else self.personal_data.save_session(self.owner_id, session, generation_id=burst.generation_id, revision=burst.revision, is_active=is_active)
         if is_active():
             latency_trace.emit_sandbox("sandbox_checkpoint_inbound", outcome="ok" if saved else "error", elapsed_ms=max(0, int((time.monotonic() - checkpoint_started_at) * 1000)))
         if not saved:
+            if not is_active():
+                return
             current_revision = self.personal_data.current_session_revision(self.owner_id, session_key)
             if current_revision is None:
                 raise RuntimeError("stale_session_revision_unavailable")
@@ -289,7 +291,9 @@ class PersonalAgentRuntime:
                 session.record_vision_observations(burst.burst_id, observations)
                 if not is_active():
                     return
-                if not self.personal_data.save_session(self.owner_id, session, generation_id=burst.generation_id, revision=burst.revision):
+                if not self.personal_data.save_session(self.owner_id, session, generation_id=burst.generation_id, revision=burst.revision, is_active=is_active):
+                    if not is_active():
+                        return
                     current_revision = self.personal_data.current_session_revision(self.owner_id, session_key)
                     if current_revision is None:
                         raise RuntimeError("stale_session_revision_unavailable")
@@ -312,8 +316,13 @@ class PersonalAgentRuntime:
         history = list(session.model_history_for_burst(burst.run_id if automation else burst.request_id if peer else burst.burst_id))
         if memory_block:
             history.append({"role": "user", "content": memory_block})
+        prompt_burst = (
+            replace(burst, visible_assistant_utterances=())
+            if isinstance(burst, InputBurst) and _burst_has_visible_peer_exchange(session, burst)
+            else burst
+        )
         request = ConversationRequest(
-            burst=burst,
+            burst=prompt_burst,
             soul=load_soul(Path(self.config.soul_path)),
             history=tuple(history),
             vision_observations=observations,
@@ -368,6 +377,9 @@ class PersonalAgentRuntime:
                             burst.latest.session_key,
                             "\n".join(message.envelope.text for message in burst.messages),
                             event.control,
+                            expected_generation_id=burst.generation_id,
+                            expected_revision=burst.revision,
+                            is_active=is_active,
                         )
                     except (StorageBusyError, ValueError):
                         pass
@@ -474,7 +486,13 @@ class PersonalAgentRuntime:
                 },
             )
         )
-        self.personal_data.save_session(self.owner_id, session)
+        current_revision = self.personal_data.current_session_revision(self.owner_id, session.session_key)
+        self.personal_data.save_session(
+            self.owner_id,
+            session,
+            generation_id=f"legacy-{envelope.message_id}",
+            revision=(current_revision or 0) + 1,
+        )
 
     @staticmethod
     def _compact_plan(result) -> dict[str, object]:
@@ -532,6 +550,7 @@ class PersonalAgentRuntime:
         if isinstance(burst, PeerTurn):
             return True
         result = event.result
+        peer_exchange = _result_used_peer_exchange(result) or _burst_has_visible_peer_exchange(session, burst)
         logical_parts = (*getattr(burst, "visible_assistant_utterances", ()), *(frame.text for frame in result.frames))
         session.append(
             StoredMessage(
@@ -549,11 +568,12 @@ class PersonalAgentRuntime:
                     "segments": self._segment_metadata(result),
                     "usage": self._usage_metadata(result),
                     "delivery_bubbles": [bubble.text for bubble in delivered],
+                    **({"peer_exchange": True} if peer_exchange else {}),
                 },
             )
         )
         checkpoint_started_at = time.monotonic()
-        saved = self.personal_data.save_session(self.owner_id, session, generation_id=burst.generation_id, revision=burst.revision)
+        saved = self.personal_data.save_session(self.owner_id, session, generation_id=burst.generation_id, revision=burst.revision, is_active=is_active)
         if is_active():
             latency_trace.emit_sandbox("sandbox_checkpoint_complete", outcome="ok" if saved else "error", elapsed_ms=max(0, int((time.monotonic() - checkpoint_started_at) * 1000)))
         return saved
@@ -563,12 +583,14 @@ class PersonalAgentRuntime:
             return False
         if isinstance(burst, PeerTurn):
             return True
+        peer_exchange = event.frame.source == "peer_exchange" or _burst_has_visible_peer_exchange(session, burst)
         parts = (*getattr(burst, "visible_assistant_utterances", ()), *(bubble.text for bubble in delivered))
         metadata = {
             "provider": self.provider.name, "generation_id": burst.generation_id,
             "generation_status": "provisional", "burst_id": burst.run_id if isinstance(burst, AutomationTurn) else burst.request_id if isinstance(burst, PeerTurn) else burst.burst_id,
             "revision": burst.revision,
             "delivery_bubbles": [bubble.text for bubble in delivered],
+            **({"peer_exchange": True} if peer_exchange else {}),
         }
         existing_index = next((index for index, message in enumerate(session.messages) if message.role == "assistant" and message.metadata.get("generation_id") == burst.generation_id), None)
         if existing_index is None:
@@ -579,7 +601,7 @@ class PersonalAgentRuntime:
         if not is_active():
             return False
         checkpoint_started_at = time.monotonic()
-        saved = self.personal_data.save_session(self.owner_id, session, generation_id=burst.generation_id, revision=burst.revision)
+        saved = self.personal_data.save_session(self.owner_id, session, generation_id=burst.generation_id, revision=burst.revision, is_active=is_active)
         if is_active():
             latency_trace.emit_sandbox("sandbox_checkpoint_frame", outcome="ok" if saved else "error", elapsed_ms=max(0, int((time.monotonic() - checkpoint_started_at) * 1000)))
         return saved
@@ -594,7 +616,12 @@ def _safe_memory_control(control: MemoryWriteControl, burst: InputBurst, session
     if _contains_secret((control.kind, control.subject_key, control.topic, control.statement, control.value)):
         return False
     current_ids = {message.envelope.message_id for message in burst.messages}
-    session_ids = {str(message.metadata.get("_canonical_message_id")) for message in session.messages if message.metadata.get("_canonical_message_id")}
+    session_ids = {
+        str(message.metadata.get("_canonical_message_id"))
+        for message in session.messages
+        if message.metadata.get("_canonical_message_id")
+        and not message.metadata.get("peer_exchange")
+    }
     observations = tool_observation_ids or set()
     return all(
         (source.source_kind == "current_message" and source.source_id in current_ids)
@@ -602,6 +629,25 @@ def _safe_memory_control(control: MemoryWriteControl, burst: InputBurst, session
         or (source.source_kind == "tool_observation" and source.source_id in observations)
         or (source.source_kind in {"assistant_conclusion", "inference"} and source.source_id == burst.generation_id)
         for source in control.sources
+    )
+
+
+def _result_used_peer_exchange(result) -> bool:
+    return any(
+        call.name in {"peer_list", "peer_ask", "peer_resume"}
+        for segment in result.segments
+        for call in segment.tool_calls
+    )
+
+
+def _burst_has_visible_peer_exchange(session, burst) -> bool:
+    visible = set(getattr(burst, "visible_assistant_utterances", ()))
+    if not visible:
+        return False
+    return any(
+        message.metadata.get("peer_exchange")
+        and any(bubble in visible for bubble in message.metadata.get("delivery_bubbles", ()))
+        for message in session.messages
     )
 
 

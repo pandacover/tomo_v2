@@ -11,7 +11,7 @@ import tempfile
 import time
 import uuid
 from contextlib import ExitStack, closing, contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 
@@ -42,6 +42,14 @@ def _fts(text: str) -> str:
     return " AND ".join(terms)
 
 
+def _is_peer_exchange_metadata(raw: str) -> bool:
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(value, dict) and value.get("peer_exchange") is True
+
+
 def _validate_timestamp(value: str | None) -> None:
     if value is None:
         return
@@ -53,6 +61,16 @@ def _validate_timestamp(value: str | None) -> None:
         raise ValueError("timestamp must be timezone-aware ISO-8601") from error
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError("timestamp must be timezone-aware ISO-8601")
+
+
+def _purge_window_bounds(start_at: str, end_at: str) -> tuple[datetime, datetime]:
+    _validate_timestamp(start_at)
+    _validate_timestamp(end_at)
+    start = datetime.fromisoformat(start_at.replace("Z", "+00:00")).astimezone(timezone.utc)
+    end = datetime.fromisoformat(end_at.replace("Z", "+00:00")).astimezone(timezone.utc)
+    if start >= end:
+        raise ValueError("purge window must end after it starts")
+    return start, end
 
 
 def _validate_control_timestamps(control: MemoryWriteControl) -> None:
@@ -77,9 +95,9 @@ CREATE TABLE pending_memory_actions(id TEXT PRIMARY KEY,owner_id TEXT NOT NULL,s
 CREATE TABLE memory_deletion_tombstones(id TEXT PRIMARY KEY,owner_id TEXT NOT NULL,deleted_at TEXT NOT NULL,request_key TEXT NOT NULL,UNIQUE(owner_id,request_key));
 CREATE VIRTUAL TABLE messages_fts USING fts5(record_id UNINDEXED,owner_id UNINDEXED,content,tokenize='unicode61 remove_diacritics 2');
 CREATE VIRTUAL TABLE memories_fts USING fts5(record_id UNINDEXED,owner_id UNINDEXED,search_text,tokenize='unicode61 remove_diacritics 2');
-CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN INSERT INTO messages_fts(record_id,owner_id,content) SELECT new.id,s.owner_id,new.content FROM sessions s WHERE s.id=new.session_id; END;
+CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN INSERT INTO messages_fts(record_id,owner_id,content) SELECT new.id,s.owner_id,new.content FROM sessions s WHERE s.id=new.session_id AND COALESCE(json_extract(new.metadata_json,'$.peer_exchange'),0)!=1; END;
 CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN DELETE FROM messages_fts WHERE record_id=old.id; END;
-CREATE TRIGGER messages_au AFTER UPDATE OF content ON messages BEGIN DELETE FROM messages_fts WHERE record_id=old.id; INSERT INTO messages_fts(record_id,owner_id,content) SELECT new.id,s.owner_id,new.content FROM sessions s WHERE s.id=new.session_id; END;
+CREATE TRIGGER messages_au AFTER UPDATE OF content,metadata_json ON messages BEGIN DELETE FROM messages_fts WHERE record_id=old.id; INSERT INTO messages_fts(record_id,owner_id,content) SELECT new.id,s.owner_id,new.content FROM sessions s WHERE s.id=new.session_id AND COALESCE(json_extract(new.metadata_json,'$.peer_exchange'),0)!=1; END;
 CREATE TRIGGER memories_ai AFTER INSERT ON memories BEGIN INSERT INTO memories_fts VALUES(new.id,new.owner_id,new.search_text); END;
 CREATE TRIGGER memories_ad AFTER DELETE ON memories BEGIN DELETE FROM memories_fts WHERE record_id=old.id; END;
 CREATE TRIGGER memories_au AFTER UPDATE OF search_text ON memories BEGIN DELETE FROM memories_fts WHERE record_id=old.id; INSERT INTO memories_fts VALUES(new.id,new.owner_id,new.search_text); END;
@@ -134,7 +152,7 @@ class SqlitePersonalDataRepository:
             try:
                 con.execute("BEGIN IMMEDIATE")
                 version = con.execute("SELECT max(version) FROM schema_migrations").fetchone()[0] if self._exists(con, "schema_migrations") else None
-                if version not in (None, 1, 2, 3, 4): raise StorageCapabilityError("unsupported_schema_version")
+                if version not in (None, 1, 2, 3, 4, 5): raise StorageCapabilityError("unsupported_schema_version")
                 if version is None:
                     for statement in _schema_statements():
                         con.execute(statement)
@@ -172,6 +190,15 @@ class SqlitePersonalDataRepository:
                     con.execute("CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN DELETE FROM messages_fts WHERE record_id=old.id; END")
                     con.execute("CREATE TRIGGER messages_au AFTER UPDATE OF content ON messages BEGIN DELETE FROM messages_fts WHERE record_id=old.id; INSERT INTO messages_fts(record_id,owner_id,content) SELECT new.id,s.owner_id,new.content FROM sessions s WHERE s.id=new.session_id; END")
                     con.execute("INSERT INTO schema_migrations VALUES(4,?)", (utc_now_iso(),))
+                    version = 4
+                if version == 4:
+                    con.execute("DROP TRIGGER messages_ai")
+                    con.execute("DROP TRIGGER messages_au")
+                    con.execute("CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN INSERT INTO messages_fts(record_id,owner_id,content) SELECT new.id,s.owner_id,new.content FROM sessions s WHERE s.id=new.session_id AND COALESCE(json_extract(new.metadata_json,'$.peer_exchange'),0)!=1; END")
+                    con.execute("CREATE TRIGGER messages_au AFTER UPDATE OF content,metadata_json ON messages BEGIN DELETE FROM messages_fts WHERE record_id=old.id; INSERT INTO messages_fts(record_id,owner_id,content) SELECT new.id,s.owner_id,new.content FROM sessions s WHERE s.id=new.session_id AND COALESCE(json_extract(new.metadata_json,'$.peer_exchange'),0)!=1; END")
+                    con.execute("DELETE FROM messages_fts")
+                    con.execute("INSERT INTO messages_fts SELECT m.id,s.owner_id,m.content FROM messages m JOIN sessions s ON s.id=m.session_id WHERE COALESCE(json_extract(m.metadata_json,'$.peer_exchange'),0)!=1")
+                    con.execute("INSERT INTO schema_migrations VALUES(5,?)", (utc_now_iso(),))
                 con.commit()
             except sqlite3.OperationalError as error:
                 con.rollback()
@@ -432,12 +459,16 @@ class SqlitePersonalDataRepository:
             ).fetchone()
             return None if row is None or row["current_revision"] is None else int(row["current_revision"])
     @_checkpoint_after_write
-    def save_session(self, owner_id, session, *, generation_id=None, revision=None):
+    def save_session(self, owner_id, session, *, generation_id=None, revision=None, is_active=None):
         try:
             with self._connection() as con:
                 con.execute("BEGIN IMMEDIATE"); s=self._session(con,owner_id,session.session_key,True); now=utc_now_iso()
+                if is_active is not None and not is_active():
+                    con.rollback(); return False
                 if (generation_id is None) != (revision is None):
                     raise ValueError("generation_id and revision must be provided together")
+                if generation_id is None and s["current_revision"] is not None:
+                    con.rollback(); return False
                 if generation_id is not None:
                     current_revision = s["current_revision"]
                     current_generation = s["current_generation_id"]
@@ -514,7 +545,11 @@ class SqlitePersonalDataRepository:
                 con.execute("UPDATE sessions SET updated_at=? WHERE id=?",(now,s["id"])); con.commit(); return True
         except sqlite3.OperationalError as e: raise self._safe(e) from None
     def accept_generations(self, owner_id, session_key, generation_ids):
-        session=self.load_session(owner_id,session_key); session.accept_generations(generation_ids); self.save_session(owner_id,session)
+        with self._connection() as c:
+            row=c.execute("SELECT current_generation_id,current_revision FROM sessions WHERE owner_id=? AND session_key=?",(owner_id,session_key)).fetchone()
+        session=self.load_session(owner_id,session_key); session.accept_generations(generation_ids)
+        if row is None or row["current_revision"] is None:self.save_session(owner_id,session)
+        else:self.save_session(owner_id,session,generation_id=row["current_generation_id"],revision=row["current_revision"])
 
     def memory_settings(self, owner):
         with self._connection() as c:
@@ -607,27 +642,44 @@ class SqlitePersonalDataRepository:
         if not self.memory_settings(q.owner_id).retrieval_enabled:return ()
         if not q.text.strip(): raise StorageSearchError("session_search_query_required")
         if not q.roles: return ()
-        limit=max(1,min(q.limit,20)); before=max(0,min(q.context_before,10)); after=max(0,min(q.context_after,10)); remaining=4000
+        limit=max(1,min(q.limit,20)); before=max(0,min(q.context_before,10)); after=max(0,min(q.context_after,10)); remaining=4000; candidate_limit=min(160,limit*8)
         try:
             with self._connection() as c:
-                rows=c.execute("SELECT m.*,s.session_key,s.connector,-bm25(messages_fts) score FROM messages_fts JOIN messages m ON m.id=messages_fts.record_id JOIN sessions s ON s.id=m.session_id WHERE messages_fts MATCH ? AND s.owner_id=? AND m.role IN (%s) AND (m.role IN ('user','automation') OR m.generation_status='accepted') ORDER BY score DESC LIMIT ?" % ",".join("?"*len(q.roles)),(_fts(q.text),q.owner_id,*q.roles,limit)).fetchall(); out=[]
+                c.create_function("tomo_is_peer_exchange",1,lambda raw: int(_is_peer_exchange_metadata(raw)),deterministic=True)
+                rows=c.execute("SELECT m.*,s.session_key,s.connector,-bm25(messages_fts) score FROM messages_fts JOIN messages m ON m.id=messages_fts.record_id JOIN sessions s ON s.id=m.session_id WHERE messages_fts MATCH ? AND s.owner_id=? AND m.role IN (%s) AND (m.role IN ('user','automation') OR m.generation_status='accepted') AND tomo_is_peer_exchange(m.metadata_json)=0 ORDER BY score DESC LIMIT ?" % ",".join("?"*len(q.roles)),(_fts(q.text),q.owner_id,*q.roles,candidate_limit)).fetchall(); out=[]
                 for r in rows:
-                    context=c.execute("SELECT * FROM messages WHERE session_id=? AND ordinal BETWEEN ? AND ? AND (role IN ('user','automation') OR generation_status='accepted') ORDER BY ordinal,id",(r["session_id"],(r["ordinal"] or 0)-before,(r["ordinal"] or 0)+after)).fetchall()
+                    if _is_peer_exchange_metadata(r["metadata_json"]): continue
+                    context=tuple(c.execute("SELECT * FROM messages WHERE session_id=? AND ordinal BETWEEN ? AND ? AND (role IN ('user','automation') OR generation_status='accepted') AND tomo_is_peer_exchange(metadata_json)=0 ORDER BY ordinal,id",(r["session_id"],(r["ordinal"] or 0)-before,(r["ordinal"] or 0)+after)).fetchall())
                     texts=[r["content"], *(x["content"] for x in context)]
                     size=sum(len(text) for text in texts)
                     if size > remaining:
                         continue
                     remaining -= size
                     out.append(SessionSearchHit(r["session_id"],r["session_key"],r["connector"],r["id"],r["role"],r["content"],r["timestamp"],float(r["score"]),tuple(StoredMessage(x["role"],x["content"],x["timestamp"],json.loads(x["metadata_json"])) for x in context)))
+                    if len(out) == limit: break
                 return tuple(out)
         except (sqlite3.OperationalError,ValueError) as e: raise StorageSearchError("session_search_unavailable") from None
-    def apply_user_memory_control(self,owner,session_key,control):
-        if isinstance(control,OwnerSettingControl): self.update_memory_setting(owner,control.setting,control.enabled); return MemoryGovernanceResult("applied")
+    def apply_user_memory_control(self,owner,session_key,control,*,expected_generation_id=None,expected_revision=None,is_active=None):
+        if (expected_generation_id is None)!=(expected_revision is None):raise ValueError("expected generation and revision must be provided together")
+        def stale(c):
+            if is_active is not None and not is_active():return True
+            if expected_generation_id is None:return False
+            row=c.execute("SELECT current_generation_id,current_revision FROM sessions WHERE owner_id=? AND session_key=?",(owner,session_key)).fetchone()
+            return row is None or row["current_generation_id"]!=expected_generation_id or row["current_revision"]!=expected_revision
+        if isinstance(control,OwnerSettingControl):
+            if control.setting not in {"capture_enabled","retrieval_enabled","reactions_enabled"}:raise ValueError("unknown owner setting")
+            with self._connection() as c:
+                c.execute("BEGIN IMMEDIATE")
+                if stale(c):c.rollback();return MemoryGovernanceResult("rejected")
+                now=utc_now_iso();c.execute("INSERT OR IGNORE INTO owner_memory_settings VALUES(?,?,?,?,?,?)",(owner,1,1,1,0,now));c.execute(f"UPDATE owner_memory_settings SET {control.setting}=?,governance_revision=governance_revision+1,updated_at=? WHERE owner_id=?",(int(control.enabled),now,owner));c.commit()
+            self._checkpoint();return MemoryGovernanceResult("applied")
         if isinstance(control,MemoryGovernanceControl):
             if not control.target_memory_ids: return MemoryGovernanceResult("not_found")
             try:
                 with self._connection() as c:
-                    c.execute("BEGIN IMMEDIATE"); now=utc_now_iso(); marks=",".join("?"*len(control.target_memory_ids))
+                    c.execute("BEGIN IMMEDIATE"); now=utc_now_iso()
+                    if stale(c):c.rollback();return MemoryGovernanceResult("rejected")
+                    marks=",".join("?"*len(control.target_memory_ids))
                     rows=c.execute("SELECT id FROM memories WHERE owner_id=? AND id IN (%s)" % marks,(owner,*control.target_memory_ids)).fetchall()
                     if len(rows) != len(set(control.target_memory_ids)):
                         c.rollback(); return MemoryGovernanceResult("not_found")
@@ -650,6 +702,7 @@ class SqlitePersonalDataRepository:
             try:
                 with self._connection() as c:
                     c.execute("BEGIN IMMEDIATE"); now=utc_now_iso()
+                    if stale(c):c.rollback();return MemoryGovernanceResult("rejected")
                     pending=c.execute("SELECT * FROM pending_memory_actions WHERE id=? AND owner_id=? AND session_key=?",(control.pending_action_id,owner,session_key)).fetchone()
                     if not pending:
                         c.rollback()
@@ -682,6 +735,69 @@ class SqlitePersonalDataRepository:
                 c.execute("DELETE FROM sessions WHERE id=?",(session_id,))
             c.commit()
         self._checkpoint(scrub=True)
+    def validate_purge_window(self,start_at,end_at):
+        _purge_window_bounds(start_at,end_at)
+    def list_owners(self):
+        with self._connection() as c:
+            rows=c.execute(
+                "SELECT owner_id FROM sessions "
+                "UNION SELECT owner_id FROM memories "
+                "UNION SELECT owner_id FROM owner_memory_settings "
+                "UNION SELECT owner_id FROM pending_memory_actions "
+                "UNION SELECT owner_id FROM memory_deletion_tombstones "
+                "ORDER BY 1"
+            ).fetchall()
+        return tuple(row["owner_id"] for row in rows)
+    def purge_owner_window(self,owner,start_at,end_at,*,before_purge=None):
+        start,end=_purge_window_bounds(start_at,end_at)
+
+        def in_window(value):
+            _validate_timestamp(value)
+            observed=datetime.fromisoformat(value.replace("Z","+00:00")).astimezone(timezone.utc)
+            return int(start <= observed < end)
+
+        try:
+            with self._connection() as c:
+                c.create_function("tomo_in_purge_window",1,in_window,deterministic=True)
+                c.execute("BEGIN IMMEDIATE")
+                if before_purge is not None:before_purge(self._export_owner_records(c,owner))
+                c.execute("CREATE TEMP TABLE purge_seed(id TEXT PRIMARY KEY)")
+                c.execute("INSERT INTO purge_seed SELECT m.id FROM messages m JOIN sessions s ON s.id=m.session_id WHERE s.owner_id=? AND tomo_in_purge_window(m.timestamp)=1",(owner,))
+                c.execute("CREATE TEMP TABLE purge_messages(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,connector_message_id TEXT,generation_id TEXT,burst_id TEXT)")
+                c.execute("WITH RECURSIVE closure(id) AS (SELECT id FROM purge_seed UNION SELECT related.id FROM closure x JOIN messages current ON current.id=x.id JOIN messages related ON related.session_id=current.session_id AND ((current.burst_id IS NOT NULL AND related.burst_id=current.burst_id) OR (current.generation_id IS NOT NULL AND related.generation_id=current.generation_id))) INSERT INTO purge_messages SELECT m.id,m.session_id,m.connector_message_id,m.generation_id,m.burst_id FROM messages m JOIN closure x ON x.id=m.id")
+                c.execute("CREATE TEMP TABLE purge_generations(session_id TEXT NOT NULL,id TEXT NOT NULL,PRIMARY KEY(session_id,id))")
+                c.execute("INSERT OR IGNORE INTO purge_generations SELECT session_id,generation_id FROM purge_messages WHERE generation_id IS NOT NULL")
+                c.execute("CREATE TEMP TABLE purge_sources(session_id TEXT NOT NULL,id TEXT NOT NULL,PRIMARY KEY(session_id,id))")
+                c.execute("INSERT OR IGNORE INTO purge_sources SELECT session_id,id FROM purge_messages")
+                c.execute("INSERT OR IGNORE INTO purge_sources SELECT session_id,connector_message_id FROM purge_messages WHERE connector_message_id IS NOT NULL")
+                c.execute("INSERT OR IGNORE INTO purge_sources SELECT session_id,id FROM purge_generations")
+                c.execute("CREATE TEMP TABLE purge_memories(id TEXT PRIMARY KEY,supersedes_id TEXT)")
+                c.execute("INSERT INTO purge_memories SELECT m.id,m.supersedes_id FROM memories m WHERE m.owner_id=? AND (tomo_in_purge_window(m.created_at)=1 OR EXISTS (SELECT 1 FROM purge_generations pg JOIN sessions ps ON ps.id=pg.session_id WHERE pg.id=m.source_generation_id AND ps.session_key=m.source_session_key) OR EXISTS (SELECT 1 FROM memory_sources ms JOIN purge_sources ps ON ps.id=ms.source_id JOIN sessions source_session ON source_session.id=ps.session_id WHERE ms.memory_id=m.id AND source_session.session_key=m.source_session_key))",(owner,))
+                c.execute("CREATE TEMP TABLE purge_sessions(id TEXT PRIMARY KEY)")
+                c.execute("INSERT OR IGNORE INTO purge_sessions SELECT session_id FROM purge_messages")
+                c.execute("INSERT OR IGNORE INTO purge_sessions SELECT s.id FROM sessions s JOIN memories m ON m.source_session_key=s.session_key JOIN purge_memories pm ON pm.id=m.id WHERE s.owner_id=?",(owner,))
+                c.execute("CREATE TEMP TABLE purge_predecessors(id TEXT PRIMARY KEY)")
+                c.execute("INSERT OR IGNORE INTO purge_predecessors SELECT supersedes_id FROM purge_memories WHERE supersedes_id IS NOT NULL AND supersedes_id NOT IN (SELECT id FROM purge_memories)")
+                c.execute("CREATE TEMP TABLE purge_pending(id TEXT PRIMARY KEY)")
+                c.execute("INSERT OR IGNORE INTO purge_pending SELECT id FROM pending_memory_actions WHERE owner_id=? AND tomo_in_purge_window(created_at)=1",(owner,))
+                affected_memories={row[0] for row in c.execute("SELECT id FROM purge_memories")}
+                for row in c.execute("SELECT id,target_ids_json FROM pending_memory_actions WHERE owner_id=?",(owner,)):
+                    try: targets=set(json.loads(row["target_ids_json"]))
+                    except (TypeError,ValueError): targets=set()
+                    if targets & affected_memories:c.execute("INSERT OR IGNORE INTO purge_pending VALUES(?)",(row["id"],))
+                counts={"messages":c.execute("SELECT count(*) FROM purge_messages").fetchone()[0],"memories":len(affected_memories),"pending_actions":c.execute("SELECT count(*) FROM purge_pending").fetchone()[0]}
+                c.execute("DELETE FROM pending_memory_actions WHERE id IN (SELECT id FROM purge_pending)")
+                c.execute("DELETE FROM accepted_generations WHERE EXISTS (SELECT 1 FROM purge_generations pg WHERE pg.session_id=accepted_generations.session_id AND pg.id=accepted_generations.generation_id)")
+                purge_fence=_id("purge-window",owner,start.isoformat(),end.isoformat())
+                c.execute("UPDATE sessions SET current_generation_id=?,current_revision=COALESCE(current_revision,0)+1 WHERE owner_id=? AND id IN (SELECT id FROM purge_sessions)",(purge_fence,owner))
+                c.execute("DELETE FROM messages WHERE id IN (SELECT id FROM purge_messages)")
+                c.execute("DELETE FROM memories WHERE id IN (SELECT id FROM purge_memories)")
+                now=utc_now_iso()
+                c.execute("UPDATE memories SET status=CASE WHEN surface_scope='archive' THEN 'archived' ELSE 'active' END,updated_at=? WHERE owner_id=? AND id IN (SELECT id FROM purge_predecessors) AND status!='disabled_by_user' AND NOT EXISTS (SELECT 1 FROM memories child WHERE child.supersedes_id=memories.id)",(now,owner))
+                c.commit()
+        except sqlite3.OperationalError as e: raise self._safe(e) from None
+        self._checkpoint(scrub=True)
+        return counts
     def delete_owner(self,owner):
         with self._connection() as c:
             c.execute("BEGIN IMMEDIATE"); c.execute("DELETE FROM sessions WHERE owner_id=?",(owner,)); c.execute("DELETE FROM memories WHERE owner_id=?",(owner,)); c.execute("DELETE FROM owner_memory_settings WHERE owner_id=?",(owner,)); c.execute("DELETE FROM pending_memory_actions WHERE owner_id=?",(owner,)); c.execute("DELETE FROM memory_deletion_tombstones WHERE owner_id=?",(owner,)); c.commit()
@@ -693,11 +809,11 @@ class SqlitePersonalDataRepository:
             c.execute("BEGIN IMMEDIATE")
             if owner_id is None:
                 c.execute("DELETE FROM messages_fts"); c.execute("DELETE FROM memories_fts")
-                c.execute("INSERT INTO messages_fts SELECT m.id,s.owner_id,m.content FROM messages m JOIN sessions s ON s.id=m.session_id")
+                c.execute("INSERT INTO messages_fts SELECT m.id,s.owner_id,m.content FROM messages m JOIN sessions s ON s.id=m.session_id WHERE COALESCE(json_extract(m.metadata_json,'$.peer_exchange'),0)!=1")
                 c.execute("INSERT INTO memories_fts SELECT id,owner_id,search_text FROM memories")
             else:
                 c.execute("DELETE FROM messages_fts WHERE owner_id=?",(owner_id,)); c.execute("DELETE FROM memories_fts WHERE owner_id=?",(owner_id,))
-                c.execute("INSERT INTO messages_fts SELECT m.id,s.owner_id,m.content FROM messages m JOIN sessions s ON s.id=m.session_id WHERE s.owner_id=?",(owner_id,))
+                c.execute("INSERT INTO messages_fts SELECT m.id,s.owner_id,m.content FROM messages m JOIN sessions s ON s.id=m.session_id WHERE s.owner_id=? AND COALESCE(json_extract(m.metadata_json,'$.peer_exchange'),0)!=1",(owner_id,))
                 c.execute("INSERT INTO memories_fts SELECT id,owner_id,search_text FROM memories WHERE owner_id=?",(owner_id,))
             c.commit()
 
@@ -714,19 +830,20 @@ class SqlitePersonalDataRepository:
             return count
 
     # Transfer methods intentionally use stable canonical rows, never sqlite dump syntax.
+    def _export_owner_records(self,c,owner):
+        records=[]
+        session_ids=[r[0] for r in c.execute("SELECT id FROM sessions WHERE owner_id=?",(owner,))]
+        for table, where, args in (("sessions","owner_id=?",(owner,)),("memories","owner_id=?",(owner,)),("owner_memory_settings","owner_id=?",(owner,)),("pending_memory_actions","owner_id=? AND expires_at>?",(owner,utc_now_iso())),("memory_deletion_tombstones","owner_id=?",(owner,))):
+            records += [{"table":table,"row":dict(r)} for r in c.execute(f"SELECT * FROM {table} WHERE {where}",args)]
+        if session_ids:
+            marks=",".join("?"*len(session_ids)); records += [{"table":"messages","row":dict(r)} for r in c.execute(f"SELECT * FROM messages WHERE session_id IN ({marks})",session_ids)]
+            records += [{"table":"accepted_generations","row":dict(r)} for r in c.execute(f"SELECT * FROM accepted_generations WHERE session_id IN ({marks})",session_ids)]
+        memory_ids=[r[0] for r in c.execute("SELECT id FROM memories WHERE owner_id=?",(owner,))]
+        if memory_ids:
+            marks=",".join("?"*len(memory_ids)); records += [{"table":"memory_sources","row":dict(r)} for r in c.execute(f"SELECT * FROM memory_sources WHERE memory_id IN ({marks})",memory_ids)]
+        return records
     def export_owner_records(self, owner):
-        with self._connection() as c:
-            records=[]
-            session_ids=[r[0] for r in c.execute("SELECT id FROM sessions WHERE owner_id=?",(owner,))]
-            for table, where, args in (("sessions","owner_id=?",(owner,)),("memories","owner_id=?",(owner,)),("owner_memory_settings","owner_id=?",(owner,)),("pending_memory_actions","owner_id=? AND expires_at>?",(owner,utc_now_iso())),("memory_deletion_tombstones","owner_id=?",(owner,))):
-                records += [{"table":table,"row":dict(r)} for r in c.execute(f"SELECT * FROM {table} WHERE {where}",args)]
-            if session_ids:
-                marks=",".join("?"*len(session_ids)); records += [{"table":"messages","row":dict(r)} for r in c.execute(f"SELECT * FROM messages WHERE session_id IN ({marks})",session_ids)]
-                records += [{"table":"accepted_generations","row":dict(r)} for r in c.execute(f"SELECT * FROM accepted_generations WHERE session_id IN ({marks})",session_ids)]
-            memory_ids=[r[0] for r in c.execute("SELECT id FROM memories WHERE owner_id=?",(owner,))]
-            if memory_ids:
-                marks=",".join("?"*len(memory_ids)); records += [{"table":"memory_sources","row":dict(r)} for r in c.execute(f"SELECT * FROM memory_sources WHERE memory_id IN ({marks})",memory_ids)]
-            return records
+        with self._connection() as c:return self._export_owner_records(c,owner)
     @_checkpoint_after_write
     def import_owner_records(self, owner, records):
         # SQLite validates references transactionally; materialize only at this
