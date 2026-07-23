@@ -50,24 +50,30 @@ def _is_peer_exchange_metadata(raw: str) -> bool:
     return isinstance(value, dict) and value.get("peer_exchange") is True
 
 
+def _parse_timestamp(value: str) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError("timestamp must be timezone-aware ISO-8601 or epoch seconds")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except ValueError as error:
+            raise ValueError("timestamp must be timezone-aware ISO-8601 or epoch seconds") from error
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("timestamp must be timezone-aware ISO-8601 or epoch seconds")
+    return parsed.astimezone(timezone.utc)
+
+
 def _validate_timestamp(value: str | None) -> None:
     if value is None:
         return
-    if not isinstance(value, str):
-        raise ValueError("timestamp must be timezone-aware ISO-8601")
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as error:
-        raise ValueError("timestamp must be timezone-aware ISO-8601") from error
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ValueError("timestamp must be timezone-aware ISO-8601")
+    _parse_timestamp(value)
 
 
 def _purge_window_bounds(start_at: str, end_at: str) -> tuple[datetime, datetime]:
-    _validate_timestamp(start_at)
-    _validate_timestamp(end_at)
-    start = datetime.fromisoformat(start_at.replace("Z", "+00:00")).astimezone(timezone.utc)
-    end = datetime.fromisoformat(end_at.replace("Z", "+00:00")).astimezone(timezone.utc)
+    start = _parse_timestamp(start_at)
+    end = _parse_timestamp(end_at)
     if start >= end:
         raise ValueError("purge window must end after it starts")
     return start, end
@@ -752,9 +758,8 @@ class SqlitePersonalDataRepository:
         start,end=_purge_window_bounds(start_at,end_at)
 
         def in_window(value):
-            _validate_timestamp(value)
-            observed=datetime.fromisoformat(value.replace("Z","+00:00")).astimezone(timezone.utc)
-            return int(start <= observed < end)
+                    observed=_parse_timestamp(value)
+                    return int(start <= observed < end)
 
         try:
             with self._connection() as c:

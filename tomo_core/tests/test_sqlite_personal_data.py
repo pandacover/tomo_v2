@@ -311,6 +311,21 @@ class SqlitePersonalDataTests(unittest.TestCase):
             self.assertEqual(retained.messages, [])
             self.assertEqual(retained.accepted_generation_ids, ())
 
+    def test_purge_owner_window_accepts_epoch_second_message_timestamps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repository = SqlitePersonalDataRepository(Path(tmp) / "tomo.sqlite3")
+            session = ConversationSession("telegram:actor:epoch")
+            # 2026-07-21 12:00:00 UTC and 2026-07-24 12:00:00 UTC as epoch seconds
+            session.append(StoredMessage("user", "inside epoch", "1784635200.0", {"burst_id": "e1", "update_id": 1}))
+            session.append(StoredMessage("user", "outside epoch", "1784894400.0", {"burst_id": "e2", "update_id": 2}))
+            repository.save_session("owner-a", session)
+
+            result = repository.purge_owner_window("owner-a", "2026-07-20T18:30:00+00:00", "2026-07-23T18:30:00+00:00")
+
+            self.assertEqual(result["messages"], 1)
+            retained = repository.load_session("owner-a", session.session_key)
+            self.assertEqual([message.content for message in retained.messages], ["outside epoch"])
+
     def test_list_owners_includes_every_personal_data_owner(self):
         with tempfile.TemporaryDirectory() as tmp:
             repository = SqlitePersonalDataRepository(Path(tmp) / "tomo.sqlite3")
