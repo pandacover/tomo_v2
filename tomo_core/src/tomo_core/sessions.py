@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass, field
-import json
 from typing import Literal
 
 from .models import AutomationTurn, InboundMessage, MessageAttachment, PeerTurn, utc_now_iso
@@ -121,14 +121,11 @@ class ConversationSession:
             metadata = {**message.metadata, "vision_observations": [value for _, value in grouped[message_id]]}
             self.messages[index] = StoredMessage(message.role, message.content, message.timestamp, metadata)
 
-    def model_history(self, limit: int = 20) -> list[dict[str, str]]:
-        return [
-            _model_message(message)
-            for message in self.messages
-            if not message.metadata.get("peer_exchange")
-        ][-limit:]
+    def model_history(self, limit: int = 40) -> list[dict[str, str]]:
+        eligible = [message for message in self.messages if not message.metadata.get("peer_exchange")]
+        return [_model_message(message) for message in _continuity_window(eligible, limit)]
 
-    def model_history_for_burst(self, burst_id: str, limit: int = 20) -> list[dict[str, str]]:
+    def model_history_for_burst(self, burst_id: str, limit: int = 40) -> list[dict[str, str]]:
         accepted = set(self.accepted_generation_ids)
         visible: list[StoredMessage] = []
         for message in self.messages:
@@ -140,7 +137,35 @@ class ConversationSession:
             if metadata.get("generation_status") == "provisional" and metadata.get("generation_id") not in accepted:
                 continue
             visible.append(message)
-        return [_model_message(message) for message in visible[-limit:]]
+        return [_model_message(message) for message in _continuity_window(visible, limit)]
+
+
+_IDENTITY_CONTINUITY = re.compile(
+    r"\b(?:my name is|call me|i go by)\b|"
+    r"\bi(?:'m| am)\s+[a-z0-9][a-z0-9_.-]{0,31}\b",
+    re.I,
+)
+
+
+def _continuity_window(messages: list[StoredMessage], limit: int) -> list[StoredMessage]:
+    if limit <= 0 or len(messages) <= limit:
+        return list(messages)
+    recent = messages[-limit:]
+    recent_ids = {id(message) for message in recent}
+    pin_budget = min(4, max(1, limit // 8))
+    pins: list[StoredMessage] = []
+    for message in messages:
+        if len(pins) >= pin_budget:
+            break
+        if id(message) in recent_ids or message.role != "user":
+            continue
+        if _IDENTITY_CONTINUITY.search(message.content or ""):
+            pins.append(message)
+    if not pins:
+        return recent
+    keep_recent = limit - len(pins)
+    selected = set(map(id, pins + recent[-keep_recent:]))
+    return [message for message in messages if id(message) in selected]
 
 
 def _attachment_metadata(attachment: MessageAttachment) -> dict:

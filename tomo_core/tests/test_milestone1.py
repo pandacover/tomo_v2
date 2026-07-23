@@ -203,6 +203,22 @@ class MilestoneOneTests(unittest.TestCase):
             self.assertNotIn("file_unique_id", reply_history["content"])
             self.assertIn({"role": "user", "content": "ordinary"}, history)
 
+    def test_model_history_pins_early_identity_statements_outside_recent_window(self):
+        session = ConversationSession("telegram:actor:u")
+        session.append(StoredMessage("user", "we don't, i am luv", metadata={"burst_id": "id", "update_id": 1}))
+        session.append(StoredMessage("assistant", "bet", metadata={"generation_id": "g0", "generation_status": "accepted"}))
+        for index in range(50):
+            session.append(StoredMessage("user", f"noise {index}", metadata={"burst_id": f"b{index}", "update_id": index + 2}))
+            session.append(StoredMessage("assistant", f"ack {index}", metadata={"generation_id": f"g{index}", "generation_status": "accepted"}))
+        session.append(StoredMessage("user", "who am i?", metadata={"burst_id": "ask", "update_id": 999}))
+
+        history = session.model_history(limit=20)
+        contents = [item["content"] for item in history]
+
+        self.assertIn("we don't, i am luv", contents)
+        self.assertIn("who am i?", contents)
+        self.assertEqual(len(history), 20)
+
 
 if __name__ == "__main__":
     unittest.main()
