@@ -19,6 +19,34 @@ from .parsing import ConversationOutputError
 from .prompts import build_first_segment_repair_messages, build_segment_messages, build_segment_repair_messages
 
 
+def should_repair_performative_output(user_text: str, frames: Sequence[Frame]) -> bool:
+    """Return True if a casual short input receives a bloated or performative multi-sentence response."""
+    cleaned_input = user_text.strip().lower()
+    if not cleaned_input:
+        return False
+    words_input = cleaned_input.split()
+    if len(words_input) > 8:
+        return False
+    info_keywords = {
+        "why", "how", "what", "where", "when", "who", "which",
+        "can", "could", "would", "is", "are", "will", "fix", "code", "bug",
+        "error", "server", "crash", "deploy", "build", "remember",
+        "saved", "delete", "forget", "help", "explain", "meaning",
+        "vocabulary", "normal", "speak", "talk", "tone",
+        "friend", "passed", "died", "away", "yesterday", "hurt", "sad", "sick",
+        "migration", "work", "definitely"
+    }
+    if any(word.strip("?,.!\"'") in info_keywords for word in words_input):
+        return False
+
+    full_output = " ".join(frame.text for frame in frames).strip()
+    words_output = full_output.split()
+    sentences = [s for s in full_output.replace("!", ".").replace("?", ".").split(".") if s.strip()]
+
+    return len(words_output) > 16 or len(sentences) > 1
+
+
+
 class ConversationEngine:
     def __init__(
         self,

@@ -32,6 +32,27 @@ from . import latency_trace
 _MAX_VISION_IMAGES_PER_TURN = 8
 
 
+def _is_low_stakes_casual_input(text: str) -> bool:
+    """Return True if text is a low-stakes casual burst that should bypass pre-turn memory hydration."""
+    cleaned = text.strip().lower()
+    if not cleaned:
+        return True
+    words = cleaned.split()
+    if len(words) > 8:
+        return False
+    info_keywords = {
+        "why", "how", "what", "where", "when", "who", "which",
+        "can", "could", "would", "is", "are", "will", "fix", "code", "bug",
+        "error", "server", "crash", "deploy", "build", "remember",
+        "saved", "delete", "forget", "help", "explain", "meaning",
+        "vocabulary", "normal", "speak", "talk", "tone",
+        "friend", "passed", "died", "away", "yesterday", "hurt", "sad", "sick",
+        "migration", "work", "definitely"
+    }
+    return not any(word.strip("?,.!\"'") in info_keywords for word in words)
+
+
+
 def _peer_frame_grounded(
     text: str, scope: str, candidates: list[dict[str, object]]
 ) -> bool:
@@ -444,7 +465,11 @@ class PersonalAgentRuntime:
         session = self.personal_data.load_session(self.owner_id, envelope.session_key)
         soul = load_soul(Path(self.config.soul_path))
         try:
-            memory_data = _memory_data_block(self.personal_data.memory_context(MemoryContextQuery(self.owner_id, envelope.text)), self.personal_data.pending_memory_actions(self.owner_id, envelope.session_key))
+            # Relevance gating: skip automatic memory context block for low-stakes casual inputs
+            if _is_low_stakes_casual_input(envelope.text):
+                memory_data = None
+            else:
+                memory_data = _memory_data_block(self.personal_data.memory_context(MemoryContextQuery(self.owner_id, envelope.text)), self.personal_data.pending_memory_actions(self.owner_id, envelope.session_key))
         except (StorageBusyError, StorageSearchError, StorageCapabilityError):
             memory_data = None
         return {"session": session, "soul": soul, "memory_data": memory_data}
