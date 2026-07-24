@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -13,6 +14,7 @@ from .models import AutomationTurn, InboundEnvelope, InputBurst, OutboundBubble,
 from .providers import ProviderAdapter
 from .reaction_service import ReactionDeliveryKey, ReactionService
 from .memory_governance import MemoryGovernanceService
+from .memory import ProactiveMemoryExtractor
 from .personal_data import (MemoryContextQuery, MemoryWriteControl,
                             PersonalDataRepository, StorageBusyError,
                             StorageCapabilityError, StorageSearchError)
@@ -132,10 +134,17 @@ class PersonalAgentRuntime:
         tool_registry: ToolRegistry | None = None,
         personal_data_repository: PersonalDataRepository | None = None,
         vision_interpreter: VisionInterpreter | None = None,
+        memory_extractor: ProactiveMemoryExtractor | None = None,
     ) -> None:
         self.config = config or RuntimeConfig()
         self.provider = provider
         self.vision_interpreter = vision_interpreter
+        if memory_extractor is not None:
+            self.memory_extractor: ProactiveMemoryExtractor | None = memory_extractor
+        elif os.getenv("TOMO_MEMORY_EXTRACTOR_ENABLED") == "1" or os.getenv("TOMO_MEMORY_EXTRACTOR_MODEL"):
+            self.memory_extractor = ProactiveMemoryExtractor(provider=provider, min_confidence=0.5)
+        else:
+            self.memory_extractor = None
         self.personal_data = personal_data_repository or SqlitePersonalDataRepository(
             Path(self.config.data_dir) / "tomo.sqlite3", local_work_dir=self.config.local_work_dir
         )
@@ -572,6 +581,32 @@ class PersonalAgentRuntime:
                 },
             )
         )
+        if self.memory_extractor and not isinstance(burst, (AutomationTurn, PeerTurn)) and not peer_exchange:
+            try:
+                settings = self.personal_data.memory_settings(self.owner_id)
+                if settings.capture_enabled:
+                    user_text = "\n".join(msg.envelope.text for msg in burst.messages) if hasattr(burst, "messages") else ""
+                    assistant_text = " ".join(part.strip() for part in logical_parts if part.strip())
+                    from .sqlite_personal_data import utc_now_iso
+                    extracted = self.memory_extractor.extract_memories(
+                        user_text, assistant_text, burst.generation_id, utc_now_iso()
+                    )
+                    for control in extracted:
+                        if _safe_memory_control(control, burst, session):
+                            try:
+                                self.personal_data.stage_memory_controls(
+                                    self.owner_id,
+                                    burst.latest.session_key,
+                                    burst.generation_id,
+                                    0,
+                                    settings.governance_revision,
+                                    (control,),
+                                    revision=burst.revision,
+                                )
+                            except Exception:
+                                pass
+            except Exception:
+                pass
         checkpoint_started_at = time.monotonic()
         saved = self.personal_data.save_session(self.owner_id, session, generation_id=burst.generation_id, revision=burst.revision, is_active=is_active)
         if is_active():
