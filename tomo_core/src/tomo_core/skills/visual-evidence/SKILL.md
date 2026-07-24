@@ -1,6 +1,6 @@
 ---
 name: visual-evidence
-description: use when current or persisted image evidence is relevant to the user's question
+description: Synthesize current or persisted image evidence (photos, screenshots, visual documents) to answer the user's question.
 ---
 
 # Visual Evidence

@@ -1,6 +1,6 @@
 ---
 name: memory
-description: memory: use for recalling prior context, deciding whether to retain information, explaining memory behavior, or handling inspection, correction, disabling, forgetting, and deletion requests.
+description: Personal memory management for recalling context, deciding retention, explaining memory behavior, or handling inspection, correction, disabling, forgetting, and deletion requests.
 ---
 
 # Memory

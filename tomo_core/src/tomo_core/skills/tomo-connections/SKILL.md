@@ -1,6 +1,6 @@
 ---
 name: tomo-connections
-description: Runtime contract for asking a connected Tomo.
+description: Ask, message, or check availability of a connected Tomo peer.
 ---
 
 Use this skill when the owner naturally asks to ask, check with, or message a connected Tomo.

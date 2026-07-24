@@ -1,6 +1,6 @@
 ---
 name: cron-jobs
-description: cron-jobs: use for creating, inspecting, changing, running, pausing, resuming, deleting, or explaining owner-scoped scheduled Tomo work.
+description: Scheduled Tomo work and cron job lifecycle (create, inspect, update, run, pause, resume, delete, or explain owner schedules).
 ---
 
 # Cron Jobs
