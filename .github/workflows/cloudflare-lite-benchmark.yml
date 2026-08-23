@@ -1,0 +1,161 @@
+name: Cloudflare lite benchmark
+
+on:
+  push:
+    branches:
+      - benchmark/cloudflare-lite
+    paths:
+      - ".github/workflows/cloudflare-lite-benchmark.yml"
+      - "tomo_core/Dockerfile.cloudflare-benchmark"
+      - "tomo_core/cloudflare-benchmark/**"
+      - "tomo_core/pyproject.toml"
+      - "tomo_core/uv.lock"
+      - "tomo_core/tomo/**"
+  workflow_dispatch:
+    inputs:
+      extended_wait:
+        description: Also run the 720-second provider-wait scenario
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloudflare-lite-benchmark
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+        working-directory: tomo_core/cloudflare-benchmark
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Worker dependencies
+        run: npm ci
+
+      - name: Validate Worker
+        run: |
+          npm run types
+          npm run typecheck
+
+      - name: Create temporary benchmark token
+        run: |
+          token="$(openssl rand -hex 32)"
+          echo "::add-mask::$token"
+          echo "TOMO_BENCHMARK_TOKEN=$token" >> "$GITHUB_ENV"
+
+      - name: Deploy temporary benchmark Worker
+        id: deploy
+        run: |
+          secrets_file="$RUNNER_TEMP/tomo-benchmark-secrets.json"
+          jq -n --arg token "$TOMO_BENCHMARK_TOKEN" \
+            '{BENCHMARK_TOKEN: $token}' > "$secrets_file"
+
+          npx wrangler deploy --secrets-file "$secrets_file" 2>&1 | tee deploy.log
+          worker_url="$(grep -Eo 'https://[^[:space:]]+\.workers\.dev' deploy.log | tail -n 1)"
+          if [[ -z "$worker_url" ]]; then
+            echo "Could not find the workers.dev URL in Wrangler output." >&2
+            exit 1
+          fi
+          echo "WORKER_URL=$worker_url" >> "$GITHUB_ENV"
+
+      - name: Run benchmark scenarios
+        run: |
+          mkdir -p results
+
+          run_scenario() {
+            local name="$1"
+            local body="$2"
+            local output="results/${name}.json"
+            local status
+            local curl_exit
+
+            set +e
+            status="$(curl --silent --show-error \
+              --connect-timeout 30 \
+              --max-time 1000 \
+              --output "$output" \
+              --write-out '%{http_code}' \
+              --request POST \
+              --header "authorization: Bearer $TOMO_BENCHMARK_TOKEN" \
+              --header "content-type: application/json" \
+              --data "$body" \
+              "$WORKER_URL/run")"
+            curl_exit=$?
+            set -e
+
+            if [[ ! "$status" =~ ^[0-9]{3}$ ]]; then
+              status=0
+            fi
+            if ! jq -e . "$output" >/dev/null 2>&1; then
+              jq -n --arg message "curl failed with exit code $curl_exit" \
+                '{error: $message}' > "$output"
+            fi
+
+            jq -n \
+              --arg scenario "$name" \
+              --arg httpStatus "$status" \
+              --argjson curlExit "$curl_exit" \
+              --argjson response "$(cat "$output")" \
+              '{scenario: $scenario, httpStatus: ($httpStatus | tonumber), curlExit: $curlExit, response: $response}' \
+              > "results/${name}.record.json"
+          }
+
+          run_scenario text '{"scenario":"text","owners":3,"delaySeconds":0.05}'
+          run_scenario image '{"scenario":"image","owners":3,"delaySeconds":0.05}'
+          run_scenario image-max '{"scenario":"image-max","owners":3,"delaySeconds":0.05}'
+          run_scenario wait-120 '{"scenario":"wait","owners":3,"delaySeconds":120}'
+          run_scenario sleep-cycle '{"scenario":"text","owners":3,"delaySeconds":0.05,"sleepCycle":true}'
+
+          if [[ "${{ inputs.extended_wait || 'false' }}" == "true" ]]; then
+            run_scenario wait-720 '{"scenario":"wait","owners":3,"delaySeconds":720}'
+          fi
+
+      - name: Build benchmark summary
+        if: always() && steps.deploy.outcome == 'success'
+        run: |
+          {
+            echo "# Cloudflare lite benchmark"
+            echo
+            echo "| Scenario | HTTP | Owners | Peak MiB | Result |"
+            echo "|---|---:|---:|---:|---|"
+            shopt -s nullglob
+            records=(results/*.record.json)
+            for record in "${records[@]}"; do
+              jq -r '
+                . as $record
+                | ($record.response.owners // []) as $owners
+                | ([ $owners[].runs[].command.success ] | all) as $commands_ok
+                | ([ $owners[].runs[].benchmark.cgroupMemory.peakBytes // empty ] | max // 0) as $peak
+                | "| \($record.scenario) | \($record.httpStatus) | \($owners | length) | \(($peak / 1048576 * 10 | round) / 10) | \(if $record.httpStatus == 200 and ($owners | length) == 3 and $commands_ok then "completed" else "inspect result" end) |"
+              ' "$record"
+            done
+          } | tee results/summary.md
+          cat results/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudflare-lite-benchmark-${{ github.run_id }}
+          path: |
+            tomo_core/cloudflare-benchmark/results/
+            tomo_core/cloudflare-benchmark/deploy.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Delete temporary benchmark Worker
+        if: always()
+        run: npx wrangler delete tomo-cloudflare-lite-benchmark --force || true
