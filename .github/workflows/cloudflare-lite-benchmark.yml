@@ -122,7 +122,12 @@ jobs:
               if [[ ! "$status" =~ ^[0-9]{3}$ ]]; then
                 status=0
               fi
-              if jq -e '.runId' "$output" >/dev/null 2>&1; then
+              # Retry until the Worker answers with a full result (HTTP 200 +
+              # runId). Non-200s cover both platform blips and transient
+              # Worker<->container drops like "Network connection lost."
+              # Real benchmark outcomes arrive inside 200 responses and are
+              # never retried.
+              if [[ "$status" == "200" ]] && jq -e '.runId' "$output" >/dev/null 2>&1; then
                 break
               fi
               echo "[$name] attempt $attempt: no Worker response (HTTP $status, curl $curl_exit); retrying in 10s..."
