@@ -232,4 +232,13 @@ jobs:
 
       - name: Delete temporary benchmark Worker
         if: always()
-        run: npx wrangler delete tomo-cloudflare-lite-benchmark --force || true
+        run: |
+          npx wrangler delete tomo-cloudflare-lite-benchmark --force || true
+          # A successful deploy leaves its container application behind under a
+          # fresh durable-object namespace, which blocks the next deploy of the
+          # same container name. Remove it too.
+          app_id="$(npx wrangler containers list 2>/dev/null \
+            | awk -F'│' '/tomo-cloudflare-lite-benchmark-sandbox/ {gsub(/ /, "", $2); print $2; exit}')"
+          if [[ -n "$app_id" ]]; then
+            npx wrangler containers delete "$app_id" || true
+          fi
