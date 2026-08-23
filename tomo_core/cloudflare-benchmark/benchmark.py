@@ -235,6 +235,8 @@ def run() -> dict[str, object]:
             soul_path=str(soul_path),
             owner_id=owner_id,
             local_work_dir=str(data_dir / "work"),
+            # The fake provider deliberately sleeps; keep the turn ceiling above it.
+            max_turn_seconds=delay_seconds + 60,
         )
         exit_code = run_once(
             io.StringIO(encode_inbound("benchmark-request", burst)),

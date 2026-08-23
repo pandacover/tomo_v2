@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from math import isfinite
 from typing import Any, Literal
 
 Connector = Literal["telegram"]
@@ -332,6 +333,7 @@ class RuntimeConfig:
     soul_path: str = "SOUL.md"
     owner_id: str | None = "local"
     local_work_dir: str | None = None
+    max_turn_seconds: float | None = None
 
     def __post_init__(self) -> None:
         self.response_contract
@@ -339,6 +341,8 @@ class RuntimeConfig:
             raise ValueError("max_frames_per_segment must be at least 1")
         if not isinstance(self.max_chars_per_frame, int) or isinstance(self.max_chars_per_frame, bool) or not 1 <= self.max_chars_per_frame <= 4096:
             raise ValueError("max_chars_per_frame must be between 1 and 4096")
+        if self.max_turn_seconds is not None and (not isinstance(self.max_turn_seconds, (int, float)) or isinstance(self.max_turn_seconds, bool) or not isfinite(self.max_turn_seconds) or self.max_turn_seconds <= 0):
+            raise ValueError("max_turn_seconds must be a positive finite number when supplied")
         if self.owner_id is not None and (not isinstance(self.owner_id, str) or not self.owner_id.strip()):
             raise ValueError("owner_id must be a non-empty string when supplied")
 
@@ -354,10 +358,10 @@ class RuntimeConfig:
     def ordinary_turn_budget(self):
         from .conversation.models import TurnBudget
 
-        return TurnBudget(1, 0, 0, 1, self.max_frames_per_segment, self.max_sentences_per_bubble, self.max_chars_per_frame)
+        return TurnBudget(1, 0, 0, 1, self.max_frames_per_segment, self.max_sentences_per_bubble, self.max_chars_per_frame, max_elapsed_seconds=self.max_turn_seconds if self.max_turn_seconds is not None else 120.0)
 
     @property
     def tool_turn_budget(self):
         from .conversation.models import TurnBudget
 
-        return TurnBudget(6, 5, 5, 3, self.max_frames_per_segment, self.max_sentences_per_bubble, self.max_chars_per_frame)
+        return TurnBudget(6, 5, 5, 3, self.max_frames_per_segment, self.max_sentences_per_bubble, self.max_chars_per_frame, max_elapsed_seconds=self.max_turn_seconds if self.max_turn_seconds is not None else 120.0)
