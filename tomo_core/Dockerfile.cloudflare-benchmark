@@ -2,6 +2,10 @@ FROM python:3.11.11-slim-bookworm
 
 COPY --from=docker.io/cloudflare/sandbox:0.12.7 /container-server/sandbox /sandbox
 
+# The sandbox container server runs commands with cwd=/workspace; without this
+# directory every spawn fails with a misleading ENOENT on the shell binary.
+RUN mkdir -p /workspace
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PATH="/opt/tomo/.venv/bin:$PATH"
