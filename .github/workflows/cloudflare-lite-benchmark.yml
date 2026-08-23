@@ -145,6 +145,62 @@ jobs:
           } | tee results/summary.md
           cat results/summary.md >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Validate benchmark results
+        if: always() && steps.deploy.outcome == 'success'
+        run: |
+          set -e
+          expected=(text image image-max wait-120 sleep-cycle)
+
+          fail() {
+            echo "::error::$1"
+            echo "FAIL: $1" >> results/validation.txt
+          }
+
+          : > results/validation.txt
+          ok=true
+
+          for name in "${expected[@]}"; do
+            record="results/${name}.record.json"
+            if [[ ! -f "$record" ]]; then
+              fail "missing result record: $name"
+              ok=false
+              continue
+            fi
+
+            problems="$(
+              jq -r '
+                def all_runs: [.response.owners[]?.runs[]?];
+                def problems:
+                  [
+                    (if .httpStatus != 200 then ["HTTP status \(.httpStatus) (curl exit \(.curlExit))"] else [] end),
+                    (if (.response.owners // []) | length != 3
+                      then ["expected 3 owners, got \((.response.owners // []) | length)"]
+                      else [] end),
+                    (([.response.owners[]?.runs[]?] | map(select(.command.success != true)) | length) as $bad
+                      | if $bad > 0 then ["\($bad) owner command(s) failed"] else [] end),
+                    (all_runs as $runs
+                      | if ($runs | length) > ($runs | map(select(.benchmark.passed == true)) | length)
+                        then ["some benchmark result(s) did not report passed=true"]
+                        else [] end)
+                  ] | flatten;
+                {problems: problems} | .problems[]
+              ' "$record"
+            )"
+
+            if [[ -n "$problems" ]]; then
+              while IFS= read -r problem; do
+                fail "$name: $problem"
+              done <<< "$problems"
+              ok=false
+            fi
+          done
+
+          if [[ "$ok" != true ]]; then
+            cat results/validation.txt >&2
+            exit 1
+          fi
+          echo "All benchmark scenarios passed validation."
+
       - name: Upload benchmark evidence
         if: always()
         uses: actions/upload-artifact@v4
