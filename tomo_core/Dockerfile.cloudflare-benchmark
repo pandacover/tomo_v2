@@ -1,0 +1,23 @@
+FROM python:3.11.11-slim-bookworm
+
+COPY --from=docker.io/cloudflare/sandbox:0.12.7 /container-server/sandbox /sandbox
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/opt/tomo/.venv/bin:$PATH"
+
+WORKDIR /opt/tomo
+
+COPY pyproject.toml uv.lock ./
+COPY src ./src
+COPY SOUL.md ./SOUL.md
+
+RUN pip install --no-cache-dir "uv==0.6.14" \
+    && uv sync --frozen --no-dev \
+    && tomo-core --help \
+    && /opt/tomo/.venv/bin/python -c "from PIL import Image; image=Image.new('RGB',(2560,1920),(72,110,160)); image.save('/opt/tomo/benchmark-image.jpg',format='JPEG',quality=90); image.close(); image=Image.new('RGB',(5000,4000),(72,110,160)); image.save('/opt/tomo/benchmark-image-max.jpg',format='JPEG',quality=90); image.close()"
+
+COPY cloudflare-benchmark/benchmark.py ./benchmark.py
+
+EXPOSE 8080
+ENTRYPOINT ["/sandbox"]
