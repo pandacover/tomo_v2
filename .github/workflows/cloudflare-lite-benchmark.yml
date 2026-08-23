@@ -71,6 +71,24 @@ jobs:
           fi
           echo "WORKER_URL=$worker_url" >> "$GITHUB_ENV"
 
+      - name: Wait for Worker readiness
+        run: |
+          set -e
+          for attempt in $(seq 1 30); do
+            code="$(curl --silent --output /dev/null \
+              --write-out '%{http_code}' \
+              --connect-timeout 10 \
+              "$WORKER_URL/health")" || code=0
+            if [[ "$code" == "200" ]]; then
+              echo "Worker is ready (attempt $attempt)."
+              exit 0
+            fi
+            echo "Attempt $attempt: /health returned $code; retrying in 10s..."
+            sleep 10
+          done
+          echo "::error::Worker /health did not return 200 within 5 minutes."
+          exit 1
+
       - name: Run benchmark scenarios
         run: |
           mkdir -p results
