@@ -93,30 +93,43 @@ jobs:
         run: |
           mkdir -p results
 
+          # Platform-level failures (route not yet serving, connection drops)
+          # are retried; a parseable response containing runId means the Worker
+          # itself answered, so its status stands without retries.
           run_scenario() {
             local name="$1"
             local body="$2"
             local output="results/${name}.json"
             local status
             local curl_exit
+            local attempt=1
 
-            set +e
-            status="$(curl --silent --show-error \
-              --connect-timeout 30 \
-              --max-time 1000 \
-              --output "$output" \
-              --write-out '%{http_code}' \
-              --request POST \
-              --header "authorization: Bearer $TOMO_BENCHMARK_TOKEN" \
-              --header "content-type: application/json" \
-              --data "$body" \
-              "$WORKER_URL/run")"
-            curl_exit=$?
-            set -e
+            while [[ $attempt -le 3 ]]; do
+              set +e
+              status="$(curl --silent --show-error \
+                --connect-timeout 30 \
+                --max-time 1000 \
+                --output "$output" \
+                --write-out '%{http_code}' \
+                --request POST \
+                --header "authorization: Bearer $TOMO_BENCHMARK_TOKEN" \
+                --header "content-type: application/json" \
+                --data "$body" \
+                "$WORKER_URL/run")"
+              curl_exit=$?
+              set -e
 
-            if [[ ! "$status" =~ ^[0-9]{3}$ ]]; then
-              status=0
-            fi
+              if [[ ! "$status" =~ ^[0-9]{3}$ ]]; then
+                status=0
+              fi
+              if jq -e '.runId' "$output" >/dev/null 2>&1; then
+                break
+              fi
+              echo "[$name] attempt $attempt: no Worker response (HTTP $status, curl $curl_exit); retrying in 10s..."
+              attempt=$((attempt + 1))
+              sleep 10
+            done
+
             if ! jq -e . "$output" >/dev/null 2>&1; then
               jq -n --arg message "curl failed with exit code $curl_exit" \
                 '{error: $message}' > "$output"
@@ -125,9 +138,10 @@ jobs:
             jq -n \
               --arg scenario "$name" \
               --arg httpStatus "$status" \
+              --argjson attempts "$attempt" \
               --argjson curlExit "$curl_exit" \
               --argjson response "$(cat "$output")" \
-              '{scenario: $scenario, httpStatus: ($httpStatus | tonumber), curlExit: $curlExit, response: $response}' \
+              '{scenario: $scenario, httpStatus: ($httpStatus | tonumber), attempts: $attempts, curlExit: $curlExit, response: $response}' \
               > "results/${name}.record.json"
           }
 
