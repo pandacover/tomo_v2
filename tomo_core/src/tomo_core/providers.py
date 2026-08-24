@@ -154,16 +154,10 @@ def _stream_openai_compatible(
             if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
                 raise ValueError("invalid stream usage")
         if prompt is not None:
-            if input_tokens is not None and input_tokens != prompt:
-                raise ValueError("conflicting stream usage")
             input_tokens = prompt
         if completion is not None:
-            if output_tokens is not None and output_tokens != completion:
-                raise ValueError("conflicting stream usage")
             output_tokens = completion
         if reasoning is not None:
-            if reasoning_tokens is not None and reasoning_tokens != reasoning:
-                raise ValueError("conflicting stream usage")
             reasoning_tokens = reasoning
 
     def consume_data(data: str) -> Iterator[ProviderTextDelta]:
@@ -195,23 +189,19 @@ def _stream_openai_compatible(
             raise ValueError("invalid stream choices")
         choice = choices[0]
         current_finish = choice.get("finish_reason")
-        if current_finish is not None:
-            if not isinstance(current_finish, str) or not current_finish.strip():
-                raise ValueError("invalid stream finish reason")
-            if finish_reason is not None:
-                raise ValueError("duplicate stream finish reason")
-            finish_reason = current_finish
-        elif finish_reason is not None:
-            raise ValueError("data after stream finish")
-        delta = choice.get("delta", {})
+        if isinstance(current_finish, str) and current_finish.strip():
+            if finish_reason is None:
+                finish_reason = current_finish
+        elif current_finish not in (None, "", "null"):
+            raise ValueError("invalid stream finish reason")
+        delta = choice.get("delta") or {}
         if not isinstance(delta, dict):
             raise ValueError("invalid stream delta")
         content = delta.get("content")
-        if content is not None:
-            if not isinstance(content, str):
-                raise ValueError("invalid stream content")
-            if content:
-                yield ProviderTextDelta(content)
+        if isinstance(content, str) and content:
+            yield ProviderTextDelta(content)
+        elif content not in (None, ""):
+            raise ValueError("invalid stream content")
         native_calls = delta.get("tool_calls")
         if native_calls is not None:
             if not isinstance(native_calls, list):
@@ -276,10 +266,12 @@ def _stream_openai_compatible(
                 raw_event, buffer = buffer.split(separator, 1)
                 yield from consume_sse_event(raw_event)
         buffer += decoder.decode(b"", final=True)
-        if buffer:
-            raise ValueError("incomplete SSE event")
+        if buffer.strip():
+            yield from consume_sse_event(buffer)
 
-    if not saw_done or finish_reason is None:
+    if finish_reason is None and saw_done:
+        finish_reason = "stop"
+    if finish_reason is None:
         raise ValueError("stream ended without terminal completion")
     if tool_calls and finish_reason != "tool_calls":
         raise ValueError("tool calls without tool finish")

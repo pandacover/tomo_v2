@@ -26,6 +26,11 @@ def _provider_failure_code(error: BaseException) -> str:
         return "provider_timeout"
     if isinstance(error, httpx.ConnectError):
         return "provider_connect"
+    if isinstance(error, ValueError):
+        message = str(error).split(":")[-1].strip().lower()
+        slug = "".join(character if character.isalnum() else "_" for character in message).strip("_")[:48]
+        if slug:
+            return f"provider_{slug}"
     name = type(error).__name__.lower()
     slug = "".join(character if character.isalnum() else "_" for character in name).strip("_")[:40]
     return f"provider_{slug}" if slug else "provider_stream_failure"

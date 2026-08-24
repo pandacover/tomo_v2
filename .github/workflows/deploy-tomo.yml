@@ -1,5 +1,5 @@
 name: Deploy Tomo
-# Redeploy: basic instance, no HTTPS intercept, retry sandbox 500.
+# Redeploy: tolerate OpenRouter SSE; slug ValueError text.
 
 on:
   workflow_dispatch:

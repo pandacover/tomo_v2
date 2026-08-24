@@ -194,11 +194,11 @@ class ProviderStreamingTests(unittest.TestCase):
             ],
         )
 
-    def test_stream_fails_closed_without_a_done_sentinel(self):
+    def test_stream_accepts_finish_without_a_done_sentinel(self):
         event = json.dumps({"choices": [{"delta": {"content": "hi"}, "finish_reason": "stop"}]})
         with patch("tomo_core.providers.httpx.stream", return_value=FakeStreamResponse(sse_chunks(event))):
-            with self.assertRaises(ValueError):
-                list(XaiApiProvider(api_key="test-key").stream([{"role": "user", "content": "hi"}]))
+            events = list(XaiApiProvider(api_key="test-key").stream([{"role": "user", "content": "hi"}]))
+        self.assertEqual(events, [ProviderTextDelta("hi"), ProviderStreamCompleted("stop")])
 
     def test_stream_fails_closed_on_malformed_payload_http_error_and_incomplete_tool_call(self):
         cases = [
@@ -228,20 +228,24 @@ class ProviderStreamingTests(unittest.TestCase):
         for chunks in (
             sse_chunks(conflicting_id, conflicting_id_next, "[DONE]"),
             sse_chunks(invalid_usage, "[DONE]"),
-            sse_chunks(no_finish, "[DONE]"),
         ):
             with self.subTest(chunks=chunks), patch("tomo_core.providers.httpx.stream", return_value=FakeStreamResponse(chunks)):
                 with self.assertRaises(ValueError):
                     list(XaiApiProvider(api_key="test-key").stream([{"role": "user", "content": "hi"}]))
+        with patch("tomo_core.providers.httpx.stream", return_value=FakeStreamResponse(sse_chunks(no_finish, "[DONE]"))):
+            events = list(XaiApiProvider(api_key="test-key").stream([{"role": "user", "content": "hi"}]))
+        self.assertEqual(events, [ProviderTextDelta("hi"), ProviderStreamCompleted("stop")])
 
-    def test_stream_rejects_invalid_or_conflicting_reasoning_usage(self):
+    def test_stream_keeps_last_reasoning_usage_and_rejects_invalid_usage(self):
         invalid = json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}], "usage": {"completion_tokens_details": {"reasoning_tokens": -1}}})
         first = json.dumps({"choices": [{"delta": {}, "finish_reason": None}], "usage": {"completion_tokens_details": {"reasoning_tokens": 2}}})
-        conflicting = json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}], "usage": {"completion_tokens_details": {"reasoning_tokens": 3}}})
-        for chunks in (sse_chunks(invalid, "[DONE]"), sse_chunks(first, conflicting, "[DONE]")):
-            with self.subTest(chunks=chunks), patch("tomo_core.providers.httpx.stream", return_value=FakeStreamResponse(chunks)):
-                with self.assertRaises(ValueError):
-                    list(XaiApiProvider(api_key="test-key").stream([{"role": "user", "content": "hi"}]))
+        later = json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}], "usage": {"completion_tokens_details": {"reasoning_tokens": 3}}})
+        with patch("tomo_core.providers.httpx.stream", return_value=FakeStreamResponse(sse_chunks(invalid, "[DONE]"))):
+            with self.assertRaises(ValueError):
+                list(XaiApiProvider(api_key="test-key").stream([{"role": "user", "content": "hi"}]))
+        with patch("tomo_core.providers.httpx.stream", return_value=FakeStreamResponse(sse_chunks(first, later, "[DONE]"))):
+            events = list(XaiApiProvider(api_key="test-key").stream([{"role": "user", "content": "hi"}]))
+        self.assertEqual(events, [ProviderStreamCompleted("stop", reasoning_tokens=3)])
 
     def test_completed_rejects_invalid_reasoning_tokens(self):
         with self.assertRaises(ValueError):
