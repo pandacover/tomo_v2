@@ -1,5 +1,5 @@
 name: Deploy Tomo
-# Redeploy: non-streaming sandbox.exec, retry container start.
+# Redeploy: 240s guest timeout, health probe, no destroy-on-supersede.
 
 on:
   workflow_dispatch:
