@@ -38,6 +38,13 @@ test("parses frame and error events and ignores latency", () => {
   );
   assert.equal(error?.type, "error");
   if (error?.type === "error") assert.equal(error.code, "provider_budget");
+  const unbound = parseEventLine(
+    'TOMO_SANDBOX_EVENT={"version":5,"request_id":"unknown","generation_id":"unknown","sequence":0,"type":"error","error":{"code":"missing_access_token"}}',
+    "r1",
+    "g1",
+  );
+  assert.equal(unbound?.type, "error");
+  if (unbound?.type === "error") assert.equal(unbound.code, "missing_access_token");
   assert.equal(parseEventLine("TOMO_SANDBOX_LATENCY_V1=phase=sandbox_runtime_entry outcome=ok elapsed_ms=0", "r1", "g1"), null);
 });
 

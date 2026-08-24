@@ -119,6 +119,10 @@ export class OwnerDO extends DurableObject<Env> {
 
   async alarm(): Promise<void> {
     await this.ready;
+    this.ctx.waitUntil(this.handleAlarm());
+  }
+
+  private async handleAlarm(): Promise<void> {
     if (this.running) {
       await this.scheduleWake();
       return;
@@ -131,6 +135,12 @@ export class OwnerDO extends DurableObject<Env> {
       "SELECT * FROM chat_turn WHERE burst_id IS NOT NULL AND active_generation_id IS NULL AND quiet_until IS NOT NULL AND quiet_until <= ?",
       Date.now(),
     );
+    logOps({
+      event: "owner_alarm",
+      tomo_id: this.tomoId(),
+      cron: dueCron ? 1 : 0,
+      turn: turn ? 1 : 0,
+    });
     try {
       if (dueCron) await this.runCron(dueCron);
       else if (turn) await this.runInteractive(String(turn.chat_id));
@@ -345,6 +355,7 @@ export class OwnerDO extends DurableObject<Env> {
     const abort = new AbortController();
     this.abort = abort;
     const telegram = new TelegramApi(this.env.TELEGRAM_BOT_TOKEN);
+    const typing = this.keepTyping(chatId, abort.signal, telegram);
     const sandbox = getSandbox(this.env.Sandbox, this.tomoId(), {
       enableDefaultSession: false,
       normalizeId: true,
@@ -355,6 +366,7 @@ export class OwnerDO extends DurableObject<Env> {
     const frameState = { first: true };
     let outputChain = Promise.resolve();
     try {
+      logOps({ event: "exec_start", tomo_id: this.tomoId(), generation_id: generationId });
       await this.hydrate(sandbox);
       const env = await this.guestEnv(generationId, chatId, actorId, extraEnv, options);
       const timeout = 120_000 + Math.min(options.images.length, 8) * 75_000;
@@ -386,7 +398,15 @@ export class OwnerDO extends DurableObject<Env> {
       }
     } catch (error) {
       errorClass = error instanceof Error ? error.name : "Error";
+      logOps({
+        event: "exec_failed",
+        tomo_id: this.tomoId(),
+        generation_id: generationId,
+        error_class: errorClass,
+      });
     } finally {
+      abort.abort();
+      await typing.catch(() => undefined);
       try {
         await sandbox.destroy();
       } catch {
@@ -394,6 +414,13 @@ export class OwnerDO extends DurableObject<Env> {
       }
       this.running = false;
       this.abort = null;
+      const delivered = this.one(
+        "SELECT 1 AS ok FROM deliveries WHERE generation_id = ? AND status = 'sent'",
+        generationId,
+      );
+      if (this.generationActive(generationId) && errorClass && errorClass !== "provider_budget" && !delivered) {
+        await telegram.sendMessage(chatId, "I couldn't finish that turn. Try again.");
+      }
       const status = this.generationActive(generationId) ? (errorClass ? "failed" : "completed") : "superseded";
       if (this.generationActive(generationId)) this.finishGeneration(generationId, chatId, status, errorClass);
       logOps({
@@ -483,6 +510,27 @@ export class OwnerDO extends DurableObject<Env> {
       }
     }
     return { firstFrame, errorClass };
+  }
+
+  private async keepTyping(chatId: string, signal: AbortSignal, telegram: TelegramApi): Promise<void> {
+    while (!signal.aborted) {
+      await telegram.sendTyping(chatId);
+      await new Promise<void>((resolve) => {
+        if (signal.aborted) {
+          resolve();
+          return;
+        }
+        const timer = setTimeout(resolve, 4000);
+        signal.addEventListener(
+          "abort",
+          () => {
+            clearTimeout(timer);
+            resolve();
+          },
+          { once: true },
+        );
+      });
+    }
   }
 
   private async guestEnv(

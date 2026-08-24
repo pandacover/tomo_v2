@@ -28,6 +28,7 @@ jobs:
             -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
             -H "Content-Type: application/json" \
             --data "$(jq -n --argjson from "$from" --argjson to "$to" '{
+              queryId: "tomo-debug",
               timeframe: {from: $from, to: $to},
               view: "events",
               datasets: ["cloudflare-workers"],

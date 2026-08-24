@@ -1,4 +1,5 @@
 name: Deploy Tomo
+# Redeploy after silent first DM: keep typing + failure line.
 
 on:
   workflow_dispatch:

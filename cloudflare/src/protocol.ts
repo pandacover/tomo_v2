@@ -77,10 +77,14 @@ export function parseEventLine(line: string, requestId: string, generationId: st
   const position = line.indexOf(EVENT_MARKER);
   if (position < 0) return null;
   const message = JSON.parse(line.slice(position + EVENT_MARKER.length)) as Record<string, unknown>;
+  const sequence = message.sequence;
   if (message.request_id !== requestId || message.generation_id !== generationId) {
+    if (message.type === "error") {
+      const error = message.error as { code?: string } | undefined;
+      return { type: "error", sequence: typeof sequence === "number" ? sequence : 0, code: error?.code || "runtime_failed" };
+    }
     throw new Error("sandbox event binding mismatch");
   }
-  const sequence = message.sequence;
   if (typeof sequence !== "number") throw new Error("sandbox event sequence missing");
   if (message.type === "frame" && typeof message.text === "string") {
     return { type: "frame", sequence, text: message.text };
