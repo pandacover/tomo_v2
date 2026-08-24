@@ -5,6 +5,8 @@ import time
 from collections.abc import Callable, Iterator
 from dataclasses import replace
 
+import httpx
+
 from ..context import ContextHydrator
 from ..delivery import split_sentences
 from ..models import AutomationTurn, PeerTurn, ResponseContract
@@ -363,6 +365,8 @@ class ConversationEngine:
                         return
                     yield completed(TurnRunStatus.COMPLETED)
                     return
+                except httpx.HTTPStatusError:
+                    raise
                 except Exception:
                     failure = ConversationOutputError("provider_stream_failure")
                     stream = None
@@ -403,6 +407,8 @@ class ConversationEngine:
                             failure = error
                             break
                     stream_exhausted = True
+                except httpx.HTTPStatusError:
+                    raise
                 except Exception:
                     if failure is None:
                         failure = ConversationOutputError("provider_stream_failure")

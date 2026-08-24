@@ -128,6 +128,24 @@ class ProviderStreamingTests(unittest.TestCase):
         self.assertEqual(stream.call_args.args[:2], ("POST", "https://api.x.ai/v1/chat/completions"))
         self.assertTrue(stream.call_args.kwargs["json"]["stream"])
 
+    def test_openrouter_usage_chunk_without_choices_is_ignored(self):
+        events = (
+            json.dumps({"choices": [{"delta": {"content": "hi"}, "finish_reason": "stop"}]}),
+            json.dumps({"usage": {"prompt_tokens": 3, "completion_tokens": 1}}),
+            "[DONE]",
+        )
+        with patch("tomo_core.providers.httpx.stream", return_value=FakeStreamResponse(sse_chunks(*events))) as stream:
+            result = list(
+                XaiApiProvider(
+                    api_key="or-key",
+                    model="deepseek/deepseek-v4-flash-0731",
+                    base_url="https://openrouter.ai/api/v1",
+                ).stream([{"role": "user", "content": "hi"}])
+            )
+        self.assertEqual(result, [ProviderTextDelta("hi"), ProviderStreamCompleted("stop", input_tokens=3, output_tokens=1)])
+        self.assertEqual(stream.call_args.kwargs["timeout"], 180)
+        self.assertEqual(stream.call_args.kwargs["headers"]["HTTP-Referer"], "https://github.com/pandacover/tomo_v2")
+
     def test_stream_assembles_multiple_native_tool_calls_before_terminal_event(self):
         events = (
             json.dumps(

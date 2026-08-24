@@ -167,7 +167,11 @@ def _stream_openai_compatible(
         if not isinstance(payload, dict):
             raise ValueError("invalid stream payload")
         parse_usage(payload)
+        if payload.get("error"):
+            raise ValueError("provider stream error")
         choices = payload.get("choices")
+        if choices is None:
+            return
         if not isinstance(choices, list):
             raise ValueError("missing stream choices")
         if not choices:
@@ -243,7 +247,7 @@ def _stream_openai_compatible(
         f"{base_url}/chat/completions",
         headers=_provider_headers(base_url, access_token),
         json=request_body,
-        timeout=60,
+        timeout=180,
     ) as response:
         response.raise_for_status()
         for chunk in response.iter_raw():

@@ -1,5 +1,5 @@
 name: Deploy Tomo
-# Redeploy: 240s guest timeout, health probe, no destroy-on-supersede.
+# Redeploy: OpenRouter stream HTTP errors and usage chunks.
 
 on:
   workflow_dispatch:
