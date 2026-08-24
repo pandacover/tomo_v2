@@ -1,0 +1,42 @@
+name: Dump Tomo logs
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - cloudflare-cutover
+    paths:
+      - ".github/workflows/dump-tomo-logs.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  logs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+    steps:
+      - name: Query Workers Logs
+        run: |
+          to="$(($(date +%s) * 1000))"
+          from="$((to - 3600000))"
+          curl -sS -X POST \
+            "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/observability/telemetry/query" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data "$(jq -n --argjson from "$from" --argjson to "$to" '{
+              timeframe: {from: $from, to: $to},
+              view: "events",
+              datasets: ["cloudflare-workers"],
+              filters: [{kind:"filter", key:"$metadata.service", operation:"eq", type:"string", value:"tomo"}],
+              limit: 100,
+              chart: false
+            }')" | tee logs.json
+          echo "## Tomo logs" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          jq '{success, errors, result: (.result | if type=="object" then (.events // . | [.[0:20]]) else . end)}' logs.json | head -c 12000 >> "$GITHUB_STEP_SUMMARY"
+          echo >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
