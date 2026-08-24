@@ -1,3 +1,4 @@
+import { Sandbox as CloudflareSandbox } from "@cloudflare/sandbox";
 import type { Env } from "./env";
 import { hexKey, logOps } from "./env";
 import { verifyAttachment, verifyCron } from "./hmac";
@@ -6,7 +7,11 @@ import { PeerDO } from "./peer";
 import { RegistryDO } from "./registry";
 import { compactPrivateMessage, equalSecret, TelegramApi } from "./telegram";
 
-export { Sandbox } from "@cloudflare/sandbox";
+export class Sandbox extends CloudflareSandbox {
+  enableInternet = true;
+  interceptHttps = false;
+}
+
 export { OwnerDO, RegistryDO, PeerDO };
 
 function json(payload: unknown, status = 200): Response {

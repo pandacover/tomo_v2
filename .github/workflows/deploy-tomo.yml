@@ -1,5 +1,5 @@
 name: Deploy Tomo
-# Redeploy: trust Cloudflare intercept CA; name provider exceptions.
+# Redeploy: basic instance, no HTTPS intercept, retry sandbox 500.
 
 on:
   workflow_dispatch:

@@ -370,28 +370,23 @@ export class OwnerDO extends DurableObject<Env> {
       }
       logOps({ event: "exec_start", tomo_id: this.tomoId(), generation_id: generationId });
       await this.prepareGuest(sandbox);
-      const health = await this.execGuest(sandbox, {}, 30_000, true);
-      if (!health.success) {
-        errorClass = `guest_health_${health.exitCode}`;
-      } else {
-        const env = await this.guestEnv(generationId, chatId, actorId, extraEnv, options);
-        const timeout = 240_000 + Math.min(options.images.length, 8) * 75_000;
-        const result = await this.execGuest(sandbox, env, timeout, false);
-        const lines = result.stdout.split(/\r?\n/).filter((line) => line.length > 0);
-        const flag = await this.handleLines(lines, generationId, chatId, requestId, telegram, last, true);
-        errorClass = flag.errorClass;
-        if (!result.success && !errorClass) errorClass = result.exitCode === 124 ? "sandbox_timeout" : `sandbox_exit_${result.exitCode}`;
-        logOps({
-          event: "exec_result",
-          tomo_id: this.tomoId(),
-          generation_id: generationId,
-          exit_code: result.exitCode,
-          error_class: errorClass,
-          stderr_present: result.stderr ? 1 : 0,
-        });
-        if (this.generationActive(generationId) && !abort.signal.aborted) {
-          await this.checkpoint(sandbox);
-        }
+      const env = await this.guestEnv(generationId, chatId, actorId, extraEnv, options);
+      const timeout = 240_000 + Math.min(options.images.length, 8) * 75_000;
+      const result = await this.execGuest(sandbox, env, timeout, false);
+      const lines = result.stdout.split(/\r?\n/).filter((line) => line.length > 0);
+      const flag = await this.handleLines(lines, generationId, chatId, requestId, telegram, last, true);
+      errorClass = flag.errorClass;
+      if (!result.success && !errorClass) errorClass = result.exitCode === 124 ? "sandbox_timeout" : `sandbox_exit_${result.exitCode}`;
+      logOps({
+        event: "exec_result",
+        tomo_id: this.tomoId(),
+        generation_id: generationId,
+        exit_code: result.exitCode,
+        error_class: errorClass,
+        stderr_present: result.stderr ? 1 : 0,
+      });
+      if (this.generationActive(generationId) && !abort.signal.aborted) {
+        await this.checkpoint(sandbox);
       }
     } catch (error) {
       errorClass = sandboxLabel(error);
@@ -748,10 +743,13 @@ function retryableSandbox(error: unknown): boolean {
   return (
     name === "ContainerUnavailableError" ||
     name === "RPCTransportError" ||
+    name === "SandboxError" ||
     code === "CONTAINER_UNAVAILABLE" ||
     code === "RPC_TRANSPORT_ERROR" ||
     blob.includes("container_starting") ||
-    blob.includes("container unavailable")
+    blob.includes("container unavailable") ||
+    blob.includes("http_error_status_500") ||
+    blob.includes("status 500")
   );
 }
 
