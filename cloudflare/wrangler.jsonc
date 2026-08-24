@@ -1,0 +1,47 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "tomo",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-23",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "invocation_logs": true
+    }
+  },
+  "containers": [
+    {
+      "class_name": "Sandbox",
+      "image": "../tomo_core/Dockerfile.cloudflare",
+      "instance_type": "lite",
+      "max_instances": 3
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "class_name": "Sandbox", "name": "Sandbox" },
+      { "class_name": "RegistryDO", "name": "REGISTRY" },
+      { "class_name": "OwnerDO", "name": "OWNER" },
+      { "class_name": "PeerDO", "name": "PEER" }
+    ]
+  },
+  "r2_buckets": [
+    {
+      "binding": "CHECKPOINTS",
+      "bucket_name": "tomo-checkpoints"
+    }
+  ],
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["Sandbox", "RegistryDO", "OwnerDO", "PeerDO"]
+    }
+  ],
+  "vars": {
+    "TOMO_AGENT_MODEL": "deepseek/deepseek-v4-flash-0731",
+    "TOMO_VISION_MODEL": "meta/muse-spark-1.2-contributor",
+    "TOMO_ALLOWLIST": "[{\"actor_id\":\"5995349219\",\"tomo_id\":\"tomo-pandacover\"}]"
+  }
+}

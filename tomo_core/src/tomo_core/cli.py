@@ -22,7 +22,7 @@ from .hosted_config import HostedRuntimeConfig
 from .models import OutboundBubble, RuntimeConfig
 from .oauth import OAuthManager
 from .grok_auth import GrokAuthStore
-from .providers import GrokAuthProvider, OAuthBackedSuperGrokProvider, StaticProvider, XaiApiProvider, supergrok_oauth_provider_from_access_token
+from .providers import GrokAuthProvider, OAuthBackedSuperGrokProvider, StaticProvider, XaiApiProvider, OPENROUTER_BASE_URL, DEFAULT_OPENROUTER_AGENT_MODEL, DEFAULT_OPENROUTER_VISION_MODEL, supergrok_oauth_provider_from_access_token
 from .runtime import PersonalAgentRuntime
 from .sandbox_inbound import SandboxInboundError, emit_failure, run_once
 from .telegram import TelegramDeliverySink
@@ -94,6 +94,11 @@ def _cron_run_payload(run) -> dict:
 def build_provider(args: argparse.Namespace, oauth: OAuthManager):
     if args.static_response:
         return StaticProvider(args.static_response)
+    openrouter = os.getenv("OPENROUTER_API_KEY") or os.getenv("TOMO_OPENROUTER_API_KEY")
+    if openrouter:
+        model = os.getenv("TOMO_AGENT_MODEL") or getattr(args, "model", None) or DEFAULT_OPENROUTER_AGENT_MODEL
+        effort = os.getenv("TOMO_AGENT_REASONING_EFFORT") or os.getenv("TOMO_XAI_REASONING_EFFORT")
+        return XaiApiProvider(api_key=openrouter, model=model, base_url=OPENROUTER_BASE_URL, reasoning_effort=effort)
     api_key = (
         getattr(args, "xai_api_key", None)
         or os.getenv("XAI_API_KEY")
@@ -120,9 +125,10 @@ def build_vision_interpreter(
     """Create a role-specific provider while reusing the selected local auth source."""
     if args.static_response:
         return None
-    vision_model = model or os.getenv("TOMO_XAI_VISION_MODEL", "grok-4.3")
-    vision_effort = reasoning_effort or os.getenv("TOMO_XAI_VISION_REASONING_EFFORT", "low")
     base = build_provider(args, oauth)
+    default_vision = DEFAULT_OPENROUTER_VISION_MODEL if isinstance(base, XaiApiProvider) and "openrouter.ai" in base.base_url else "grok-4.3"
+    vision_model = model or os.getenv("TOMO_VISION_MODEL") or os.getenv("TOMO_XAI_VISION_MODEL", default_vision)
+    vision_effort = reasoning_effort or os.getenv("TOMO_XAI_VISION_REASONING_EFFORT", "low")
     if isinstance(base, XaiApiProvider):
         provider = XaiApiProvider(base.api_key, model=vision_model, base_url=base.base_url, reasoning_effort=vision_effort, store=False)
     elif isinstance(base, GrokAuthProvider):
@@ -365,6 +371,50 @@ def run_shared_gateway_foreground(args: argparse.Namespace, config: HostedRuntim
             peer_service.stop()
         if _read_pid(pid_path) == os.getpid():
             pid_path.unlink(missing_ok=True)
+
+
+def _sandbox_openrouter_key() -> str | None:
+    return os.getenv("OPENROUTER_API_KEY") or os.getenv("TOMO_OPENROUTER_API_KEY")
+
+
+def _sandbox_provider_from_env():
+    openrouter = _sandbox_openrouter_key()
+    if openrouter:
+        effort = os.getenv("TOMO_AGENT_REASONING_EFFORT") or os.getenv("TOMO_XAI_REASONING_EFFORT")
+        provider = XaiApiProvider(
+            api_key=openrouter,
+            model=os.getenv("TOMO_AGENT_MODEL") or os.getenv("TOMO_XAI_MODEL") or DEFAULT_OPENROUTER_AGENT_MODEL,
+            base_url=OPENROUTER_BASE_URL,
+            reasoning_effort=effort,
+        )
+        return provider, openrouter
+    access_token = os.getenv("TOMO_SUPERGROK_ACCESS_TOKEN")
+    if not access_token:
+        return None, None
+    provider = supergrok_oauth_provider_from_access_token(
+        access_token,
+        model=os.getenv("TOMO_XAI_MODEL", "grok-4.5"),
+        reasoning_effort=os.getenv("TOMO_XAI_REASONING_EFFORT", "high"),
+    )
+    return provider, access_token
+
+
+def _sandbox_vision_provider_from_env(credential: str):
+    if _sandbox_openrouter_key():
+        effort = os.getenv("TOMO_XAI_VISION_REASONING_EFFORT", "low")
+        return XaiApiProvider(
+            api_key=credential,
+            model=os.getenv("TOMO_VISION_MODEL") or os.getenv("TOMO_XAI_VISION_MODEL") or DEFAULT_OPENROUTER_VISION_MODEL,
+            base_url=OPENROUTER_BASE_URL,
+            reasoning_effort=effort,
+            store=False,
+        )
+    return supergrok_oauth_provider_from_access_token(
+        credential,
+        model=os.getenv("TOMO_XAI_VISION_MODEL", "grok-4.3"),
+        reasoning_effort=os.getenv("TOMO_XAI_VISION_REASONING_EFFORT", "low"),
+        store=False,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -642,8 +692,8 @@ def main(argv: list[str] | None = None) -> int:
         if payload is None:
             emit_failure(sys.stdout, "missing_inbound")
             return 1
-        access_token = os.getenv("TOMO_SUPERGROK_ACCESS_TOKEN")
-        if not access_token:
+        provider, credential = _sandbox_provider_from_env()
+        if provider is None or credential is None:
             emit_failure(sys.stdout, "missing_access_token")
             return 1
         data_dir = os.getenv("TOMO_CORE_DATA_DIR")
@@ -655,18 +705,8 @@ def main(argv: list[str] | None = None) -> int:
             emit_failure(sys.stdout, "missing_owner_id")
             return 1
         try:
-            provider = supergrok_oauth_provider_from_access_token(
-                access_token,
-                model=os.getenv("TOMO_XAI_MODEL", "grok-4.5"),
-                reasoning_effort=os.getenv("TOMO_XAI_REASONING_EFFORT", "high"),
-            )
             vision = ProviderVisionInterpreter(
-                supergrok_oauth_provider_from_access_token(
-                    access_token,
-                    model=os.getenv("TOMO_XAI_VISION_MODEL", "grok-4.3"),
-                    reasoning_effort=os.getenv("TOMO_XAI_VISION_REASONING_EFFORT", "low"),
-                    store=False,
-                ),
+                _sandbox_vision_provider_from_env(credential),
                 ControlAttachmentReader.from_env(),
             ) if os.getenv("TOMO_ATTACHMENT_CAPABILITY") else None
             return run_once(
@@ -679,7 +719,16 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 provider=provider,
                 vision_interpreter=vision,
-                secret_values=tuple(value for value in (access_token, os.getenv("TOMO_CRON_CAPABILITY"), os.getenv("TOMO_PEER_CAPABILITY"), os.getenv("TOMO_ATTACHMENT_CAPABILITY")) if value),
+                secret_values=tuple(
+                    value
+                    for value in (
+                        credential,
+                        os.getenv("TOMO_CRON_CAPABILITY"),
+                        os.getenv("TOMO_PEER_CAPABILITY"),
+                        os.getenv("TOMO_ATTACHMENT_CAPABILITY"),
+                    )
+                    if value
+                ),
             )
         except SandboxInboundError:
             return 1

@@ -45,6 +45,18 @@ class ProviderStreamCompleted:
 
 ProviderStreamEvent: TypeAlias = ProviderTextDelta | ProviderToolCallReady | ProviderStreamCompleted
 
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+DEFAULT_OPENROUTER_AGENT_MODEL = "deepseek/deepseek-v4-flash-0731"
+DEFAULT_OPENROUTER_VISION_MODEL = "meta/muse-spark-1.2-contributor"
+
+
+def _provider_headers(base_url: str, access_token: str) -> dict[str, str]:
+    headers = {"Authorization": f"Bearer {access_token}"}
+    if "openrouter.ai" in base_url:
+        headers["HTTP-Referer"] = "https://github.com/pandacover/tomo_v2"
+        headers["X-Title"] = "Tomo"
+    return headers
+
 
 class ProviderAdapter(Protocol):
     name: str
@@ -229,7 +241,7 @@ def _stream_openai_compatible(
     with httpx.stream(
         "POST",
         f"{base_url}/chat/completions",
-        headers={"Authorization": f"Bearer {access_token}"},
+        headers=_provider_headers(base_url, access_token),
         json=request_body,
         timeout=60,
     ) as response:

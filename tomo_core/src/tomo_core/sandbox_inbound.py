@@ -139,7 +139,13 @@ def run_once(
         code = _safe_diagnostic_name(error.code, _MAX_EXCEPTION_CLASS_CHARS, secret_values)
         _raise_failure(stdout, code, error, secret_values, request_id, generation_id, sequence)
     except httpx.HTTPStatusError as error:
-        code = "auth_expired" if error.response.status_code == 401 else "provider_failed"
+        status = error.response.status_code
+        if status == 401:
+            code = "auth_expired"
+        elif status == 402:
+            code = "provider_budget"
+        else:
+            code = "provider_failed"
         _raise_failure(stdout, code, error, secret_values, request_id, generation_id, sequence)
     except Exception as error:
         _raise_failure(stdout, "runtime_failed", error, secret_values, request_id, generation_id, sequence)

@@ -233,6 +233,35 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         provider_factory.assert_called_once_with(token, model="grok-test-next", reasoning_effort="low")
 
+    def test_sandbox_inbound_prefers_openrouter_over_supergrok(self):
+        from tomo_core.providers import XaiApiProvider, OPENROUTER_BASE_URL, DEFAULT_OPENROUTER_AGENT_MODEL
+
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "OPENROUTER_API_KEY": "or-key",
+                    "TOMO_SUPERGROK_ACCESS_TOKEN": "should-not-use",
+                    "TOMO_INBOUND_JSON": "payload",
+                    "TOMO_CORE_DATA_DIR": "/data",
+                    "TOMO_INSTANCE_ID": "tomo-1",
+                },
+                clear=True,
+            ),
+            patch("tomo_core.cli.supergrok_oauth_provider_from_access_token") as provider_factory,
+            patch("tomo_core.cli.run_once", return_value=0) as run_once,
+            patch("sys.stdout", io.StringIO()),
+        ):
+            self.assertEqual(main(["sandbox-inbound"]), 0)
+
+        provider_factory.assert_not_called()
+        provider = run_once.call_args.kwargs["provider"]
+        self.assertIsInstance(provider, XaiApiProvider)
+        self.assertEqual(provider.api_key, "or-key")
+        self.assertEqual(provider.base_url, OPENROUTER_BASE_URL)
+        self.assertEqual(provider.model, DEFAULT_OPENROUTER_AGENT_MODEL)
+        self.assertEqual(run_once.call_args.kwargs["secret_values"], ("or-key",))
+
     def test_sandbox_health_reads_environment_payload_without_constructing_a_provider(self):
         with (
             patch.dict("os.environ", {"TOMO_INBOUND_JSON": '{"version":1,"type":"inbound","request_id":"health-1","inbound":{"connector":"telegram","actor_id":"health","message_id":"health","text":"health","timestamp":"2026-01-01T00:00:00+00:00"}}'}, clear=True),
