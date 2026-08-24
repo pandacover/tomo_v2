@@ -1,0 +1,82 @@
+name: Deploy Tomo
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - cloudflare-cutover
+    paths:
+      - ".github/workflows/deploy-tomo.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-tomo
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: cloudflare
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: cloudflare/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Types
+        run: npm run types
+
+      - name: Deploy Worker
+        id: deploy
+        run: |
+          npx wrangler deploy 2>&1 | tee "$RUNNER_TEMP/deploy.log"
+          worker_url="$(grep -Eo 'https://[^[:space:]]+\.workers\.dev' "$RUNNER_TEMP/deploy.log" | tail -n 1)"
+          if [[ -z "$worker_url" ]]; then
+            echo "Could not find workers.dev URL in Wrangler output." >&2
+            exit 1
+          fi
+          echo "WORKER_URL=$worker_url" >> "$GITHUB_ENV"
+          echo "url=$worker_url" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for /health
+        run: |
+          set -e
+          for attempt in $(seq 1 30); do
+            code="$(curl --silent --output /dev/null \
+              --write-out '%{http_code}' \
+              --connect-timeout 10 \
+              "$WORKER_URL/health")" || code=0
+            if [[ "$code" == "200" ]]; then
+              echo "Ready: $WORKER_URL (attempt $attempt)"
+              exit 0
+            fi
+            echo "Attempt $attempt: /health returned $code"
+            sleep 10
+          done
+          echo "::error::$WORKER_URL/health did not return 200"
+          exit 1
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "# Tomo deploy"
+            echo
+            echo "Worker URL: \`${WORKER_URL:-unknown}\`"
+            echo
+            echo "Secrets are not in this deploy. Add them in the dashboard, then setWebhook."
+          } | tee -a "$GITHUB_STEP_SUMMARY"
