@@ -1,5 +1,5 @@
 name: Deploy Tomo
-# Redeploy: OpenRouter stream HTTP errors and usage chunks.
+# Redeploy: trust Cloudflare intercept CA; name provider exceptions.
 
 on:
   workflow_dispatch:

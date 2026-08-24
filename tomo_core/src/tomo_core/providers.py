@@ -4,6 +4,7 @@ import codecs
 import copy
 import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Iterator, Protocol, TypeAlias
 
 import httpx
@@ -56,6 +57,20 @@ def _provider_headers(base_url: str, access_token: str) -> dict[str, str]:
         headers["HTTP-Referer"] = "https://github.com/pandacover/tomo_v2"
         headers["X-Title"] = "Tomo"
     return headers
+
+
+def _httpx_verify() -> str | bool:
+    cloudflare_ca = Path("/etc/cloudflare/certs/cloudflare-containers-ca.crt")
+    system_ca = Path("/etc/ssl/certs/ca-certificates.crt")
+    if cloudflare_ca.is_file() and system_ca.is_file():
+        combined = Path("/tmp/tomo-ca-bundle.pem")
+        combined.write_bytes(system_ca.read_bytes() + b"\n" + cloudflare_ca.read_bytes())
+        return str(combined)
+    if cloudflare_ca.is_file():
+        return str(cloudflare_ca)
+    if system_ca.is_file():
+        return str(system_ca)
+    return True
 
 
 class ProviderAdapter(Protocol):
@@ -248,6 +263,7 @@ def _stream_openai_compatible(
         headers=_provider_headers(base_url, access_token),
         json=request_body,
         timeout=180,
+        verify=_httpx_verify(),
     ) as response:
         response.raise_for_status()
         for chunk in response.iter_raw():

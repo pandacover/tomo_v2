@@ -21,6 +21,16 @@ from .parsing import ConversationOutputError
 from .prompts import build_first_segment_repair_messages, build_segment_messages, build_segment_repair_messages
 
 
+def _provider_failure_code(error: BaseException) -> str:
+    if isinstance(error, httpx.TimeoutException):
+        return "provider_timeout"
+    if isinstance(error, httpx.ConnectError):
+        return "provider_connect"
+    name = type(error).__name__.lower()
+    slug = "".join(character if character.isalnum() else "_" for character in name).strip("_")[:40]
+    return f"provider_{slug}" if slug else "provider_stream_failure"
+
+
 def should_repair_performative_output(user_text: str, frames: Sequence[Frame]) -> bool:
     """Return True if a casual short input receives a bloated or performative multi-sentence response."""
     cleaned_input = user_text.strip().lower()
@@ -367,8 +377,8 @@ class ConversationEngine:
                     return
                 except httpx.HTTPStatusError:
                     raise
-                except Exception:
-                    failure = ConversationOutputError("provider_stream_failure")
+                except Exception as error:
+                    failure = ConversationOutputError(_provider_failure_code(error))
                     stream = None
                 stream_exhausted = False
                 try:
@@ -409,9 +419,9 @@ class ConversationEngine:
                     stream_exhausted = True
                 except httpx.HTTPStatusError:
                     raise
-                except Exception:
+                except Exception as error:
                     if failure is None:
-                        failure = ConversationOutputError("provider_stream_failure")
+                        failure = ConversationOutputError(_provider_failure_code(error))
                 finally:
                     close = getattr(stream, "close", None)
                     if callable(close):
