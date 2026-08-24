@@ -1,5 +1,5 @@
 name: Deploy Tomo
-# Redeploy: put error class in the Telegram failure line. Secrets are now secret_text.
+# Redeploy: drop AbortSignal from sandbox.exec (DataCloneError).
 
 on:
   workflow_dispatch:

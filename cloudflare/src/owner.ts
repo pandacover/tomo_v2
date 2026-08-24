@@ -26,6 +26,7 @@ export class OwnerDO extends DurableObject<Env> {
   private ready: Promise<void>;
   private running = false;
   private abort: AbortController | null = null;
+  private liveSandbox: SandboxHandle | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -190,6 +191,9 @@ export class OwnerDO extends DurableObject<Env> {
         turn.active_generation_id,
       );
       this.abort?.abort();
+      const live = this.liveSandbox;
+      this.liveSandbox = null;
+      if (live) this.ctx.waitUntil(live.destroy().catch(() => undefined));
     }
     const burstId = turn?.burst_id ? String(turn.burst_id) : `${compact.chatId}:${compact.updateId}`;
     const revision = Number(turn?.revision || 0) + 1;
@@ -362,6 +366,7 @@ export class OwnerDO extends DurableObject<Env> {
       sleepAfter: "10s",
       containerTimeouts: { instanceGetTimeoutMS: 120_000, portReadyTimeoutMS: 180_000 },
     });
+    this.liveSandbox = sandbox;
     let errorClass: string | null = null;
     const frameState = { first: true };
     let outputChain = Promise.resolve();
@@ -380,7 +385,6 @@ export class OwnerDO extends DurableObject<Env> {
         env: { PYTHONUNBUFFERED: "1", ...env },
         stream: true,
         timeout,
-        signal: abort.signal,
         onOutput: (stream, data) => {
           if (abort.signal.aborted) return;
           if (stream === "stderr") {
@@ -435,6 +439,7 @@ export class OwnerDO extends DurableObject<Env> {
       }
       this.running = false;
       this.abort = null;
+      this.liveSandbox = null;
       const delivered = this.one(
         "SELECT 1 AS ok FROM deliveries WHERE generation_id = ? AND status = 'sent'",
         generationId,
