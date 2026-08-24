@@ -1,5 +1,5 @@
 name: Deploy Tomo
-# Redeploy after silent first DM: keep typing + failure line.
+# Redeploy: put error class in the Telegram failure line. Secrets are now secret_text.
 
 on:
   workflow_dispatch:

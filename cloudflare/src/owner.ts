@@ -365,19 +365,29 @@ export class OwnerDO extends DurableObject<Env> {
     let errorClass: string | null = null;
     const frameState = { first: true };
     let outputChain = Promise.resolve();
+    let stderrTail = "";
     try {
+      if (!this.env.OPENROUTER_API_KEY) {
+        throw new Error("missing_openrouter_key");
+      }
       logOps({ event: "exec_start", tomo_id: this.tomoId(), generation_id: generationId });
+      await sandbox.mkdir(DATA_DIR, { recursive: true });
       await this.hydrate(sandbox);
       const env = await this.guestEnv(generationId, chatId, actorId, extraEnv, options);
       const timeout = 120_000 + Math.min(options.images.length, 8) * 75_000;
       let carry = "";
       const result = await sandbox.exec(COMMAND, {
-        env,
+        env: { PYTHONUNBUFFERED: "1", ...env },
         stream: true,
         timeout,
         signal: abort.signal,
         onOutput: (stream, data) => {
-          if (stream !== "stdout" || abort.signal.aborted) return;
+          if (abort.signal.aborted) return;
+          if (stream === "stderr") {
+            if (stderrTail.length < 500) stderrTail = (stderrTail + data).slice(0, 500);
+            return;
+          }
+          if (stream !== "stdout") return;
           const split = splitLines(data, carry);
           carry = split.rest;
           outputChain = outputChain.then(async () => {
@@ -392,12 +402,23 @@ export class OwnerDO extends DurableObject<Env> {
         const flag = await this.handleLines([carry], generationId, chatId, requestId, telegram, last, frameState.first);
         if (flag.errorClass) errorClass = flag.errorClass;
       }
-      if (!result.success && !errorClass) errorClass = result.exitCode === 124 ? "sandbox_timeout" : "sandbox_exec_failed";
+      if (!result.success && !errorClass) errorClass = result.exitCode === 124 ? "sandbox_timeout" : `sandbox_exit_${result.exitCode}`;
+      if (result.stderr && stderrTail.length < 500) stderrTail = (stderrTail + result.stderr).slice(0, 500);
+      logOps({
+        event: "exec_result",
+        tomo_id: this.tomoId(),
+        generation_id: generationId,
+        exit_code: result.exitCode,
+        error_class: errorClass,
+        stderr_present: stderrTail ? 1 : 0,
+      });
       if (this.generationActive(generationId) && !abort.signal.aborted) {
         await this.checkpoint(sandbox);
       }
     } catch (error) {
-      errorClass = error instanceof Error ? error.name : "Error";
+      const name = error instanceof Error ? error.name : "Error";
+      const detail = error instanceof Error ? error.message : "";
+      errorClass = name === "Error" && detail ? detail.replace(/[^a-zA-Z0-9._-]+/g, "_").slice(0, 40) : name;
       logOps({
         event: "exec_failed",
         tomo_id: this.tomoId(),
@@ -419,7 +440,7 @@ export class OwnerDO extends DurableObject<Env> {
         generationId,
       );
       if (this.generationActive(generationId) && errorClass && errorClass !== "provider_budget" && !delivered) {
-        await telegram.sendMessage(chatId, "I couldn't finish that turn. Try again.");
+        await telegram.sendMessage(chatId, `I couldn't finish that turn (${errorClass}). Try again.`);
       }
       const status = this.generationActive(generationId) ? (errorClass ? "failed" : "completed") : "superseded";
       if (this.generationActive(generationId)) this.finishGeneration(generationId, chatId, status, errorClass);
