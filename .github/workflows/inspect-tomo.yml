@@ -30,33 +30,43 @@ jobs:
       - name: Health, secrets names, vars, logs
         working-directory: cloudflare
         run: |
+          set +e
           echo "## health"
           curl -sS -i --max-time 15 https://tomo.luvmakin01.workers.dev/health | head -n 20
+          echo
 
           echo "## secret names"
-          npx wrangler secret list --name tomo || true
+          npx wrangler secret list --name tomo
+          echo
 
           echo "## deployments"
-          npx wrangler deployments list --name tomo || true
+          npx wrangler deployments list --name tomo
+          echo
 
           echo "## script settings"
           curl -sS \
             "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/scripts/tomo/settings" \
-            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" | jq '{success, errors, result: (.result | {bindings: [.bindings[]? | {type, name}]})}'
-
-          echo "## recent logs"
-          to="$(($(date +%s) * 1000))"
-          from="$((to - 7200000))"
-          curl -sS -X POST \
-            "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/observability/telemetry/query" \
             -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
-            -H "Content-Type: application/json" \
-            --data "$(jq -n --argjson from "$from" --argjson to "$to" '{
-              queryId: "tomo-debug",
-              timeframe: {from: $from, to: $to},
-              view: "events",
-              datasets: ["workers_observability"],
-              filters: [{kind:"filter", key:"$metadata.service", operation:"eq", type:"string", value:"tomo"}],
-              limit: 50,
-              chart: false
-            }')" | jq '{success, errors, keys: (.result | keys), sample: .}' | head -c 20000
+            | jq '{success, errors, bindings: [.result.bindings[]? | {type, name}]}'
+          echo
+
+          echo "## logs cloudflare-workers"
+          to="$(($(date +%s) * 1000))"
+          from="$((to - 3600000))"
+          for dataset in workers_observability cloudflare-workers workers-logs; do
+            echo "### dataset $dataset"
+            curl -sS -X POST \
+              "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/observability/telemetry/query" \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data "$(jq -n --arg ds "$dataset" --argjson from "$from" --argjson to "$to" '{
+                queryId: "tomo-debug",
+                timeframe: {from: $from, to: $to},
+                view: "events",
+                datasets: [$ds],
+                filters: [{kind:"filter", key:"$metadata.service", operation:"eq", type:"string", value:"tomo"}],
+                limit: 20,
+                chart: false
+              }')" | head -c 8000
+            echo
+          done
