@@ -41,6 +41,15 @@ R2 bucket `tomo-checkpoints`: enable object versioning, 7-day keep, in the Cloud
 
 Add the other two later as more objects in that JSON, then `npx wrangler deploy`. No agent image rebuild. Their first DM binds.
 
+## Checks
+
+```bash
+cd cloudflare
+npm test
+npm run types
+npm run typecheck
+```
+
 ## Deploy
 
 Docker is required. Cloudflare builds the container from `tomo_core/Dockerfile.cloudflare`.

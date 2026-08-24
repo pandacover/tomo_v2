@@ -6,7 +6,8 @@
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
     "typecheck": "tsc --noEmit",
-    "types": "wrangler types"
+    "types": "wrangler types",
+    "test": "node --experimental-strip-types --test tests/*.ts"
   },
   "dependencies": {
     "@cloudflare/sandbox": "0.12.7"

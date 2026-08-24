@@ -80,7 +80,11 @@ export function compactPrivateMessage(update: Record<string, unknown>): CompactU
 }
 
 export class TelegramApi {
-  constructor(private token: string) {}
+  private token: string;
+
+  constructor(token: string) {
+    this.token = token;
+  }
 
   async sendMessage(chatId: string, text: string, replyTo?: string | null): Promise<{ messageId: string } | { uncertain: boolean }> {
     const body: Record<string, unknown> = { chat_id: chatId, text };

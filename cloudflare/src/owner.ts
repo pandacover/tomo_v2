@@ -111,7 +111,7 @@ export class OwnerDO extends DurableObject<Env> {
         "INSERT INTO meta(k, v) VALUES ('origin', ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
         body.origin,
       );
-      return this.enqueue(body.compact);
+      return await this.enqueue(body.compact);
     }
     if (url.pathname.startsWith("/v1/cron/")) return this.cron(request, url);
     return Response.json({ error: "not found" }, { status: 404 });
@@ -159,7 +159,7 @@ export class OwnerDO extends DurableObject<Env> {
     await this.ctx.storage.setAlarm(Math.min(...candidates));
   }
 
-  private enqueue(compact: CompactUpdate): Response {
+  private async enqueue(compact: CompactUpdate): Promise<Response> {
     if (this.one("SELECT 1 AS ok FROM inbox WHERE update_id = ?", compact.updateId)) {
       return Response.json({ ok: true, duplicate: true });
     }
@@ -198,8 +198,8 @@ export class OwnerDO extends DurableObject<Env> {
       revision,
       now + DEBOUNCE_MS,
     );
-    void this.ctx.storage.setAlarm(now + DEBOUNCE_MS);
-    void new TelegramApi(this.env.TELEGRAM_BOT_TOKEN).sendTyping(compact.chatId);
+    await this.ctx.storage.setAlarm(now + DEBOUNCE_MS);
+    this.ctx.waitUntil(new TelegramApi(this.env.TELEGRAM_BOT_TOKEN).sendTyping(compact.chatId));
     logOps({ event: "inbox_enqueued", tomo_id: this.tomoId(), update_id: compact.updateId });
     return Response.json({ ok: true });
   }
@@ -342,7 +342,8 @@ export class OwnerDO extends DurableObject<Env> {
   ): Promise<void> {
     const started = Date.now();
     this.running = true;
-    this.abort = new AbortController();
+    const abort = new AbortController();
+    this.abort = abort;
     const telegram = new TelegramApi(this.env.TELEGRAM_BOT_TOKEN);
     const sandbox = getSandbox(this.env.Sandbox, this.tomoId(), {
       enableDefaultSession: false,
@@ -362,8 +363,9 @@ export class OwnerDO extends DurableObject<Env> {
         env,
         stream: true,
         timeout,
+        signal: abort.signal,
         onOutput: (stream, data) => {
-          if (stream !== "stdout" || this.abort?.signal.aborted) return;
+          if (stream !== "stdout" || abort.signal.aborted) return;
           const split = splitLines(data, carry);
           carry = split.rest;
           outputChain = outputChain.then(async () => {
@@ -379,7 +381,9 @@ export class OwnerDO extends DurableObject<Env> {
         if (flag.errorClass) errorClass = flag.errorClass;
       }
       if (!result.success && !errorClass) errorClass = result.exitCode === 124 ? "sandbox_timeout" : "sandbox_exec_failed";
-      await this.checkpoint(sandbox);
+      if (this.generationActive(generationId) && !abort.signal.aborted) {
+        await this.checkpoint(sandbox);
+      }
     } catch (error) {
       errorClass = error instanceof Error ? error.name : "Error";
     } finally {
@@ -424,7 +428,11 @@ export class OwnerDO extends DurableObject<Env> {
       if (event.type === "error") {
         errorClass = event.code;
         if (event.code === "provider_budget") {
-          await telegram.sendMessage(chatId, BUDGET_LINE);
+          const delivered = this.one(
+            "SELECT 1 AS ok FROM deliveries WHERE generation_id = ? AND status = 'sent'",
+            generationId,
+          );
+          if (!delivered) await telegram.sendMessage(chatId, BUDGET_LINE);
         }
         continue;
       }
