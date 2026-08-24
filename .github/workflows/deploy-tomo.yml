@@ -1,5 +1,5 @@
 name: Deploy Tomo
-# Redeploy: drop AbortSignal from sandbox.exec (DataCloneError).
+# Redeploy: non-streaming sandbox.exec, retry container start.
 
 on:
   workflow_dispatch:

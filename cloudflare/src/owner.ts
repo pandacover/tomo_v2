@@ -9,7 +9,6 @@ import {
   envelopeFromCompact,
   parseEventLine,
   requestIdFor,
-  splitLines,
   type InboundBurst,
 } from "./protocol";
 import { TelegramApi, type CompactUpdate } from "./telegram";
@@ -368,61 +367,32 @@ export class OwnerDO extends DurableObject<Env> {
     });
     this.liveSandbox = sandbox;
     let errorClass: string | null = null;
-    const frameState = { first: true };
-    let outputChain = Promise.resolve();
-    let stderrTail = "";
     try {
       if (!this.env.OPENROUTER_API_KEY) {
         throw new Error("missing_openrouter_key");
       }
       logOps({ event: "exec_start", tomo_id: this.tomoId(), generation_id: generationId });
-      await sandbox.mkdir(DATA_DIR, { recursive: true });
-      await this.hydrate(sandbox);
+      await this.prepareGuest(sandbox);
       const env = await this.guestEnv(generationId, chatId, actorId, extraEnv, options);
       const timeout = 120_000 + Math.min(options.images.length, 8) * 75_000;
-      let carry = "";
-      const result = await sandbox.exec(COMMAND, {
-        env: { PYTHONUNBUFFERED: "1", ...env },
-        stream: true,
-        timeout,
-        onOutput: (stream, data) => {
-          if (abort.signal.aborted) return;
-          if (stream === "stderr") {
-            if (stderrTail.length < 500) stderrTail = (stderrTail + data).slice(0, 500);
-            return;
-          }
-          if (stream !== "stdout") return;
-          const split = splitLines(data, carry);
-          carry = split.rest;
-          outputChain = outputChain.then(async () => {
-            const flag = await this.handleLines(split.lines, generationId, chatId, requestId, telegram, last, frameState.first);
-            frameState.first = flag.firstFrame;
-            if (flag.errorClass) errorClass = flag.errorClass;
-          });
-        },
-      });
-      await outputChain;
-      if (carry.trim()) {
-        const flag = await this.handleLines([carry], generationId, chatId, requestId, telegram, last, frameState.first);
-        if (flag.errorClass) errorClass = flag.errorClass;
-      }
+      const result = await this.execGuest(sandbox, env, timeout);
+      const lines = result.stdout.split(/\r?\n/).filter((line) => line.length > 0);
+      const flag = await this.handleLines(lines, generationId, chatId, requestId, telegram, last, true);
+      errorClass = flag.errorClass;
       if (!result.success && !errorClass) errorClass = result.exitCode === 124 ? "sandbox_timeout" : `sandbox_exit_${result.exitCode}`;
-      if (result.stderr && stderrTail.length < 500) stderrTail = (stderrTail + result.stderr).slice(0, 500);
       logOps({
         event: "exec_result",
         tomo_id: this.tomoId(),
         generation_id: generationId,
         exit_code: result.exitCode,
         error_class: errorClass,
-        stderr_present: stderrTail ? 1 : 0,
+        stderr_present: result.stderr ? 1 : 0,
       });
       if (this.generationActive(generationId) && !abort.signal.aborted) {
         await this.checkpoint(sandbox);
       }
     } catch (error) {
-      const name = error instanceof Error ? error.name : "Error";
-      const detail = error instanceof Error ? error.message : "";
-      errorClass = name === "Error" && detail ? detail.replace(/[^a-zA-Z0-9._-]+/g, "_").slice(0, 40) : name;
+      errorClass = sandboxLabel(error);
       logOps({
         event: "exec_failed",
         tomo_id: this.tomoId(),
@@ -611,7 +581,36 @@ export class OwnerDO extends DurableObject<Env> {
     return env;
   }
 
-  private async hydrate(sandbox: ReturnType<typeof getSandbox>): Promise<void> {
+  private async prepareGuest(sandbox: SandboxHandle): Promise<void> {
+    await this.withContainerRetry(() => sandbox.mkdir(DATA_DIR, { recursive: true }));
+    await this.hydrate(sandbox);
+  }
+
+  private async execGuest(
+    sandbox: SandboxHandle,
+    env: Record<string, string>,
+    timeout: number,
+  ): Promise<{ success: boolean; exitCode: number; stdout: string; stderr: string }> {
+    return this.withContainerRetry(() =>
+      sandbox.exec(COMMAND, { env: { PYTHONUNBUFFERED: "1", ...env }, timeout }),
+    );
+  }
+
+  private async withContainerRetry<T>(operation: () => Promise<T>): Promise<T> {
+    let last: unknown;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      try {
+        return await operation();
+      } catch (error) {
+        last = error;
+        if (!retryableSandbox(error) || attempt === 4) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 4000 * (attempt + 1)));
+      }
+    }
+    throw last;
+  }
+
+  private async hydrate(sandbox: SandboxHandle): Promise<void> {
     const object = await this.env.CHECKPOINTS.get(`owners/${this.tomoId()}/tomo.sqlite3`);
     if (!object) return;
     const bytes = new Uint8Array(await object.arrayBuffer());
@@ -728,6 +727,29 @@ function jobJson(job: SqlRow): Record<string, unknown> {
 }
 
 type SandboxHandle = ReturnType<typeof getSandbox>;
+
+function sandboxLabel(error: unknown): string {
+  const name = error instanceof Error ? error.name : "Error";
+  const detail = error instanceof Error ? error.message : "";
+  const code = error && typeof error === "object" && "code" in error ? String((error as { code?: unknown }).code || "") : "";
+  const raw = [name, code, detail].filter(Boolean).join("_");
+  return raw.replace(/[^a-zA-Z0-9._-]+/g, "_").slice(0, 60) || "Error";
+}
+
+function retryableSandbox(error: unknown): boolean {
+  const name = error instanceof Error ? error.name : "";
+  const code = error && typeof error === "object" && "code" in error ? String((error as { code?: unknown }).code || "") : "";
+  const detail = error instanceof Error ? error.message : "";
+  const blob = `${name} ${code} ${detail}`.toLowerCase();
+  return (
+    name === "ContainerUnavailableError" ||
+    name === "RPCTransportError" ||
+    code === "CONTAINER_UNAVAILABLE" ||
+    code === "RPC_TRANSPORT_ERROR" ||
+    blob.includes("container_starting") ||
+    blob.includes("container unavailable")
+  );
+}
 
 function bytesToB64(bytes: Uint8Array): string {
   let binary = "";
