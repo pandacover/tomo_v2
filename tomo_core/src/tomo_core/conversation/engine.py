@@ -45,9 +45,9 @@ def _structured_frame_response_format(budget: TurnBudget, *, include_reaction: b
     required = ["frames"]
     if include_reaction:
         properties["reaction"] = {
-            "type": ["string", "null"],
-            "enum": [*REACTION_EMOJI_OPTIONS, None],
-            "description": "A sparse Telegram reaction intent for the incoming message, or null.",
+            "type": "string",
+            "enum": [*REACTION_EMOJI_OPTIONS, "none"],
+            "description": "A sparse Telegram reaction intent for the incoming message, or the string none.",
         }
         required.append("reaction")
     return {
@@ -76,17 +76,18 @@ def _parse_structured_frame_repair(
         payload = json.loads(text)
     except json.JSONDecodeError:
         raise ConversationOutputError("invalid_json_object") from None
-    expected_fields = {"frames", "reaction"} if include_reaction else {"frames"}
-    if not isinstance(payload, dict) or set(payload) != expected_fields:
+    expected_fields = ({"frames"}, {"frames", "reaction"}) if include_reaction else ({"frames"},)
+    if not isinstance(payload, dict) or set(payload) not in expected_fields:
         raise ConversationOutputError("invalid_frame_batch")
     frames = payload["frames"]
     if not isinstance(frames, list) or not 1 <= len(frames) <= budget.max_frames_per_segment:
         raise ConversationOutputError("invalid_frame_batch")
     records: list[object] = []
     if include_reaction:
-        reaction = payload["reaction"]
-        if reaction is not None and reaction not in REACTION_EMOJI_OPTIONS:
+        reaction_value = payload.get("reaction", "none")
+        if reaction_value != "none" and reaction_value not in REACTION_EMOJI_OPTIONS:
             raise ConversationOutputError("invalid_frame_batch")
+        reaction = None if reaction_value == "none" else reaction_value
         records.extend(parser.feed(json.dumps({
             "type": "turn_plan",
             "primary_move": "answer",
@@ -271,6 +272,7 @@ class ConversationEngine:
                 schemas = tuple(schema for schema in schemas if schema.get("function", {}).get("name") == "peer_resume")
             replacement = False
             repair_code: str | None = None
+            reaction_repair_fallback = False
             while True:
                 remaining_frames = 3 - len(frames)
                 if remaining_frames < 1:
@@ -282,7 +284,7 @@ class ConversationEngine:
                 parser = SegmentFrameParser(index, first_segment=plan is None, budget=segment_budget)
                 structured_stream = getattr(self.provider, "stream_structured", None)
                 structured_frame_repair = replacement and bool(repair_code and repair_code.startswith("missing_frame")) and callable(structured_stream)
-                structured_reaction = structured_frame_repair and index == 0 and plan is None and not isinstance(request.burst, (AutomationTurn, PeerTurn))
+                structured_reaction = structured_frame_repair and not reaction_repair_fallback and index == 0 and plan is None and not isinstance(request.burst, (AutomationTurn, PeerTurn))
                 if structured_frame_repair:
                     schemas = ()
                     messages = build_structured_frame_repair_messages(
@@ -496,7 +498,10 @@ class ConversationEngine:
                     yield completed(TurnRunStatus.COMPLETED)
                     return
                 except httpx.HTTPStatusError:
-                    raise
+                    if not structured_reaction:
+                        raise
+                    failure = ConversationOutputError("reaction_repair_unavailable")
+                    stream = None
                 except Exception as error:
                     failure = ConversationOutputError(_provider_failure_code(error))
                     stream = None
@@ -538,7 +543,9 @@ class ConversationEngine:
                             break
                     stream_exhausted = True
                 except httpx.HTTPStatusError:
-                    raise
+                    if not structured_reaction:
+                        raise
+                    failure = ConversationOutputError("reaction_repair_unavailable")
                 except Exception as error:
                     if failure is None:
                         failure = ConversationOutputError(_provider_failure_code(error))
@@ -781,6 +788,14 @@ class ConversationEngine:
                         return
                     if expired():
                         raise ConversationOutputError("elapsed_budget_exhausted")
+                    if structured_reaction:
+                        # Reaction metadata must never make a reply unavailable.
+                        # Retry the already-authorized repair once with the proven
+                        # frame-only schema and preserve the global repair budget.
+                        reaction_repair_fallback = True
+                        repair_code = "missing_frame_reaction_fallback"
+                        replacement = True
+                        continue
                     if segments or repairs >= self.budget.max_contract_repairs:
                         raise ConversationOutputError(failure.code)
                     repair_code = failure.code

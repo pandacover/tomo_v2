@@ -589,9 +589,39 @@ class ConversationEngineTests(unittest.TestCase):
         messages, response_format, actor_id = provider.structured_calls[0]
         self.assertIn("response schema overrides the JSONL output contract for this repair only", messages[0]["content"])
         self.assertEqual(response_format["json_schema"]["schema"]["properties"]["frames"]["maxItems"], 3)
-        self.assertEqual(response_format["json_schema"]["schema"]["properties"]["reaction"]["enum"][-1], None)
+        self.assertEqual(response_format["json_schema"]["schema"]["properties"]["reaction"]["enum"][-1], "none")
         self.assertEqual(result.plan.reaction.emoji, "👏")
         self.assertEqual(actor_id, "u1")
+
+    def test_structured_repair_accepts_frame_only_fallback_without_reaction(self):
+        provider = StructuredRepairProvider(
+            [[ProviderStreamCompleted("stop")]],
+            [[ProviderTextDelta('{"frames":[{"text":"Recovered answer."}]}'), ProviderStreamCompleted("stop")]],
+        )
+
+        result = ConversationEngine(provider).respond(self.request())
+
+        self.assertEqual([frame.text for frame in result.frames], ["Recovered answer."])
+        self.assertIsNone(result.plan.reaction)
+
+    def test_reaction_repair_failure_falls_back_to_proven_frame_only_schema(self):
+        provider = StructuredRepairProvider(
+            [[ProviderStreamCompleted("stop")]],
+            [
+                [ProviderTextDelta('{"not_frames":true}'), ProviderStreamCompleted("stop")],
+                [ProviderTextDelta('{"frames":[{"text":"Safe recovered answer."}]}'), ProviderStreamCompleted("stop")],
+            ],
+        )
+
+        result = ConversationEngine(provider).respond(self.request())
+
+        self.assertEqual([frame.text for frame in result.frames], ["Safe recovered answer."])
+        self.assertEqual(result.usage.contract_repairs, 1)
+        self.assertEqual(len(provider.structured_calls), 2)
+        first_schema = provider.structured_calls[0][1]["json_schema"]["schema"]["properties"]
+        fallback_schema = provider.structured_calls[1][1]["json_schema"]["schema"]["properties"]
+        self.assertIn("reaction", first_schema)
+        self.assertNotIn("reaction", fallback_schema)
 
     def test_missing_frame_failure_distinguishes_reasoning_only_and_nonempty_content(self):
         budget = TurnBudget(1, 0, 0, 1, 3, 3, 800, max_contract_repairs=0)

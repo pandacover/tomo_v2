@@ -143,7 +143,7 @@ def build_structured_frame_repair_messages(
         f"the previous segment produced no usable frame: {safe_code}. "
         "the response schema overrides the JSONL output contract for this repair only. "
         "emit exactly one frame-batch object and nothing else. honor the user's requested number of separate messages within the schema limits. "
-        "if the schema includes reaction, choose one very sparsely using the normal reaction policy, otherwise use null. "
+        "if the schema includes reaction, choose one very sparsely using the normal reaction policy, otherwise use the string none. "
         "omit turn_plan, memory_control, native tools, prose, fences, and backticks."
     )
     return messages
