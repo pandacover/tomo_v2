@@ -545,7 +545,7 @@ class ConversationEngineTests(unittest.TestCase):
     def test_empty_stop_and_malformed_json_still_use_one_repair(self):
         for first_attempt, repair_code in (
             ([ProviderStreamCompleted("stop")], "missing_frame"),
-            ([ProviderTextDelta("not json\n"), ProviderStreamCompleted("stop")], "invalid_json"),
+            ([ProviderTextDelta("not json\n"), ProviderStreamCompleted("stop")], "invalid_json_non_record"),
         ):
             with self.subTest(repair_code=repair_code):
                 provider = ScriptedProvider([

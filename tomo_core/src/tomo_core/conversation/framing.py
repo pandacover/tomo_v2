@@ -47,12 +47,16 @@ class SegmentFrameParser:
         return records
 
     def _parse_line(self, line: str) -> list[MovePlan | MemoryControl | Frame]:
-        if not line.strip():
+        stripped = line.strip()
+        if not stripped:
+            return []
+        if stripped in {"```", "```json", "```jsonl"}:
             return []
         try:
             payload = json.loads(line)
         except json.JSONDecodeError:
-            raise ConversationOutputError("invalid_json") from None
+            code = "invalid_json_object" if stripped.startswith("{") else "invalid_json_non_record"
+            raise ConversationOutputError(code) from None
         if not isinstance(payload, dict) or not isinstance(payload.get("type"), str):
             raise ConversationOutputError("invalid_record")
         record_type = payload["type"]
