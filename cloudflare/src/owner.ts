@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { getSandbox, parseSSEStream, type ExecEvent } from "@cloudflare/sandbox";
+import { cancelSupersededExecution } from "./cancellation";
 import type { Env } from "./env";
 import { hexKey, logOps } from "./env";
 import { CRON_OPS, issueAttachment, issueCron, sha256Hex } from "./hmac";
@@ -28,6 +29,7 @@ export class OwnerDO extends DurableObject<Env> {
   private running = false;
   private abort: AbortController | null = null;
   private liveSandbox: SandboxHandle | null = null;
+  private cancelling: Promise<void> | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -125,6 +127,11 @@ export class OwnerDO extends DurableObject<Env> {
   }
 
   private async handleAlarm(): Promise<void> {
+    const cancellation = this.cancelling;
+    if (cancellation) {
+      await cancellation;
+      if (this.cancelling === cancellation) this.cancelling = null;
+    }
     if (this.running) {
       await this.scheduleWake();
       return;
@@ -187,11 +194,22 @@ export class OwnerDO extends DurableObject<Env> {
     const turn = this.one("SELECT * FROM chat_turn WHERE chat_id = ?", compact.chatId);
     const now = Date.now();
     if (turn?.active_generation_id) {
+      const supersededGenerationId = String(turn.active_generation_id);
       this.ctx.storage.sql.exec(
         "UPDATE generations SET status = 'superseded' WHERE generation_id = ? AND status = 'active'",
-        turn.active_generation_id,
+        supersededGenerationId,
       );
-      this.abort?.abort();
+      const sandbox = this.liveSandbox ?? this.sandbox();
+      const cancellation = cancelSupersededExecution(this.abort, sandbox).then((result) => {
+        logOps({
+          event: "generation_cancelled",
+          tomo_id: this.tomoId(),
+          generation_id: supersededGenerationId,
+          result,
+        });
+      });
+      this.cancelling = cancellation;
+      this.ctx.waitUntil(cancellation);
     }
     const burstId = turn?.burst_id ? String(turn.burst_id) : `${compact.chatId}:${compact.updateId}`;
     const revision = Number(turn?.revision || 0) + 1;
@@ -358,12 +376,7 @@ export class OwnerDO extends DurableObject<Env> {
     this.abort = abort;
     const telegram = new TelegramApi(this.env.TELEGRAM_BOT_TOKEN);
     const typing = this.keepTyping(chatId, abort.signal, telegram);
-    const sandbox = getSandbox(this.env.Sandbox, this.tomoId(), {
-      enableDefaultSession: false,
-      normalizeId: true,
-      sleepAfter: "10s",
-      containerTimeouts: { instanceGetTimeoutMS: 120_000, portReadyTimeoutMS: 180_000 },
-    });
+    const sandbox = this.sandbox();
     this.liveSandbox = sandbox;
     let errorClass: string | null = null;
     try {
@@ -374,13 +387,13 @@ export class OwnerDO extends DurableObject<Env> {
       await this.prepareGuest(sandbox);
       const env = await this.guestEnv(generationId, chatId, actorId, extraEnv, options);
       const timeout = 240_000 + Math.min(options.images.length, 8) * 75_000;
-      const stream = await this.execGuestStream(sandbox, env, timeout);
+      const stream = await this.execGuestStream(sandbox, env, timeout, abort.signal);
       let carry = "";
       let firstFrame = true;
       let exitCode: number | null = null;
       let stderrPresent = false;
       const diagnosticCodes = new Set<string>();
-      for await (const event of parseSSEStream<ExecEvent>(stream)) {
+      for await (const event of parseSSEStream<ExecEvent>(stream, abort.signal)) {
         if (event.type === "stdout") {
           const split = splitLines(event.data || "", carry);
           carry = split.rest;
@@ -433,13 +446,17 @@ export class OwnerDO extends DurableObject<Env> {
         await this.checkpoint(sandbox);
       }
     } catch (error) {
-      errorClass = sandboxLabel(error);
-      logOps({
-        event: "exec_failed",
-        tomo_id: this.tomoId(),
-        generation_id: generationId,
-        error_class: errorClass,
-      });
+      if (abort.signal.aborted && !this.generationActive(generationId)) {
+        logOps({ event: "exec_cancelled", tomo_id: this.tomoId(), generation_id: generationId });
+      } else {
+        errorClass = sandboxLabel(error);
+        logOps({
+          event: "exec_failed",
+          tomo_id: this.tomoId(),
+          generation_id: generationId,
+          error_class: errorClass,
+        });
+      }
     } finally {
       abort.abort();
       await typing.catch(() => undefined);
@@ -659,10 +676,20 @@ export class OwnerDO extends DurableObject<Env> {
     sandbox: SandboxHandle,
     env: Record<string, string>,
     timeout: number,
+    signal: AbortSignal,
   ): Promise<ReadableStream> {
     return this.withContainerRetry(() =>
-      sandbox.execStream(COMMAND, { env: { PYTHONUNBUFFERED: "1", ...env }, timeout }),
+      sandbox.execStream(COMMAND, { env: { PYTHONUNBUFFERED: "1", ...env }, timeout, signal }),
     );
+  }
+
+  private sandbox(): SandboxHandle {
+    return getSandbox(this.env.Sandbox, this.tomoId(), {
+      enableDefaultSession: false,
+      normalizeId: true,
+      sleepAfter: "10s",
+      containerTimeouts: { instanceGetTimeoutMS: 120_000, portReadyTimeoutMS: 180_000 },
+    });
   }
 
   private async withContainerRetry<T>(operation: () => Promise<T>): Promise<T> {
