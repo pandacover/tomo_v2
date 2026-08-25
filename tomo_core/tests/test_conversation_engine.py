@@ -4,7 +4,7 @@ from unittest.mock import patch
 from tomo_core.conversation import ConversationEngine, ConversationRequest, FrameReady, MemoryControlReady, ReactionWindowReady, SegmentFinish, TurnBudget, TurnRunCompleted, TurnRunStarted, TurnRunStatus
 from tomo_core.conversation.parsing import ConversationOutputError
 from tomo_core.models import InboundEnvelope, PeerTurn, ResponseContract
-from tomo_core.providers import ProviderSetupRequired, ProviderStreamCompleted, ProviderTextDelta, ProviderToolCallReady
+from tomo_core.providers import ProviderSetupRequired, ProviderStreamCompleted, ProviderStreamError, ProviderTextDelta, ProviderToolCallReady, ProviderTransportError
 
 
 PLAN = '{"type":"turn_plan","primary_move":"answer","supporting_moves":["acknowledge"],"move_sequence":["acknowledge","answer"],"response_goal":"answer directly","confidence":"high"}\n'
@@ -50,6 +50,20 @@ class ScriptedProvider:
         raise AssertionError("ordinary turns must not call complete")
 
 
+class StructuredRepairProvider(ScriptedProvider):
+    def __init__(self, streams, structured_streams):
+        super().__init__(streams)
+        self.structured_streams = list(structured_streams)
+        self.structured_calls = []
+
+    def stream_structured(self, messages, *, response_format, actor_id=None):
+        self.structured_calls.append((messages, response_format, actor_id))
+        scripted = self.structured_streams.pop(0)
+        iterator = ClosingIterator(scripted)
+        self.iterators.append(iterator)
+        return iterator
+
+
 class ConversationEngineTests(unittest.TestCase):
     def request(self):
         return ConversationRequest.from_history(
@@ -57,6 +71,22 @@ class ConversationEngineTests(unittest.TestCase):
             soul="SOUL SENTINEL",
             history=[{"role": "user", "content": "i need this job"}],
         )
+
+    def test_provider_stream_error_keeps_its_stable_code(self):
+        from tomo_core.conversation.engine import _provider_failure_code
+
+        self.assertEqual(
+            _provider_failure_code(ProviderStreamError("invalid_sse_event")),
+            "provider_protocol_invalid_sse_event",
+        )
+
+    def test_provider_failures_are_typed_without_exception_text_slugging(self):
+        from tomo_core.conversation.engine import _provider_failure_code
+
+        self.assertEqual(_provider_failure_code(ProviderTransportError("timeout")), "provider_transport_timeout")
+        self.assertEqual(_provider_failure_code(ConversationOutputError("invalid_frame")), "invalid_frame")
+        self.assertEqual(_provider_failure_code(ValueError("secret provider detail")), "provider_value_error")
+        self.assertNotIn("secret", _provider_failure_code(ValueError("secret provider detail")))
 
     def test_one_stream_progressively_yields_plan_and_frames_independent_of_moves(self):
         provider = ScriptedProvider([
@@ -537,7 +567,7 @@ class ConversationEngineTests(unittest.TestCase):
     def test_empty_stop_and_malformed_json_still_use_one_repair(self):
         for first_attempt, repair_code in (
             ([ProviderStreamCompleted("stop")], "missing_frame"),
-            ([ProviderTextDelta("not json\n"), ProviderStreamCompleted("stop")], "invalid_json"),
+            ([ProviderTextDelta('{"type":"frame"\n'), ProviderStreamCompleted("stop")], "invalid_json_object"),
         ):
             with self.subTest(repair_code=repair_code):
                 provider = ScriptedProvider([
@@ -551,6 +581,88 @@ class ConversationEngineTests(unittest.TestCase):
                 self.assertEqual(result.usage.contract_repairs, 1)
                 self.assertEqual(len(provider.calls), 2)
                 self.assertIn(repair_code, provider.calls[1][0][0]["content"])
+
+    def test_missing_frame_uses_schema_enforced_frame_batch_repair_when_supported(self):
+        provider = StructuredRepairProvider(
+            [[ProviderStreamCompleted("stop")]],
+            [[ProviderTextDelta('{"frames":[{"text":"First answer."},{"text":"Second answer."},{"text":"Third answer."}]}'), ProviderStreamCompleted("stop")]],
+        )
+
+        result = ConversationEngine(provider).respond(self.request())
+
+        self.assertEqual([frame.text for frame in result.frames], ["First answer.", "Second answer.", "Third answer."])
+        self.assertEqual(result.usage.contract_repairs, 1)
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(len(provider.structured_calls), 1)
+        messages, response_format, actor_id = provider.structured_calls[0]
+        self.assertIn("response schema overrides the JSONL output contract for this repair only", messages[0]["content"])
+        self.assertEqual(response_format["json_schema"]["schema"]["properties"]["frames"]["maxItems"], 3)
+        self.assertEqual(set(response_format["json_schema"]["schema"]["properties"]), {"frames"})
+        self.assertIsNone(result.plan.reaction)
+        self.assertEqual(actor_id, "u1")
+
+    def test_structured_repair_accepts_frame_only_fallback_without_reaction(self):
+        provider = StructuredRepairProvider(
+            [[ProviderStreamCompleted("stop")]],
+            [[ProviderTextDelta('{"frames":[{"text":"Recovered answer."}]}'), ProviderStreamCompleted("stop")]],
+        )
+
+        result = ConversationEngine(provider).respond(self.request())
+
+        self.assertEqual([frame.text for frame in result.frames], ["Recovered answer."])
+        self.assertIsNone(result.plan.reaction)
+
+    def test_structured_repair_failure_does_not_start_a_third_provider_attempt(self):
+        provider = StructuredRepairProvider(
+            [[ProviderStreamCompleted("stop")]],
+            [
+                [ProviderTextDelta('{"not_frames":true}'), ProviderStreamCompleted("stop")],
+            ],
+        )
+
+        with self.assertRaises(ConversationOutputError) as raised:
+            ConversationEngine(provider).respond(self.request())
+
+        self.assertEqual(raised.exception.code, "invalid_frame_batch")
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(len(provider.structured_calls), 1)
+
+    def test_malformed_json_uses_the_same_single_structured_frame_repair(self):
+        provider = StructuredRepairProvider(
+            [[ProviderTextDelta('{"type":"frame"\n'), ProviderStreamCompleted("stop")]],
+            [[ProviderTextDelta('{"frames":[{"text":"Recovered one."},{"text":"Recovered two."}]}'), ProviderStreamCompleted("stop")]],
+        )
+
+        result = ConversationEngine(provider).respond(self.request())
+
+        self.assertEqual([frame.text for frame in result.frames], ["Recovered one.", "Recovered two."])
+        self.assertEqual(result.usage.contract_repairs, 1)
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(len(provider.structured_calls), 1)
+
+    def test_missing_frame_failure_distinguishes_reasoning_only_and_nonempty_content(self):
+        budget = TurnBudget(1, 0, 0, 1, 3, 3, 800, max_contract_repairs=0)
+        cases = (
+            ([ProviderStreamCompleted("stop", output_tokens=9, reasoning_tokens=9)], "missing_frame_reasoning_only"),
+            ([ProviderTextDelta("plain reply\n"), ProviderStreamCompleted("stop", output_tokens=2)], "missing_frame_nonempty_content"),
+        )
+
+        for stream, code in cases:
+            with self.subTest(code=code), self.assertRaises(ConversationOutputError) as raised:
+                ConversationEngine(ScriptedProvider([stream]), budget=budget).respond(self.request())
+            self.assertEqual(raised.exception.code, code)
+
+    def test_non_json_preamble_before_valid_jsonl_does_not_require_repair(self):
+        provider = ScriptedProvider([[
+            ProviderTextDelta("Here is the JSONL response:\n" + CANONICAL_PLAN + '{"type":"frame","text":"Direct answer."}\n'),
+            ProviderStreamCompleted("stop"),
+        ]])
+
+        result = ConversationEngine(provider).respond(self.request())
+
+        self.assertEqual([frame.text for frame in result.frames], ["Direct answer."])
+        self.assertEqual(result.usage.contract_repairs, 0)
+        self.assertEqual(len(provider.calls), 1)
 
     def test_invalid_first_response_repairs_with_one_mutating_tool_call(self):
         from tomo_core.tools import BoundTool, ToolRegistry, ToolSpec

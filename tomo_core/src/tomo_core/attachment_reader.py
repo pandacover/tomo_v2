@@ -48,12 +48,26 @@ class ControlAttachmentReader:
             with self.opener(request, timeout=10) as response:
                 mime_type = response.headers.get_content_type()
                 if not mime_type.startswith("image/"):
-                    raise AttachmentReadError("attachment_unavailable")
+                    raise AttachmentReadError("attachment_invalid_mime")
                 data = response.read(10 * 1024 * 1024 + 1)
         except AttachmentReadError:
             raise
-        except (HTTPError, URLError, OSError, ValueError):
-            raise AttachmentReadError("attachment_unavailable") from None
+        except HTTPError as error:
+            if error.code == 401:
+                code = "attachment_auth_failed"
+            elif error.code == 503:
+                code = "attachment_source_failed"
+            elif 400 <= error.code < 500:
+                code = "attachment_http_4xx"
+            elif error.code >= 500:
+                code = "attachment_http_5xx"
+            else:
+                code = "attachment_http_error"
+            raise AttachmentReadError(code) from None
+        except URLError:
+            raise AttachmentReadError("attachment_transport_failed") from None
+        except (OSError, ValueError):
+            raise AttachmentReadError("attachment_read_failed") from None
         if len(data) > 10 * 1024 * 1024:
             raise AttachmentReadError("attachment_too_large")
         return DownloadedAttachment(data, mime_type)
@@ -61,4 +75,13 @@ class ControlAttachmentReader:
 
 def _valid_context(control_url: object, capability: object, owner_id: object, generation_id: object) -> bool:
     parsed = urlparse(control_url) if isinstance(control_url, str) else None
-    return bool(parsed and parsed.scheme == "https" and parsed.netloc and not parsed.username and not parsed.password and all(isinstance(value, str) and value for value in (capability, owner_id, generation_id)))
+    secure_control = bool(
+        parsed
+        and (
+            (parsed.scheme == "https" and parsed.netloc)
+            or (parsed.scheme == "http" and parsed.netloc == "tomo.control")
+        )
+        and not parsed.username
+        and not parsed.password
+    )
+    return bool(secure_control and all(isinstance(value, str) and value for value in (capability, owner_id, generation_id)))

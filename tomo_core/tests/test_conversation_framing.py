@@ -91,6 +91,36 @@ class SegmentFrameParserTests(unittest.TestCase):
         self.assertIs(parser.plan_source, PlanSource.SYNTHESIZED)
         self.assertEqual(parser.finish(), [])
 
+    def test_accepts_standalone_markdown_fences_around_valid_jsonl(self):
+        parser = SegmentFrameParser(segment_index=0, first_segment=True, budget=budget())
+
+        records = parser.feed(
+            "```jsonl\n"
+            '{"type":"frame","text":"Direct answer."}\n'
+            "```\n"
+        )
+
+        self.assertEqual(records, [MovePlan.direct_answer(), Frame(0, 0, "Direct answer.")])
+        self.assertEqual(parser.finish(), [])
+
+    def test_ignores_bounded_non_json_preamble_before_the_first_record_only(self):
+        parser = SegmentFrameParser(segment_index=0, first_segment=True, budget=budget())
+
+        records = parser.feed(
+            "I will format the response now.\n"
+            "Here is the JSONL:\n"
+            '{"type":"frame","text":"Direct answer."}\n'
+        )
+
+        self.assertEqual(records, [MovePlan.direct_answer(), Frame(0, 0, "Direct answer.")])
+        with self.assertRaises(ConversationOutputError) as raised:
+            parser.feed("Trailing prose is still rejected.\n")
+        self.assertEqual(raised.exception.code, "invalid_json_non_record")
+
+        preamble_only = SegmentFrameParser(segment_index=0, first_segment=True, budget=budget())
+        self.assertEqual(preamble_only.feed("Here is the response:\n"), [])
+        self.assertEqual(preamble_only.finish(), [])
+
     def test_rejects_invalid_record_shapes_and_plan_ordering_with_safe_codes(self):
         cases = [
             ('{"type":"frame","text":"ok","extra":"x"}\n', "invalid_frame"),
@@ -119,8 +149,8 @@ class SegmentFrameParserTests(unittest.TestCase):
 
     def test_finish_rejects_incomplete_or_garbage_json_and_allows_empty_first_segment(self):
         cases = [
-            (False, '{"type":"frame","text":"unfinished', "invalid_json"),
-            (False, '{"type":"frame","text":"valid"} garbage', "invalid_json"),
+            (False, '{"type":"frame","text":"unfinished', "invalid_json_object"),
+            (False, '{"type":"frame","text":"valid"} garbage', "invalid_json_object"),
         ]
         for first_segment, raw, code in cases:
             with self.subTest(code=code):

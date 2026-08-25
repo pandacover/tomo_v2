@@ -1,6 +1,8 @@
 import unittest
 import json
+import os
 from io import BytesIO
+from unittest.mock import patch
 
 import httpx
 from PIL import Image
@@ -266,7 +268,7 @@ class ProviderVisionInterpreterTests(unittest.TestCase):
         class Provider:
             name = "fake"; supports_images_in = True; supports_images_out = False; supports_tool_calls = False
             def stream(self, messages, *, tools=(), actor_id=None): return iter(())
-        for result, code in ((AttachmentReadError("private detail"), "vision_unavailable"), (OSError("private detail"), "vision_unavailable"), (DownloadedAttachment(b"bad", "image/jpeg"), "unsupported_image")):
+        for result, code in ((AttachmentReadError("private detail"), "attachment_unavailable"), (OSError("private detail"), "attachment_unavailable"), (DownloadedAttachment(b"bad", "image/jpeg"), "unsupported_image")):
             with self.subTest(result=result):
                 observation = ProviderVisionInterpreter(Provider(), Reader(result)).observe(MessageAttachment("image", "id"), "q", message_id="m", attachment_index=0, actor_id="actor")
                 self.assertEqual(observation.error_code, code)
@@ -288,7 +290,7 @@ class ProviderVisionInterpreterTests(unittest.TestCase):
         request = httpx.Request("POST", "https://provider.example")
         unauthorized = httpx.HTTPStatusError("secret body", request=request, response=httpx.Response(401, request=request, text="secret body"))
         unavailable = httpx.HTTPStatusError("secret body", request=request, response=httpx.Response(500, request=request, text="secret body"))
-        for error, raises in ((unauthorized, True), (unavailable, False), (OSError("secret body"), False)):
+        for error, raises, code in ((unauthorized, True, None), (unavailable, False, "vision_provider_upstream"), (OSError("secret body"), False, "vision_provider_failure")):
             class Reader:
                 def read(self, attachment): return DownloadedAttachment(self_image, "image/jpeg")
             class Provider:
@@ -302,5 +304,19 @@ class ProviderVisionInterpreterTests(unittest.TestCase):
                 self.assertIs(caught.exception, error)
             else:
                 result = interpreter.observe(MessageAttachment("image", "id"), "q", message_id="m", attachment_index=0, actor_id="actor")
-                self.assertEqual(result.error_code, "vision_unavailable")
+                self.assertEqual(result.error_code, code)
                 self.assertNotIn("secret", str(result))
+
+    def test_debug_mode_emits_only_the_fixed_unavailable_code(self):
+        class Reader:
+            def read(self, attachment): raise AttachmentReadError("attachment_auth_failed")
+        class Provider:
+            name = "fake"; supports_images_in = True; supports_images_out = False; supports_tool_calls = False
+            def stream(self, messages, *, tools=(), actor_id=None): return iter(())
+
+        with patch.dict(os.environ, {"TOMO_VISION_DIAGNOSTICS": "1"}), patch("sys.stdout") as stdout:
+            result = ProviderVisionInterpreter(Provider(), Reader()).observe(MessageAttachment("image", "id"), "q", message_id="m", attachment_index=0, actor_id="actor")
+
+        self.assertEqual(result.error_code, "attachment_auth_failed")
+        stdout.write.assert_called_once_with("TOMO_SANDBOX_DIAGNOSTIC=attachment_auth_failed\n")
+        stdout.flush.assert_called_once_with()

@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from tomo_core.cli import _log_shared_gateway_error, build_vision_interpreter, main
+from tomo_core.cli import _log_shared_gateway_error, _sandbox_vision_provider_from_env, build_vision_interpreter, main
 from tomo_core.cron_models import CronJob, JobIntent, ScheduleSpec
 from tomo_core.cron_store import CronStore
 from tomo_core.telegram_router import RetryableTelegramUpdateError
@@ -232,6 +232,55 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         provider_factory.assert_called_once_with(token, model="grok-test-next", reasoning_effort="low")
+
+    def test_sandbox_inbound_prefers_openrouter_over_supergrok(self):
+        from tomo_core.providers import XaiApiProvider, OPENROUTER_BASE_URL, DEFAULT_OPENROUTER_AGENT_MODEL
+
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "OPENROUTER_API_KEY": "or-key",
+                    "TOMO_SUPERGROK_ACCESS_TOKEN": "should-not-use",
+                    "TOMO_INBOUND_JSON": "payload",
+                    "TOMO_CORE_DATA_DIR": "/data",
+                    "TOMO_INSTANCE_ID": "tomo-1",
+                },
+                clear=True,
+            ),
+            patch("tomo_core.cli.supergrok_oauth_provider_from_access_token") as provider_factory,
+            patch("tomo_core.cli.run_once", return_value=0) as run_once,
+            patch("sys.stdout", io.StringIO()),
+        ):
+            self.assertEqual(main(["sandbox-inbound"]), 0)
+
+        provider_factory.assert_not_called()
+        provider = run_once.call_args.kwargs["provider"]
+        self.assertIsInstance(provider, XaiApiProvider)
+        self.assertEqual(provider.api_key, "or-key")
+        self.assertEqual(provider.base_url, OPENROUTER_BASE_URL)
+        self.assertEqual(provider.model, DEFAULT_OPENROUTER_AGENT_MODEL)
+        self.assertEqual(run_once.call_args.kwargs["secret_values"], ("or-key",))
+
+    def test_sandbox_openrouter_vision_omits_xai_store_parameter(self):
+        from tomo_core.providers import OPENROUTER_BASE_URL
+
+        with patch.dict(
+            "os.environ",
+            {
+                "OPENROUTER_API_KEY": "or-key",
+                "TOMO_VISION_MODEL": "meta/muse-spark-1.2-contributor",
+                "TOMO_XAI_VISION_REASONING_EFFORT": "low",
+            },
+            clear=True,
+        ):
+            provider = _sandbox_vision_provider_from_env("or-key")
+
+        self.assertIsInstance(provider, XaiApiProvider)
+        self.assertEqual(provider.base_url, OPENROUTER_BASE_URL)
+        self.assertEqual(provider.model, "meta/muse-spark-1.2-contributor")
+        self.assertEqual(provider.reasoning_effort, "low")
+        self.assertIsNone(provider.store)
 
     def test_sandbox_health_reads_environment_payload_without_constructing_a_provider(self):
         with (

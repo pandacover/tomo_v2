@@ -114,6 +114,41 @@ def build_first_segment_repair_messages(
     return messages
 
 
+def build_structured_frame_repair_messages(
+    request: ConversationRequest,
+    context: ContextSnapshot,
+    budget: TurnBudget,
+    safe_code: str,
+    *,
+    segment_index: int,
+    plan: MovePlan | None = None,
+    prior_messages: Sequence[dict[str, object]] = (),
+) -> list[dict[str, object]]:
+    """Build the schema-enforced frame-batch fallback for missing JSONL frames."""
+    messages = build_segment_messages(
+        request,
+        context,
+        budget,
+        segment_index=segment_index,
+        plan=plan,
+        prior_messages=prior_messages,
+        tools_available=(),
+    )
+    system = messages[0]["content"]
+    if not isinstance(system, str):
+        raise ValueError("structured repair prompt requires a string system message")
+    messages[0]["content"] = (
+        f"{system}\n\n"
+        "STRUCTURED FRAME REPAIR\n"
+        f"the previous segment produced no usable frame: {safe_code}. "
+        "the response schema overrides the JSONL output contract for this repair only. "
+        "emit exactly one frame-batch object and nothing else. honor the user's requested number of separate messages within the schema limits. "
+        "if the schema includes reaction, choose one very sparsely using the normal reaction policy, otherwise use the string none. "
+        "omit turn_plan, memory_control, native tools, prose, fences, and backticks."
+    )
+    return messages
+
+
 def _first_segment_system(request: ConversationRequest, budget: TurnBudget, tool_schemas: tuple[dict[str, object], ...]) -> str:
     if isinstance(request.burst, PeerTurn):
         return _peer_first_segment_system(request, budget, tool_schemas)

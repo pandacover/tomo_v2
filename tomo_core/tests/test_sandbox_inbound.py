@@ -167,6 +167,15 @@ class SandboxInboundTests(unittest.TestCase):
         self.assertNotIn(token, stdout.getvalue())
         self.assertEqual(stdout.getvalue().count(EVENT_MARKER), 1)
 
+    def test_run_once_maps_http_402_to_provider_budget(self):
+        stdout, runtime = io.StringIO(), Mock()
+        response = httpx.Response(402, request=httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions"))
+        runtime.handle_telegram_burst_iter.side_effect = httpx.HTTPStatusError("payment required", request=response.request, response=response)
+        with patch("tomo_core.sandbox_inbound.build_runtime", return_value=runtime):
+            with self.assertRaises(SandboxInboundError) as raised:
+                run_once(io.StringIO(encode_inbound("request-1", self._burst())), stdout, config=RuntimeConfig(data_dir="/tmp/data"), provider=Mock())
+        self.assertEqual(raised.exception.code, "provider_budget")
+
     def test_failure_after_visible_frame_uses_next_sequence(self):
         stdout, runtime = io.StringIO(), Mock()
         response = httpx.Response(401, request=httpx.Request("POST", "https://api.x.ai/v1/chat/completions"))

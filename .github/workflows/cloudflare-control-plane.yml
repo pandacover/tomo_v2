@@ -1,0 +1,67 @@
+name: Cloudflare control plane
+
+on:
+  pull_request:
+    paths:
+      - "cloudflare/**"
+      - "tomo_core/src/tomo_core/cli.py"
+      - "tomo_core/src/tomo_core/providers.py"
+      - "tomo_core/src/tomo_core/sandbox_inbound.py"
+      - "tomo_core/tests/test_cli.py"
+      - "tomo_core/tests/test_sandbox_inbound.py"
+      - "tomo_core/Dockerfile.cloudflare"
+      - ".github/workflows/cloudflare-control-plane.yml"
+  push:
+    branches:
+      - main
+      - cloudflare-cutover
+    paths:
+      - "cloudflare/**"
+      - "tomo_core/src/tomo_core/cli.py"
+      - "tomo_core/src/tomo_core/providers.py"
+      - "tomo_core/src/tomo_core/sandbox_inbound.py"
+      - "tomo_core/tests/test_cli.py"
+      - "tomo_core/tests/test_sandbox_inbound.py"
+      - "tomo_core/Dockerfile.cloudflare"
+      - ".github/workflows/cloudflare-control-plane.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Guest OpenRouter and 402 tests
+        working-directory: tomo_core
+        run: |
+          pip install uv
+          uv run python -m unittest \
+            tests.test_cli.CliTests.test_sandbox_inbound_reads_environment_payload_and_uses_only_the_supergrok_access_token \
+            tests.test_cli.CliTests.test_sandbox_inbound_prefers_openrouter_over_supergrok \
+            tests.test_cli.CliTests.test_sandbox_inbound_redacts_peer_capability_as_a_secret \
+            tests.test_sandbox_inbound.SandboxInboundTests.test_run_once_maps_http_401_to_auth_expired_without_exception_text \
+            tests.test_sandbox_inbound.SandboxInboundTests.test_run_once_maps_http_402_to_provider_budget
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: cloudflare/package-lock.json
+
+      - name: Worker typecheck and HMAC contract tests
+        working-directory: cloudflare
+        run: |
+          npm ci
+          npm run types
+          npm run typecheck
+          npm test

@@ -1,0 +1,6 @@
+data: {"choices":[{"delta":{"content":"{\"type\":\"frame\",\"text\":\"First answer.\"}\n"},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{"content":"{\"type\":\"frame\",\"text\":\"Second answer.\"}\n"},"finish_reason":"stop"}]}
+
+data: [DONE]
+

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+import sys
 import warnings
 import time
 from dataclasses import dataclass
@@ -19,7 +21,30 @@ from . import latency_trace
 _MAX_SUMMARY = 2000
 _MAX_ITEM_LENGTH = 1000
 _MAX_ITEMS = 8
-_UNAVAILABLE_CODES = frozenset({"unsupported_image", "vision_unavailable", "vision_invalid_response"})
+_UNAVAILABLE_CODES = frozenset({
+    "attachment_auth_failed",
+    "attachment_http_4xx",
+    "attachment_http_5xx",
+    "attachment_http_error",
+    "attachment_invalid_mime",
+    "attachment_read_failed",
+    "attachment_source_failed",
+    "attachment_too_large",
+    "attachment_transport_failed",
+    "attachment_unavailable",
+    "unsupported_image",
+    "vision_invalid_response",
+    "vision_provider_budget",
+    "vision_provider_failure",
+    "vision_provider_http",
+    "vision_provider_rate_limited",
+    "vision_provider_stream",
+    "vision_provider_timeout",
+    "vision_provider_transport",
+    "vision_provider_upstream",
+    "vision_unavailable",
+})
+_DIAGNOSTIC_MARKER = "TOMO_SANDBOX_DIAGNOSTIC="
 
 
 def _vision_array_schema() -> Mapping[str, object]:
@@ -155,9 +180,13 @@ class ProviderVisionInterpreter:
             started_at = time.monotonic()
             downloaded = self._attachment_reader.read(attachment)
             latency_trace.emit_sandbox("sandbox_attachment_fetch", elapsed_ms=max(0, int((time.monotonic() - started_at) * 1000)), image_count=1, input_bytes=len(downloaded.data))
-        except (AttachmentReadError, OSError):
+        except AttachmentReadError as error:
             latency_trace.emit_sandbox("sandbox_attachment_fetch", outcome="error", elapsed_ms=0, image_count=1)
-            return _unavailable(message_id, attachment_index, "vision_unavailable")
+            code = str(error) if str(error) in _UNAVAILABLE_CODES else "attachment_unavailable"
+            return _unavailable(message_id, attachment_index, code)
+        except OSError:
+            latency_trace.emit_sandbox("sandbox_attachment_fetch", outcome="error", elapsed_ms=0, image_count=1)
+            return _unavailable(message_id, attachment_index, "attachment_unavailable")
         try:
             started_at = time.monotonic()
             normalized = _normalize(downloaded.data)
@@ -201,10 +230,27 @@ class ProviderVisionInterpreter:
             latency_trace.emit_sandbox("sandbox_vision_provider_attempt", outcome="error", elapsed_ms=0, image_count=1, normalized_bytes=len(normalized))
             if exc.response.status_code == 401:
                 raise
-            return _unavailable(message_id, attachment_index, "vision_unavailable")
+            if exc.response.status_code == 402:
+                code = "vision_provider_budget"
+            elif exc.response.status_code == 429:
+                code = "vision_provider_rate_limited"
+            elif exc.response.status_code >= 500:
+                code = "vision_provider_upstream"
+            else:
+                code = "vision_provider_http"
+            return _unavailable(message_id, attachment_index, code)
+        except httpx.TimeoutException:
+            latency_trace.emit_sandbox("sandbox_vision_provider_attempt", outcome="error", elapsed_ms=0, image_count=1, normalized_bytes=len(normalized))
+            return _unavailable(message_id, attachment_index, "vision_provider_timeout")
+        except httpx.HTTPError:
+            latency_trace.emit_sandbox("sandbox_vision_provider_attempt", outcome="error", elapsed_ms=0, image_count=1, normalized_bytes=len(normalized))
+            return _unavailable(message_id, attachment_index, "vision_provider_transport")
+        except ValueError:
+            latency_trace.emit_sandbox("sandbox_vision_provider_attempt", outcome="error", elapsed_ms=0, image_count=1, normalized_bytes=len(normalized))
+            return _unavailable(message_id, attachment_index, "vision_provider_stream")
         except Exception:
             latency_trace.emit_sandbox("sandbox_vision_provider_attempt", outcome="error", elapsed_ms=0, image_count=1, normalized_bytes=len(normalized))
-            return _unavailable(message_id, attachment_index, "vision_unavailable")
+            return _unavailable(message_id, attachment_index, "vision_provider_failure")
 
 
 def _normalize(data: bytes) -> bytes:
@@ -249,4 +295,7 @@ def _parse_observation(text: str, message_id: str, attachment_index: int) -> Vis
 
 
 def _unavailable(message_id: str, attachment_index: int, code: str) -> VisionObservation:
+    if os.getenv("TOMO_VISION_DIAGNOSTICS") == "1" and code in _UNAVAILABLE_CODES:
+        sys.stdout.write(f"{_DIAGNOSTIC_MARKER}{code}\n")
+        sys.stdout.flush()
     return VisionObservation(message_id, attachment_index, "unavailable", "", (), (), (), code)

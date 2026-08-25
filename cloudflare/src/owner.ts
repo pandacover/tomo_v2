@@ -1,0 +1,1140 @@
+import { DurableObject } from "cloudflare:workers";
+import { getSandbox, isPlatformTransientError } from "@cloudflare/sandbox";
+import { cancelSupersededExecution } from "./cancellation";
+import { nextIntervalAt, parseCronSchedule, type CronScheduleInput } from "./cron-policy";
+import type { Env } from "./env";
+import { hexKey, logOps } from "./env";
+import { CRON_OPS, issueAttachment, issueCron, sha256Hex } from "./hmac";
+import { IMAGE_REVISION_PATH, imageRevisionMatches, observedImageRevision } from "./provenance";
+import { CONTAINER_RETRY_ATTEMPTS, CONTAINER_RETRY_BASE_MS, retryableSandbox, sandboxFailureCode } from "./sandbox-policy";
+import {
+  encodeAutomation,
+  encodeInbound,
+  consumeLogSnapshot,
+  envelopeFromCompact,
+  parseDiagnosticLine,
+  parseEventLine,
+  requestIdFor,
+  type InboundBurst,
+} from "./protocol";
+import { TelegramApi, type CompactUpdate } from "./telegram";
+
+const DATA_DIR = "/workspace/tomo-data";
+const COMMAND = "/opt/tomo/.venv/bin/tomo-core sandbox-inbound";
+const DEBOUNCE_MS = 700;
+const PACE_MS = 1500;
+const PROCESS_POLL_MS = 2000;
+const PROCESS_POLL_RETRY_MS = 5000;
+const MAX_PROCESS_POLL_FAILURES = 5;
+const BUDGET_LINE = "I cannot think right now. Model budget hit. Try later.";
+
+type SqlRow = Record<string, string | number | null>;
+
+export class OwnerDO extends DurableObject<Env> {
+  private ready: Promise<void>;
+  private running = false;
+  private abort: AbortController | null = null;
+  private liveSandbox: SandboxHandle | null = null;
+  private cancelling: Promise<void> | null = null;
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    this.ready = this.ctx.blockConcurrencyWhile(async () => this.init());
+  }
+
+  private sql(query: string, ...binds: (string | number | null)[]): SqlRow[] {
+    return this.ctx.storage.sql.exec(query, ...binds).toArray() as SqlRow[];
+  }
+
+  private one(query: string, ...binds: (string | number | null)[]): SqlRow | null {
+    return this.sql(query, ...binds)[0] ?? null;
+  }
+
+  private init(): void {
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS inbox (
+        update_id INTEGER PRIMARY KEY,
+        chat_id TEXT NOT NULL,
+        actor_id TEXT NOT NULL,
+        message_id TEXT,
+        payload TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS chat_turn (
+        chat_id TEXT PRIMARY KEY,
+        actor_id TEXT NOT NULL,
+        burst_id TEXT,
+        revision INTEGER NOT NULL DEFAULT 0,
+        active_generation_id TEXT,
+        quiet_until INTEGER
+      );
+      CREATE TABLE IF NOT EXISTS generations (
+        generation_id TEXT PRIMARY KEY,
+        burst_id TEXT NOT NULL,
+        revision INTEGER NOT NULL,
+        chat_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        status TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        error_class TEXT,
+        process_id TEXT,
+        stdout_offset INTEGER NOT NULL DEFAULT 0,
+        stdout_carry TEXT NOT NULL DEFAULT '',
+        poll_at INTEGER,
+        deadline_at INTEGER,
+        diagnostic_codes TEXT NOT NULL DEFAULT '[]',
+        stderr_present INTEGER NOT NULL DEFAULT 0,
+        poll_failures INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS deliveries (
+        generation_id TEXT NOT NULL,
+        sequence INTEGER NOT NULL,
+        text TEXT NOT NULL,
+        reply_to TEXT,
+        status TEXT NOT NULL,
+        telegram_message_id TEXT,
+        PRIMARY KEY (generation_id, sequence)
+      );
+      CREATE TABLE IF NOT EXISTS cron_jobs (
+        job_id TEXT PRIMARY KEY,
+        destination TEXT NOT NULL,
+        intent TEXT NOT NULL,
+        constraints TEXT NOT NULL,
+        schedule_kind TEXT NOT NULL,
+        schedule_at INTEGER,
+        schedule_every REAL,
+        status TEXT NOT NULL,
+        revision INTEGER NOT NULL,
+        successful_runs INTEGER NOT NULL DEFAULT 0,
+        idempotency_key TEXT UNIQUE
+      );
+      CREATE TABLE IF NOT EXISTS cron_runs (
+        run_id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL,
+        generation_id TEXT NOT NULL UNIQUE,
+        scheduled_at INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        completed_at INTEGER,
+        error_class TEXT
+      );
+      CREATE TABLE IF NOT EXISTS cron_receipts (
+        idempotency_key TEXT PRIMARY KEY,
+        request_hash TEXT NOT NULL,
+        response TEXT NOT NULL
+      );
+    `);
+    this.ensureGenerationColumn("process_id", "process_id TEXT");
+    this.ensureGenerationColumn("stdout_offset", "stdout_offset INTEGER NOT NULL DEFAULT 0");
+    this.ensureGenerationColumn("stdout_carry", "stdout_carry TEXT NOT NULL DEFAULT ''");
+    this.ensureGenerationColumn("poll_at", "poll_at INTEGER");
+    this.ensureGenerationColumn("deadline_at", "deadline_at INTEGER");
+    this.ensureGenerationColumn("diagnostic_codes", "diagnostic_codes TEXT NOT NULL DEFAULT '[]'");
+    this.ensureGenerationColumn("stderr_present", "stderr_present INTEGER NOT NULL DEFAULT 0");
+    this.ensureGenerationColumn("poll_failures", "poll_failures INTEGER NOT NULL DEFAULT 0");
+    this.ensureCronColumn("ends_at", "ends_at INTEGER");
+    this.ensureCronColumn("max_successful_runs", "max_successful_runs INTEGER");
+  }
+
+  private ensureGenerationColumn(name: string, definition: string): void {
+    const columns = new Set(this.sql("PRAGMA table_info(generations)").map((row) => String(row.name)));
+    if (!columns.has(name)) this.ctx.storage.sql.exec(`ALTER TABLE generations ADD COLUMN ${definition}`);
+  }
+
+  private ensureCronColumn(name: string, definition: string): void {
+    const columns = new Set(this.sql("PRAGMA table_info(cron_jobs)").map((row) => String(row.name)));
+    if (!columns.has(name)) this.ctx.storage.sql.exec(`ALTER TABLE cron_jobs ADD COLUMN ${definition}`);
+  }
+
+  private tomoId(): string {
+    return this.ctx.id.name || "tomo-unknown";
+  }
+
+  private origin(): string {
+    return String(this.one("SELECT v FROM meta WHERE k = 'origin'")?.v || "");
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    await this.ready;
+    const url = new URL(request.url);
+    if (request.method === "POST" && url.pathname === "/inbox") {
+      const body = (await request.json()) as { compact: CompactUpdate; origin: string };
+      this.ctx.storage.sql.exec(
+        "INSERT INTO meta(k, v) VALUES ('origin', ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+        body.origin,
+      );
+      return await this.enqueue(body.compact);
+    }
+    if (url.pathname.startsWith("/v1/cron/")) return this.cron(request, url);
+    return Response.json({ error: "not found" }, { status: 404 });
+  }
+
+  async alarm(): Promise<void> {
+    await this.ready;
+    this.ctx.waitUntil(this.handleAlarm());
+  }
+
+  private async handleAlarm(): Promise<void> {
+    const cancellation = this.cancelling;
+    if (cancellation) {
+      await cancellation;
+      if (this.cancelling === cancellation) this.cancelling = null;
+    }
+    if (this.running) {
+      await this.scheduleWake();
+      return;
+    }
+    const dueCron = this.one(
+      "SELECT * FROM cron_jobs WHERE status = 'active' AND schedule_at IS NOT NULL AND schedule_at <= ? ORDER BY schedule_at LIMIT 1",
+      Date.now(),
+    );
+    const turn = this.one(
+      "SELECT * FROM chat_turn WHERE burst_id IS NOT NULL AND active_generation_id IS NULL AND quiet_until IS NOT NULL AND quiet_until <= ?",
+      Date.now(),
+    );
+    const generation = this.one(
+      "SELECT * FROM generations WHERE status = 'active' AND poll_at IS NOT NULL AND poll_at <= ? ORDER BY poll_at LIMIT 1",
+      Date.now(),
+    );
+    logOps({
+      event: "owner_alarm",
+      tomo_id: this.tomoId(),
+      generation: generation ? 1 : 0,
+      cron: dueCron ? 1 : 0,
+      turn: turn ? 1 : 0,
+    });
+    try {
+      if (generation) await this.pollGeneration(generation);
+      else if (dueCron) await this.runCron(dueCron);
+      else if (turn) await this.runInteractive(String(turn.chat_id));
+    } catch (error) {
+      logOps({
+        event: "owner_alarm_failed",
+        tomo_id: this.tomoId(),
+        error_class: error instanceof Error ? error.name : "Error",
+      });
+    }
+    await this.scheduleWake();
+  }
+
+  private async scheduleWake(): Promise<void> {
+    const quiet = this.one(
+      "SELECT MIN(quiet_until) AS next FROM chat_turn WHERE burst_id IS NOT NULL AND active_generation_id IS NULL AND quiet_until IS NOT NULL",
+    );
+    const cron = this.one(
+      "SELECT MIN(schedule_at) AS next FROM cron_jobs WHERE status = 'active' AND schedule_at IS NOT NULL",
+    );
+    const generation = this.one(
+      "SELECT MIN(poll_at) AS next FROM generations WHERE status = 'active' AND poll_at IS NOT NULL",
+    );
+    const candidates = [quiet?.next, cron?.next, generation?.next].filter((value): value is number => typeof value === "number");
+    if (candidates.length === 0) {
+      await this.ctx.storage.deleteAlarm();
+      return;
+    }
+    await this.ctx.storage.setAlarm(Math.min(...candidates));
+  }
+
+  private async enqueue(compact: CompactUpdate): Promise<Response> {
+    if (this.one("SELECT 1 AS ok FROM inbox WHERE update_id = ?", compact.updateId)) {
+      return Response.json({ ok: true, duplicate: true });
+    }
+    this.ctx.storage.sql.exec(
+      "INSERT INTO inbox(update_id, chat_id, actor_id, message_id, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      compact.updateId,
+      compact.chatId,
+      compact.actorId,
+      compact.messageId,
+      JSON.stringify(compact),
+      Date.now(),
+    );
+    const turn = this.one("SELECT * FROM chat_turn WHERE chat_id = ?", compact.chatId);
+    const now = Date.now();
+    if (turn?.active_generation_id) {
+      const supersededGenerationId = String(turn.active_generation_id);
+      this.ctx.storage.sql.exec(
+        "UPDATE generations SET status = 'superseded' WHERE generation_id = ? AND status = 'active'",
+        supersededGenerationId,
+      );
+      const sandbox = this.liveSandbox ?? this.sandbox();
+      const cancellation = cancelSupersededExecution(this.abort, sandbox).then((result) => {
+        logOps({
+          event: "generation_cancelled",
+          tomo_id: this.tomoId(),
+          generation_id: supersededGenerationId,
+          result,
+        });
+      });
+      this.cancelling = cancellation;
+      this.ctx.waitUntil(cancellation);
+    }
+    const burstId = turn?.burst_id ? String(turn.burst_id) : `${compact.chatId}:${compact.updateId}`;
+    const revision = Number(turn?.revision || 0) + 1;
+    this.ctx.storage.sql.exec(
+      `INSERT INTO chat_turn(chat_id, actor_id, burst_id, revision, active_generation_id, quiet_until)
+       VALUES (?, ?, ?, ?, NULL, ?)
+       ON CONFLICT(chat_id) DO UPDATE SET
+         actor_id=excluded.actor_id,
+         burst_id=excluded.burst_id,
+         revision=excluded.revision,
+         active_generation_id=NULL,
+         quiet_until=excluded.quiet_until`,
+      compact.chatId,
+      compact.actorId,
+      burstId,
+      revision,
+      now + DEBOUNCE_MS,
+    );
+    await this.ctx.storage.setAlarm(now + DEBOUNCE_MS);
+    this.ctx.waitUntil(new TelegramApi(this.env.TELEGRAM_BOT_TOKEN).sendTyping(compact.chatId));
+    logOps({ event: "inbox_enqueued", tomo_id: this.tomoId(), update_id: compact.updateId });
+    return Response.json({ ok: true });
+  }
+
+  private messagesForBurst(burstId: string, chatId: string): CompactUpdate[] {
+    const firstUpdate = Number(burstId.split(":").pop());
+    const rows = this.sql(
+      "SELECT payload FROM inbox WHERE chat_id = ? AND update_id >= ? ORDER BY update_id",
+      chatId,
+      Number.isFinite(firstUpdate) ? firstUpdate : 0,
+    );
+    return rows.map((row) => JSON.parse(String(row.payload)) as CompactUpdate);
+  }
+
+  private async runInteractive(chatId: string): Promise<void> {
+    const turn = this.one("SELECT * FROM chat_turn WHERE chat_id = ?", chatId);
+    if (!turn?.burst_id || turn.active_generation_id || this.one("SELECT 1 AS ok FROM generations WHERE status = 'active' LIMIT 1")) return;
+    const burstId = String(turn.burst_id);
+    const revision = Number(turn.revision);
+    const generationId = `${burstId}:r${revision}`;
+    this.ctx.storage.sql.exec(
+      "INSERT INTO generations(generation_id, burst_id, revision, chat_id, kind, status, created_at) VALUES (?, ?, ?, ?, 'interactive', 'active', ?)",
+      generationId,
+      burstId,
+      revision,
+      chatId,
+      Date.now(),
+    );
+    this.ctx.storage.sql.exec("UPDATE chat_turn SET active_generation_id = ? WHERE chat_id = ?", generationId, chatId);
+    const messages = this.messagesForBurst(burstId, chatId);
+    if (messages.length === 0) {
+      this.finishGeneration(generationId, chatId, "failed", "empty_burst");
+      return;
+    }
+    const visible = this.sql(
+      "SELECT text FROM deliveries WHERE status IN ('sent', 'unknown') AND generation_id IN (SELECT generation_id FROM generations WHERE burst_id = ?) ORDER BY generation_id, sequence",
+      burstId,
+    ).map((row) => String(row.text));
+    const burst: InboundBurst = {
+      burst_id: burstId,
+      generation_id: generationId,
+      revision,
+      visible_assistant_utterances: visible,
+      accepted_generation_ids: [],
+      messages: messages.map((item, index) => ({
+        ordinal: index + 1,
+        update_id: item.updateId,
+        envelope: envelopeFromCompact(item, this.tomoId()),
+      })),
+    };
+    const requestId = requestIdFor(generationId);
+    const last = messages[messages.length - 1];
+    await this.execute(generationId, chatId, last.actorId, requestId, {
+      TOMO_INBOUND_JSON: encodeInbound(requestId, burst),
+    }, { interactive: true, images: messages.flatMap((item) => item.photoFileId ? [item.photoFileId] : []) });
+  }
+
+  private async runCron(job: SqlRow): Promise<void> {
+    const turn = this.one("SELECT * FROM chat_turn LIMIT 1");
+    if (!turn) return;
+    if (turn.active_generation_id || this.one("SELECT 1 AS ok FROM generations WHERE status = 'active' LIMIT 1")) return;
+    const chatId = String(turn.chat_id);
+    const actorId = String(turn.actor_id);
+    const destination = String(job.destination);
+    const boundChat = destination.startsWith("telegram:") ? destination.slice("telegram:".length) : chatId;
+    const revision = Number(turn.revision) + 1;
+    const scheduledAt = Number(job.schedule_at) || Date.now();
+    const generationId = `cron:${job.job_id}:${scheduledAt}`;
+    const runId = `run:${generationId}`;
+    this.ctx.storage.sql.exec("UPDATE chat_turn SET revision = ?, active_generation_id = ? WHERE chat_id = ?", revision, generationId, boundChat);
+    this.ctx.storage.sql.exec(
+      "INSERT INTO generations(generation_id, burst_id, revision, chat_id, kind, status, created_at) VALUES (?, ?, ?, ?, 'automation', 'active', ?)",
+      generationId,
+      `cron:${job.job_id}`,
+      revision,
+      boundChat,
+      Date.now(),
+    );
+    this.ctx.storage.sql.exec(
+      "INSERT INTO cron_runs(run_id, job_id, generation_id, scheduled_at, status) VALUES (?, ?, ?, ?, 'running')",
+      runId,
+      String(job.job_id),
+      generationId,
+      scheduledAt,
+    );
+    const scheduled = new Date(scheduledAt).toISOString();
+    const turnPayload = {
+      generation_id: generationId,
+      revision,
+      job_id: String(job.job_id),
+      run_id: runId,
+      actor_id: actorId,
+      chat_id: boundChat,
+      intent: String(job.intent),
+      scheduled_for: scheduled,
+      previous_outcome: null,
+      trigger: "schedule",
+      will_end_after_run: job.schedule_kind === "once" || job.schedule_every == null ||
+        (job.max_successful_runs != null && Number(job.successful_runs || 0) + 1 >= Number(job.max_successful_runs)),
+      connector: "telegram",
+      constraints: JSON.parse(String(job.constraints || "[]")),
+      successful_runs: Number(job.successful_runs || 0),
+      facts: [],
+    };
+    const requestId = requestIdFor(generationId);
+    await this.execute(generationId, boundChat, actorId, requestId, {
+      TOMO_AUTOMATION_JSON: encodeAutomation(requestId, turnPayload),
+    }, { interactive: false, images: [] });
+  }
+
+  private generationActive(generationId: string): boolean {
+    return this.one("SELECT 1 AS ok FROM generations WHERE generation_id = ? AND status = 'active'", generationId) !== null;
+  }
+
+  private finishGeneration(generationId: string, chatId: string, status: string, errorClass: string | null): void {
+    this.ctx.storage.sql.exec(
+      "UPDATE generations SET status = ?, error_class = ? WHERE generation_id = ? AND status = 'active'",
+      status,
+      errorClass,
+      generationId,
+    );
+    this.ctx.storage.sql.exec(
+      "UPDATE chat_turn SET active_generation_id = NULL, burst_id = CASE WHEN burst_id IS NOT NULL THEN NULL ELSE burst_id END WHERE chat_id = ? AND active_generation_id = ?",
+      chatId,
+      generationId,
+    );
+  }
+
+  private async execute(
+    generationId: string,
+    chatId: string,
+    actorId: string,
+    requestId: string,
+    extraEnv: Record<string, string>,
+    options: { interactive: boolean; images: string[] },
+  ): Promise<void> {
+    const started = Date.now();
+    const timeout = 240_000 + Math.min(options.images.length, 8) * 75_000;
+    this.running = true;
+    const abort = new AbortController();
+    this.abort = abort;
+    const telegram = new TelegramApi(this.env.TELEGRAM_BOT_TOKEN);
+    const typing = this.keepTyping(chatId, abort.signal, telegram);
+    let sandbox = this.sandbox();
+    this.liveSandbox = sandbox;
+    let errorClass: string | null = null;
+    let processStarted = false;
+    this.ctx.storage.sql.exec(
+      `UPDATE generations
+       SET process_id = ?, stdout_offset = 0, stdout_carry = '', poll_at = ?, deadline_at = ?,
+           diagnostic_codes = '[]', stderr_present = 0, poll_failures = 0
+       WHERE generation_id = ? AND status = 'active'`,
+      requestId,
+      started + PROCESS_POLL_MS,
+      started + timeout + 300_000,
+      generationId,
+    );
+    await this.ctx.storage.setAlarm(started + PROCESS_POLL_MS);
+    try {
+      if (!this.env.OPENROUTER_API_KEY) {
+        throw new Error("missing_openrouter_key");
+      }
+      logOps({ event: "exec_start", tomo_id: this.tomoId(), generation_id: generationId });
+      const prepareStarted = Date.now();
+      sandbox = await this.prepareGuest(sandbox);
+      this.liveSandbox = sandbox;
+      logOps({ event: "guest_ready", tomo_id: this.tomoId(), generation_id: generationId, duration_ms: Date.now() - prepareStarted });
+      const env = await this.guestEnv(generationId, chatId, actorId, extraEnv, options);
+      await sandbox.setKeepAlive(true);
+      const process = await this.withContainerRetry(() =>
+        sandbox.startProcess(COMMAND, {
+          env: { PYTHONUNBUFFERED: "1", ...env },
+          timeout,
+          processId: requestId,
+          autoCleanup: false,
+        }),
+      );
+      processStarted = true;
+      if (!this.generationActive(generationId)) return;
+      this.ctx.storage.sql.exec(
+        "UPDATE generations SET process_id = ?, poll_at = ?, deadline_at = ? WHERE generation_id = ? AND status = 'active'",
+        process.id,
+        Date.now() + PROCESS_POLL_MS,
+        Date.now() + timeout,
+        generationId,
+      );
+      logOps({
+        event: "exec_process_started",
+        tomo_id: this.tomoId(),
+        generation_id: generationId,
+        process_id: process.id,
+      });
+    } catch (error) {
+      if (abort.signal.aborted && !this.generationActive(generationId)) {
+        logOps({ event: "exec_cancelled", tomo_id: this.tomoId(), generation_id: generationId });
+      } else {
+        errorClass = sandboxFailureCode(error, isPlatformTransientError);
+        logOps({
+          event: "exec_failed",
+          tomo_id: this.tomoId(),
+          generation_id: generationId,
+          error_class: errorClass,
+        });
+      }
+    } finally {
+      abort.abort();
+      await typing.catch(() => undefined);
+      this.running = false;
+      this.abort = null;
+      this.liveSandbox = null;
+      if (!processStarted) {
+        if (this.generationActive(generationId)) {
+          await this.settleGeneration(generationId, chatId, errorClass || "sandbox_start_failed", sandbox);
+        } else {
+          await sandbox.destroy().catch(() => undefined);
+        }
+      }
+    }
+  }
+
+  private async pollGeneration(generation: SqlRow): Promise<void> {
+    const generationId = String(generation.generation_id);
+    const chatId = String(generation.chat_id);
+    const processId = String(generation.process_id || requestIdFor(generationId));
+    const sandbox = this.sandbox();
+    this.running = true;
+    this.liveSandbox = sandbox;
+    try {
+      if (!this.generationActive(generationId)) return;
+      const process = await this.withContainerRetry(() => sandbox.getProcess(processId));
+      if (!process) {
+        await this.settleGeneration(generationId, chatId, "sandbox_process_missing", sandbox);
+        return;
+      }
+      const status = await process.getStatus();
+      const logs = await process.getLogs();
+      if (!this.generationActive(generationId)) return;
+      let cursor = consumeLogSnapshot(
+        logs.stdout,
+        Number(generation.stdout_offset || 0),
+        String(generation.stdout_carry || ""),
+      );
+      const diagnosticCodes = stringSet(generation.diagnostic_codes);
+      const telegram = new TelegramApi(this.env.TELEGRAM_BOT_TOKEN);
+      const messages = String(generation.kind) === "interactive"
+        ? this.messagesForBurst(String(generation.burst_id), chatId)
+        : [];
+      const last = messages.length ? messages[messages.length - 1] : null;
+      let firstFrame = this.one("SELECT 1 AS ok FROM deliveries WHERE generation_id = ? LIMIT 1", generationId) === null;
+      let errorClass = generation.error_class ? String(generation.error_class) : null;
+      let flag = await this.handleLines(
+        cursor.lines,
+        generationId,
+        chatId,
+        requestIdFor(generationId),
+        telegram,
+        last,
+        firstFrame,
+        diagnosticCodes,
+      );
+      firstFrame = flag.firstFrame;
+      if (flag.errorClass) errorClass = flag.errorClass;
+      const terminal = status !== "starting" && status !== "running";
+      if (terminal && cursor.carry.trim()) {
+        flag = await this.handleLines(
+          [cursor.carry],
+          generationId,
+          chatId,
+          requestIdFor(generationId),
+          telegram,
+          last,
+          firstFrame,
+          diagnosticCodes,
+        );
+        if (flag.errorClass) errorClass = flag.errorClass;
+        cursor = { ...cursor, carry: "" };
+      }
+      this.ctx.storage.sql.exec(
+        `UPDATE generations
+         SET stdout_offset = ?, stdout_carry = ?, diagnostic_codes = ?, stderr_present = ?,
+             error_class = ?, poll_failures = 0
+         WHERE generation_id = ? AND status = 'active'`,
+        cursor.offset,
+        cursor.carry,
+        JSON.stringify([...diagnosticCodes]),
+        logs.stderr ? 1 : Number(generation.stderr_present || 0),
+        errorClass,
+        generationId,
+      );
+      if (!this.generationActive(generationId)) return;
+      if (terminal) {
+        const refreshed = await sandbox.getProcess(processId);
+        const exitCode = refreshed?.exitCode ?? (status === "completed" ? 0 : 1);
+        if (exitCode !== 0 && !errorClass) {
+          errorClass = exitCode === 124 ? "sandbox_timeout" : `sandbox_exit_${exitCode}`;
+        }
+        logOps({
+          event: "exec_result",
+          tomo_id: this.tomoId(),
+          generation_id: generationId,
+          exit_code: exitCode,
+          error_class: errorClass,
+          stderr_present: logs.stderr ? 1 : Number(generation.stderr_present || 0),
+        });
+        await this.settleGeneration(generationId, chatId, errorClass, sandbox);
+        return;
+      }
+      if (typeof generation.deadline_at === "number" && Date.now() >= generation.deadline_at) {
+        await process.kill().catch(() => undefined);
+        await this.settleGeneration(generationId, chatId, "sandbox_timeout", sandbox);
+        return;
+      }
+      this.ctx.storage.sql.exec(
+        "UPDATE generations SET poll_at = ? WHERE generation_id = ? AND status = 'active'",
+        Date.now() + PROCESS_POLL_MS,
+        generationId,
+      );
+      await telegram.sendTyping(chatId);
+    } catch (error) {
+      if (!this.generationActive(generationId)) return;
+      const failures = Number(generation.poll_failures || 0) + 1;
+      logOps({
+        event: "exec_poll_failed",
+        tomo_id: this.tomoId(),
+        generation_id: generationId,
+        error_class: sandboxFailureCode(error, isPlatformTransientError),
+        attempt: failures,
+      });
+      if (failures >= MAX_PROCESS_POLL_FAILURES) {
+        await this.settleGeneration(generationId, chatId, "sandbox_poll_failed", sandbox);
+      } else {
+        this.ctx.storage.sql.exec(
+          "UPDATE generations SET poll_failures = ?, poll_at = ? WHERE generation_id = ? AND status = 'active'",
+          failures,
+          Date.now() + PROCESS_POLL_RETRY_MS,
+          generationId,
+        );
+      }
+    } finally {
+      this.running = false;
+      this.liveSandbox = null;
+    }
+  }
+
+  private async settleGeneration(
+    generationId: string,
+    chatId: string,
+    errorClass: string | null,
+    sandbox: SandboxHandle,
+  ): Promise<void> {
+    if (this.generationActive(generationId) && !errorClass) {
+      try {
+        await this.checkpoint(sandbox);
+      } catch {
+        errorClass = "sandbox_checkpoint_failed";
+      }
+    }
+    await sandbox.setKeepAlive(false).catch(() => undefined);
+    if (errorClass || !this.generationActive(generationId)) {
+      await sandbox.destroy().catch(() => undefined);
+    }
+    const delivered = this.one(
+      "SELECT 1 AS ok FROM deliveries WHERE generation_id = ? AND status = 'sent'",
+      generationId,
+    );
+    const generation = this.one("SELECT kind, burst_id FROM generations WHERE generation_id = ?", generationId);
+    if (this.generationActive(generationId) && generation?.kind === "automation") {
+      this.settleCronRun(generationId, errorClass, delivered !== null);
+    }
+    if (this.generationActive(generationId) && generation?.kind !== "peer" && errorClass && errorClass !== "provider_budget" && !delivered) {
+      await new TelegramApi(this.env.TELEGRAM_BOT_TOKEN).sendMessage(
+        chatId,
+        `I couldn't finish that turn (${errorClass}). Try again.`,
+      );
+    }
+    const status = this.generationActive(generationId) ? (errorClass ? "failed" : "completed") : "superseded";
+    if (this.generationActive(generationId)) this.finishGeneration(generationId, chatId, status, errorClass);
+    const createdAt = Number(this.one("SELECT created_at FROM generations WHERE generation_id = ?", generationId)?.created_at || Date.now());
+    logOps({
+      event: "generation_done",
+      tomo_id: this.tomoId(),
+      generation_id: generationId,
+      duration_ms: Math.max(0, Date.now() - createdAt),
+      error_class: errorClass,
+    });
+  }
+
+  private settleCronRun(generationId: string, errorClass: string | null, delivered: boolean): void {
+    const run = this.one("SELECT * FROM cron_runs WHERE generation_id = ? AND status = 'running'", generationId);
+    if (!run) return;
+    const job = this.one("SELECT * FROM cron_jobs WHERE job_id = ?", String(run.job_id));
+    if (!job) return;
+    const successful = !errorClass || delivered;
+    this.ctx.storage.sql.exec(
+      "UPDATE cron_runs SET status = ?, completed_at = ?, error_class = ? WHERE run_id = ? AND status = 'running'",
+      successful ? "completed" : "failed",
+      Date.now(),
+      errorClass,
+      String(run.run_id),
+    );
+    if (!successful) {
+      this.ctx.storage.sql.exec("UPDATE cron_jobs SET schedule_at = ? WHERE job_id = ? AND status = 'active'", Date.now() + 60_000, String(job.job_id));
+      return;
+    }
+    const successes = Number(job.successful_runs || 0) + 1;
+    const lifecycleEnded =
+      (job.max_successful_runs != null && successes >= Number(job.max_successful_runs)) ||
+      (job.ends_at != null && Date.now() >= Number(job.ends_at));
+    if (job.schedule_every != null && !lifecycleEnded) {
+      this.ctx.storage.sql.exec(
+        "UPDATE cron_jobs SET schedule_at = ?, successful_runs = ? WHERE job_id = ?",
+        nextIntervalAt(Number(run.scheduled_at), Number(job.schedule_every)),
+        successes,
+        String(job.job_id),
+      );
+    } else {
+      this.ctx.storage.sql.exec(
+        "UPDATE cron_jobs SET status = 'ended', successful_runs = ?, schedule_at = NULL WHERE job_id = ?",
+        successes,
+        String(job.job_id),
+      );
+    }
+  }
+
+  private async handleLines(
+    lines: string[],
+    generationId: string,
+    chatId: string,
+    requestId: string,
+    telegram: TelegramApi,
+    last: CompactUpdate | null,
+    firstFrame: boolean,
+    diagnosticCodes: Set<string>,
+  ): Promise<{ firstFrame: boolean; errorClass: string | null }> {
+    let errorClass: string | null = null;
+    for (const line of lines) {
+      const diagnostic = parseDiagnosticLine(line);
+      if (diagnostic) {
+        if (!diagnosticCodes.has(diagnostic) && this.generationActive(generationId)) {
+          diagnosticCodes.add(diagnostic);
+          logOps({ event: "vision_diagnostic", tomo_id: this.tomoId(), generation_id: generationId, code: diagnostic });
+          await telegram.sendMessage(chatId, `Vision diagnostic: ${diagnostic}`);
+        }
+        continue;
+      }
+      let event;
+      try {
+        event = parseEventLine(line, requestId, generationId);
+      } catch {
+        continue;
+      }
+      if (!event) continue;
+      if (!this.generationActive(generationId)) continue;
+      if (event.type === "error") {
+        errorClass = event.code;
+        if (event.code === "provider_budget") {
+          const delivered = this.one(
+            "SELECT 1 AS ok FROM deliveries WHERE generation_id = ? AND status = 'sent'",
+            generationId,
+          );
+          if (!delivered) await telegram.sendMessage(chatId, BUDGET_LINE);
+        }
+        continue;
+      }
+      if (event.type === "stale") {
+        errorClass = "stale";
+        continue;
+      }
+      if (event.type === "reaction") {
+        if (!last?.messageId || event.target_message_id !== last.messageId) {
+          logOps({
+            event: "telegram_reaction_suppressed",
+            tomo_id: this.tomoId(),
+            generation_id: generationId,
+            code: "target_mismatch",
+          });
+          continue;
+        }
+        const reaction = await telegram.react(chatId, event.target_message_id, event.emoji);
+        logOps({
+          event: reaction.ok ? "telegram_reaction_sent" : "telegram_reaction_failed",
+          tomo_id: this.tomoId(),
+          generation_id: generationId,
+          code: reaction.ok ? undefined : reaction.code,
+        });
+        continue;
+      }
+      if (event.type === "frame") {
+        if (this.one("SELECT 1 AS ok FROM deliveries WHERE generation_id = ? AND sequence = ?", generationId, event.sequence)) {
+          continue;
+        }
+        this.ctx.storage.sql.exec(
+          "INSERT INTO deliveries(generation_id, sequence, text, reply_to, status) VALUES (?, ?, ?, ?, 'reserved')",
+          generationId,
+          event.sequence,
+          event.text,
+          firstFrame && last?.messageId ? last.messageId : null,
+        );
+        if (!this.generationActive(generationId)) {
+          this.ctx.storage.sql.exec(
+            "UPDATE deliveries SET status = 'suppressed' WHERE generation_id = ? AND sequence = ?",
+            generationId,
+            event.sequence,
+          );
+          continue;
+        }
+        if (!firstFrame) await new Promise((resolve) => setTimeout(resolve, PACE_MS));
+        const send = await telegram.sendMessage(chatId, event.text, firstFrame ? last?.messageId : null);
+        if ("messageId" in send) {
+          this.ctx.storage.sql.exec(
+            "UPDATE deliveries SET status = 'sent', telegram_message_id = ? WHERE generation_id = ? AND sequence = ?",
+            send.messageId,
+            generationId,
+            event.sequence,
+          );
+        } else {
+          this.ctx.storage.sql.exec(
+            "UPDATE deliveries SET status = 'unknown' WHERE generation_id = ? AND sequence = ?",
+            generationId,
+            event.sequence,
+          );
+        }
+        firstFrame = false;
+      }
+    }
+    return { firstFrame, errorClass };
+  }
+
+  private async keepTyping(chatId: string, signal: AbortSignal, telegram: TelegramApi): Promise<void> {
+    while (!signal.aborted) {
+      await telegram.sendTyping(chatId);
+      await new Promise<void>((resolve) => {
+        if (signal.aborted) {
+          resolve();
+          return;
+        }
+        const timer = setTimeout(resolve, 4000);
+        signal.addEventListener(
+          "abort",
+          () => {
+            clearTimeout(timer);
+            resolve();
+          },
+          { once: true },
+        );
+      });
+    }
+  }
+
+  private async guestEnv(
+    generationId: string,
+    chatId: string,
+    actorId: string,
+    extra: Record<string, string>,
+    options: { interactive: boolean; images: string[] },
+  ): Promise<Record<string, string>> {
+    const now = Math.floor(Date.now() / 1000);
+    const origin = this.origin();
+    const env: Record<string, string> = {
+      TOMO_CORE_DATA_DIR: DATA_DIR,
+      TOMO_INSTANCE_ID: this.tomoId(),
+      TOMO_CORE_SOUL: "/opt/tomo/SOUL.md",
+      OPENROUTER_API_KEY: this.env.OPENROUTER_API_KEY,
+      TOMO_AGENT_MODEL: this.env.TOMO_AGENT_MODEL,
+      TOMO_VISION_MODEL: this.env.TOMO_VISION_MODEL,
+      TOMO_VISION_DIAGNOSTICS: "1",
+      ...extra,
+    };
+    if (options.interactive) {
+      if (origin.startsWith("https://")) {
+        const cronKey = hexKey(this.env.CRON_CAPABILITY_KEY);
+        env.TOMO_CRON_CONTROL_URL = origin;
+        env.TOMO_CRON_CAPABILITY = await issueCron(cronKey, {
+          owner_id: this.tomoId(),
+          actor_id: actorId,
+          destination: `telegram:${chatId}`,
+          session_id: `telegram:actor:${actorId}`,
+          issued_at: now,
+          expires_at: now + 300,
+          operations: CRON_OPS,
+        });
+        env.TOMO_CRON_OWNER_ID = this.tomoId();
+        env.TOMO_CRON_ACTOR_ID = actorId;
+        env.TOMO_CRON_DESTINATION = `telegram:${chatId}`;
+        env.TOMO_CRON_SESSION_ID = `telegram:actor:${actorId}`;
+      }
+      if (options.images.length > 0) {
+        const hashes = [];
+        for (const fileId of options.images.slice(0, 8)) hashes.push(await sha256Hex(fileId));
+        env.TOMO_ATTACHMENT_CONTROL_URL = "http://tomo.control";
+        env.TOMO_ATTACHMENT_CAPABILITY = await issueAttachment(hexKey(this.env.ATTACHMENT_CAPABILITY_KEY), {
+          owner_id: this.tomoId(),
+          generation_id: generationId,
+          file_hashes: hashes,
+          issued_at: now,
+          expires_at: now + 300,
+        });
+        env.TOMO_ATTACHMENT_OWNER_ID = this.tomoId();
+        env.TOMO_ATTACHMENT_GENERATION_ID = generationId;
+      }
+    }
+    return env;
+  }
+
+  private async prepareGuest(sandbox: SandboxHandle): Promise<SandboxHandle> {
+    const expected = this.env.TOMO_IMAGE_REVISION;
+    let revision = await this.withContainerRetry(() => sandbox.exec(`cat ${IMAGE_REVISION_PATH}`, { timeout: 30_000 }));
+    if (!imageRevisionMatches(revision, expected)) {
+      logOps({ event: "guest_revision_stale", tomo_id: this.tomoId(), worker_revision: expected, guest_revision: observedImageRevision(revision) });
+      await sandbox.destroy().catch(() => undefined);
+      sandbox = this.sandbox();
+      revision = await this.withContainerRetry(() => sandbox.exec(`cat ${IMAGE_REVISION_PATH}`, { timeout: 30_000 }));
+      if (!imageRevisionMatches(revision, expected)) {
+        await sandbox.destroy().catch(() => undefined);
+        throw new Error("sandbox_revision_mismatch");
+      }
+    }
+    await this.withContainerRetry(() => sandbox.mkdir(DATA_DIR, { recursive: true }));
+    await this.hydrate(sandbox);
+    return sandbox;
+  }
+
+  private sandbox(): SandboxHandle {
+    return getSandbox(this.env.Sandbox, this.tomoId(), {
+      enableDefaultSession: false,
+      normalizeId: true,
+      sleepAfter: "2m",
+      containerTimeouts: { instanceGetTimeoutMS: 120_000, portReadyTimeoutMS: 180_000 },
+    });
+  }
+
+  private async withContainerRetry<T>(operation: () => Promise<T>): Promise<T> {
+    let last: unknown;
+    for (let attempt = 0; attempt < CONTAINER_RETRY_ATTEMPTS; attempt += 1) {
+      try {
+        return await operation();
+      } catch (error) {
+        last = error;
+        if (!retryableSandbox(error, isPlatformTransientError) || attempt === CONTAINER_RETRY_ATTEMPTS - 1) throw error;
+        await new Promise((resolve) => setTimeout(resolve, CONTAINER_RETRY_BASE_MS * (attempt + 1)));
+      }
+    }
+    throw last;
+  }
+
+  private async hydrate(sandbox: SandboxHandle): Promise<void> {
+    const object = await this.env.CHECKPOINTS.get(`owners/${this.tomoId()}/tomo.sqlite3`);
+    if (!object) return;
+    const bytes = new Uint8Array(await object.arrayBuffer());
+    await writeSandboxFile(sandbox, `${DATA_DIR}/tomo.sqlite3`, bytes);
+  }
+
+  private async checkpoint(sandbox: ReturnType<typeof getSandbox>): Promise<void> {
+    await sandbox.exec(
+      "python3 -c \"import sqlite3,pathlib; p=pathlib.Path('/workspace/tomo-data/tomo.sqlite3'); c=sqlite3.connect(str(p)) if p.exists() else None; c and (c.execute('PRAGMA wal_checkpoint(FULL)'), c.close())\"",
+      { timeout: 30_000 },
+    );
+    const bytes = await readSandboxFile(sandbox, `${DATA_DIR}/tomo.sqlite3`);
+    if (!bytes) return;
+    await this.env.CHECKPOINTS.put(`owners/${this.tomoId()}/tomo.sqlite3`, bytes);
+  }
+
+  private async cron(request: Request, url: URL): Promise<Response> {
+    const operation = cronOp(url.pathname, request.method);
+    if (!operation) return Response.json({ ok: false, error: "cron_not_found" }, { status: 404 });
+    const ownerId = request.headers.get("x-tomo-owner-id") || "";
+    if (ownerId !== this.tomoId()) return Response.json({ ok: false, error: "cron_unauthorized" }, { status: 401 });
+    if (operation === "list") {
+      const jobs = this.sql("SELECT * FROM cron_jobs").map(jobJson);
+      return Response.json({ ok: true, jobs });
+    }
+    if (operation === "create") {
+      const idempotency = request.headers.get("idempotency-key") || "";
+      if (!idempotency) return Response.json({ ok: false, error: "missing_idempotency" }, { status: 400 });
+      const body = (await request.json()) as {
+        intent?: string;
+        constraints?: string[];
+        schedule?: CronScheduleInput;
+        lifecycle?: { endsAt?: string; maxSuccessfulRuns?: number };
+      };
+      const requestHash = await sha256Hex(`${request.method}\n${url.pathname}\n${JSON.stringify(body)}`);
+      const receipt = this.cronReceipt(idempotency, requestHash);
+      if (receipt) return receipt;
+      const legacyExisting = this.one("SELECT * FROM cron_jobs WHERE idempotency_key = ?", idempotency);
+      if (legacyExisting) {
+        return this.storeCronReceipt(idempotency, requestHash, { ok: true, job: jobJson(legacyExisting) });
+      }
+      if (typeof body.intent !== "string" || !body.intent.trim() || body.intent.length > 4000) {
+        return Response.json({ ok: false, error: "cron_invalid_intent" }, { status: 400 });
+      }
+      let parsed;
+      try {
+        parsed = parseCronSchedule(body.schedule || {});
+      } catch (error) {
+        return Response.json({ ok: false, error: error instanceof Error ? error.message : "cron_invalid_schedule" }, { status: 400 });
+      }
+      const endsAt = body.lifecycle?.endsAt ? Date.parse(body.lifecycle.endsAt) : null;
+      const maxRuns = body.lifecycle?.maxSuccessfulRuns ?? null;
+      if ((endsAt !== null && !Number.isFinite(endsAt)) || (maxRuns !== null && (!Number.isInteger(maxRuns) || maxRuns < 1))) {
+        return Response.json({ ok: false, error: "cron_invalid_lifecycle" }, { status: 400 });
+      }
+      const jobId = (await sha256Hex(`${ownerId}\ncreate\n${idempotency}`)).slice(0, 32);
+      const destination = request.headers.get("x-tomo-destination") || "";
+      this.ctx.storage.sql.exec(
+        "INSERT INTO cron_jobs(job_id, destination, intent, constraints, schedule_kind, schedule_at, schedule_every, status, revision, successful_runs, idempotency_key, ends_at, max_successful_runs) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 1, 0, ?, ?, ?)",
+        jobId,
+        destination,
+        body.intent,
+        JSON.stringify(body.constraints || []),
+        parsed.kind,
+        parsed.scheduleAt,
+        parsed.everySeconds,
+        idempotency,
+        endsAt,
+        maxRuns,
+      );
+      await this.scheduleWake();
+      return this.storeCronReceipt(idempotency, requestHash, { ok: true, job: jobJson(this.one("SELECT * FROM cron_jobs WHERE job_id = ?", jobId)!) });
+    }
+    const match = url.pathname.match(/\/v1\/cron\/jobs\/([^/]+)(?:\/([^/]+))?$/);
+    const jobId = match?.[1] ? decodeURIComponent(match[1]) : "";
+    const job = this.one("SELECT * FROM cron_jobs WHERE job_id = ?", jobId);
+    if (!job) return Response.json({ ok: false, error: "cron_not_found" }, { status: 404 });
+    if (operation === "inspect") return Response.json({ ok: true, job: jobJson(job) });
+    if (operation === "history") {
+      const history = this.sql("SELECT run_id, scheduled_at, status, completed_at, error_class FROM cron_runs WHERE job_id = ? ORDER BY scheduled_at DESC LIMIT 32", jobId)
+        .map((row) => ({ runId: row.run_id, scheduledAt: new Date(Number(row.scheduled_at)).toISOString(), status: row.status, completedAt: row.completed_at ? new Date(Number(row.completed_at)).toISOString() : null, error: row.error_class }));
+      return Response.json({ ok: true, history });
+    }
+    const body = (await request.json().catch(() => null)) as { revision?: number; intent?: string; constraints?: string[]; schedule?: CronScheduleInput; lifecycle?: { endsAt?: string; maxSuccessfulRuns?: number } } | null;
+    const idempotency = request.headers.get("idempotency-key") || "";
+    if (!idempotency || !body || !Number.isInteger(body.revision)) return Response.json({ ok: false, error: "missing_idempotency_or_revision" }, { status: 400 });
+    const requestHash = await sha256Hex(`${request.method}\n${url.pathname}\n${JSON.stringify(body)}`);
+    const receipt = this.cronReceipt(idempotency, requestHash);
+    if (receipt) return receipt;
+    if (Number(job.revision) !== body.revision) return Response.json({ ok: false, error: "cron_revision_conflict" }, { status: 409 });
+    if (operation === "update") {
+      let parsed;
+      try { parsed = parseCronSchedule(body.schedule || {}); }
+      catch (error) { return Response.json({ ok: false, error: error instanceof Error ? error.message : "cron_invalid_schedule" }, { status: 400 }); }
+      if (typeof body.intent !== "string" || !body.intent.trim()) return Response.json({ ok: false, error: "cron_invalid_intent" }, { status: 400 });
+      const endsAt = body.lifecycle?.endsAt ? Date.parse(body.lifecycle.endsAt) : null;
+      const maxRuns = body.lifecycle?.maxSuccessfulRuns ?? null;
+      if ((endsAt !== null && !Number.isFinite(endsAt)) || (maxRuns !== null && (!Number.isInteger(maxRuns) || maxRuns < 1))) {
+        return Response.json({ ok: false, error: "cron_invalid_lifecycle" }, { status: 400 });
+      }
+      this.ctx.storage.sql.exec("UPDATE cron_jobs SET intent=?, constraints=?, schedule_kind=?, schedule_at=?, schedule_every=?, ends_at=?, max_successful_runs=?, revision=revision+1 WHERE job_id=? AND status IN ('active','paused')", body.intent, JSON.stringify(body.constraints || []), parsed.kind, parsed.scheduleAt, parsed.everySeconds, endsAt, maxRuns, jobId);
+    }
+    if (operation === "pause" && job.status === "active") this.ctx.storage.sql.exec("UPDATE cron_jobs SET status='paused', revision=revision+1 WHERE job_id=?", jobId);
+    if (operation === "resume" && job.status === "paused") this.ctx.storage.sql.exec("UPDATE cron_jobs SET status='active', revision=revision+1 WHERE job_id=?", jobId);
+    if (operation === "delete") this.ctx.storage.sql.exec("UPDATE cron_jobs SET status='cancelled', revision=revision+1, schedule_at=NULL WHERE job_id=?", jobId);
+    if (operation === "run_now" && job.status === "active") this.ctx.storage.sql.exec("UPDATE cron_jobs SET schedule_at=?, revision=revision+1 WHERE job_id=?", Date.now(), jobId);
+    await this.scheduleWake();
+    return this.storeCronReceipt(idempotency, requestHash, { ok: true, job: jobJson(this.one("SELECT * FROM cron_jobs WHERE job_id = ?", jobId)!) });
+  }
+
+  private cronReceipt(idempotency: string, requestHash: string): Response | null {
+    const receipt = this.one("SELECT request_hash, response FROM cron_receipts WHERE idempotency_key = ?", idempotency);
+    if (!receipt) return null;
+    if (receipt.request_hash !== requestHash) return Response.json({ ok: false, error: "idempotency_conflict" }, { status: 409 });
+    return Response.json(JSON.parse(String(receipt.response)));
+  }
+
+  private storeCronReceipt(idempotency: string, requestHash: string, response: Record<string, unknown>): Response {
+    this.ctx.storage.sql.exec("INSERT INTO cron_receipts(idempotency_key, request_hash, response) VALUES (?, ?, ?)", idempotency, requestHash, JSON.stringify(response));
+    return Response.json(response);
+  }
+}
+
+function cronOp(pathname: string, method: string): string | null {
+  if (pathname === "/v1/cron/jobs" && method === "POST") return "create";
+  if (pathname === "/v1/cron/jobs" && method === "GET") return "list";
+  const match = pathname.match(/^\/v1\/cron\/jobs\/([^/]+)(?:\/([^/]+))?$/);
+  if (!match) return null;
+  if (!match[2] && method === "GET") return "inspect";
+  if (!match[2] && method === "PATCH") return "update";
+  if (match[2] === "pause") return "pause";
+  if (match[2] === "resume") return "resume";
+  if (match[2] === "run-now") return "run_now";
+  if (match[2] === "delete") return "delete";
+  if (match[2] === "history") return "history";
+  return null;
+}
+
+function jobJson(job: SqlRow): Record<string, unknown> {
+  return {
+    jobId: job.job_id,
+    intent: job.intent,
+    constraints: JSON.parse(String(job.constraints || "[]")),
+    schedule: {
+      kind: job.schedule_kind,
+      at: job.schedule_at ? new Date(Number(job.schedule_at)).toISOString() : null,
+      everySeconds: job.schedule_every,
+      expression: null,
+      timezoneName: "UTC",
+      startsAt: null,
+    },
+    lifecycle: {
+      endsAt: job.ends_at ? new Date(Number(job.ends_at)).toISOString() : null,
+      maxSuccessfulRuns: job.max_successful_runs,
+    },
+    status: job.status,
+    revision: job.revision,
+    successfulRuns: job.successful_runs,
+  };
+}
+
+type SandboxHandle = ReturnType<typeof getSandbox>;
+
+function stringSet(value: string | number | null): Set<string> {
+  if (typeof value !== "string") return new Set();
+  try {
+    const parsed = JSON.parse(value);
+    return new Set(Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function bytesToB64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+function b64ToBytes(value: string): Uint8Array {
+  const binary = atob(value);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) out[i] = binary.charCodeAt(i);
+  return out;
+}
+
+async function writeSandboxFile(sandbox: SandboxHandle, path: string, bytes: Uint8Array): Promise<void> {
+  await sandbox.mkdir(DATA_DIR, { recursive: true });
+  await sandbox.writeFile(path, bytesToB64(bytes), { encoding: "base64" });
+}
+
+async function readSandboxFile(sandbox: SandboxHandle, path: string): Promise<Uint8Array | null> {
+  try {
+    const exists = await sandbox.exists(path);
+    if (!exists.exists) return null;
+    const result = await sandbox.readFile(path, { encoding: "base64" });
+    if (!result.success || !result.content) return null;
+    return b64ToBytes(result.content);
+  } catch {
+    return null;
+  }
+}
