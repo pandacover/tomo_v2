@@ -4,7 +4,7 @@ from unittest.mock import patch
 from tomo_core.conversation import ConversationEngine, ConversationRequest, FrameReady, MemoryControlReady, ReactionWindowReady, SegmentFinish, TurnBudget, TurnRunCompleted, TurnRunStarted, TurnRunStatus
 from tomo_core.conversation.parsing import ConversationOutputError
 from tomo_core.models import InboundEnvelope, PeerTurn, ResponseContract
-from tomo_core.providers import ProviderSetupRequired, ProviderStreamCompleted, ProviderStreamError, ProviderTextDelta, ProviderToolCallReady
+from tomo_core.providers import ProviderSetupRequired, ProviderStreamCompleted, ProviderStreamError, ProviderTextDelta, ProviderToolCallReady, ProviderTransportError
 
 
 PLAN = '{"type":"turn_plan","primary_move":"answer","supporting_moves":["acknowledge"],"move_sequence":["acknowledge","answer"],"response_goal":"answer directly","confidence":"high"}\n'
@@ -77,8 +77,16 @@ class ConversationEngineTests(unittest.TestCase):
 
         self.assertEqual(
             _provider_failure_code(ProviderStreamError("invalid_sse_event")),
-            "provider_stream_invalid_sse_event",
+            "provider_protocol_invalid_sse_event",
         )
+
+    def test_provider_failures_are_typed_without_exception_text_slugging(self):
+        from tomo_core.conversation.engine import _provider_failure_code
+
+        self.assertEqual(_provider_failure_code(ProviderTransportError("timeout")), "provider_transport_timeout")
+        self.assertEqual(_provider_failure_code(ConversationOutputError("invalid_frame")), "invalid_frame")
+        self.assertEqual(_provider_failure_code(ValueError("secret provider detail")), "provider_value_error")
+        self.assertNotIn("secret", _provider_failure_code(ValueError("secret provider detail")))
 
     def test_one_stream_progressively_yields_plan_and_frames_independent_of_moves(self):
         provider = ScriptedProvider([
@@ -577,7 +585,7 @@ class ConversationEngineTests(unittest.TestCase):
     def test_missing_frame_uses_schema_enforced_frame_batch_repair_when_supported(self):
         provider = StructuredRepairProvider(
             [[ProviderStreamCompleted("stop")]],
-            [[ProviderTextDelta('{"frames":[{"text":"First answer."},{"text":"Second answer."},{"text":"Third answer."}],"reaction":"👏"}'), ProviderStreamCompleted("stop")]],
+            [[ProviderTextDelta('{"frames":[{"text":"First answer."},{"text":"Second answer."},{"text":"Third answer."}]}'), ProviderStreamCompleted("stop")]],
         )
 
         result = ConversationEngine(provider).respond(self.request())
@@ -589,8 +597,8 @@ class ConversationEngineTests(unittest.TestCase):
         messages, response_format, actor_id = provider.structured_calls[0]
         self.assertIn("response schema overrides the JSONL output contract for this repair only", messages[0]["content"])
         self.assertEqual(response_format["json_schema"]["schema"]["properties"]["frames"]["maxItems"], 3)
-        self.assertEqual(response_format["json_schema"]["schema"]["properties"]["reaction"]["enum"][-1], "none")
-        self.assertEqual(result.plan.reaction.emoji, "👏")
+        self.assertEqual(set(response_format["json_schema"]["schema"]["properties"]), {"frames"})
+        self.assertIsNone(result.plan.reaction)
         self.assertEqual(actor_id, "u1")
 
     def test_structured_repair_accepts_frame_only_fallback_without_reaction(self):
@@ -604,24 +612,33 @@ class ConversationEngineTests(unittest.TestCase):
         self.assertEqual([frame.text for frame in result.frames], ["Recovered answer."])
         self.assertIsNone(result.plan.reaction)
 
-    def test_reaction_repair_failure_falls_back_to_proven_frame_only_schema(self):
+    def test_structured_repair_failure_does_not_start_a_third_provider_attempt(self):
         provider = StructuredRepairProvider(
             [[ProviderStreamCompleted("stop")]],
             [
                 [ProviderTextDelta('{"not_frames":true}'), ProviderStreamCompleted("stop")],
-                [ProviderTextDelta('{"frames":[{"text":"Safe recovered answer."}]}'), ProviderStreamCompleted("stop")],
             ],
+        )
+
+        with self.assertRaises(ConversationOutputError) as raised:
+            ConversationEngine(provider).respond(self.request())
+
+        self.assertEqual(raised.exception.code, "invalid_frame_batch")
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(len(provider.structured_calls), 1)
+
+    def test_malformed_json_uses_the_same_single_structured_frame_repair(self):
+        provider = StructuredRepairProvider(
+            [[ProviderTextDelta('{"type":"frame"\n'), ProviderStreamCompleted("stop")]],
+            [[ProviderTextDelta('{"frames":[{"text":"Recovered one."},{"text":"Recovered two."}]}'), ProviderStreamCompleted("stop")]],
         )
 
         result = ConversationEngine(provider).respond(self.request())
 
-        self.assertEqual([frame.text for frame in result.frames], ["Safe recovered answer."])
+        self.assertEqual([frame.text for frame in result.frames], ["Recovered one.", "Recovered two."])
         self.assertEqual(result.usage.contract_repairs, 1)
-        self.assertEqual(len(provider.structured_calls), 2)
-        first_schema = provider.structured_calls[0][1]["json_schema"]["schema"]["properties"]
-        fallback_schema = provider.structured_calls[1][1]["json_schema"]["schema"]["properties"]
-        self.assertIn("reaction", first_schema)
-        self.assertNotIn("reaction", fallback_schema)
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(len(provider.structured_calls), 1)
 
     def test_missing_frame_failure_distinguishes_reasoning_only_and_nonempty_content(self):
         budget = TurnBudget(1, 0, 0, 1, 3, 3, 800, max_contract_repairs=0)

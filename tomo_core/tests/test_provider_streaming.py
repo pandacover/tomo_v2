@@ -1,5 +1,6 @@
 import json
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import httpx
@@ -9,6 +10,7 @@ from tomo_core.providers import (
     OAuthBackedSuperGrokProvider,
     ProviderStreamCompleted,
     ProviderStreamError,
+    ProviderTransportError,
     ProviderTextDelta,
     ProviderToolCallReady,
     StaticProvider,
@@ -63,6 +65,37 @@ def sse_chunks(*events, splits=()):
 
 
 class ProviderStreamingTests(unittest.TestCase):
+    def _fixture_events(self, name):
+        fixture = Path(__file__).parent / "fixtures" / "openrouter" / name
+        provider = XaiApiProvider(
+            api_key="or-key",
+            model="deepseek/deepseek-v4-flash-0731",
+            base_url="https://openrouter.ai/api/v1",
+        )
+        with patch("tomo_core.providers.httpx.stream", return_value=FakeStreamResponse([fixture.read_bytes()])):
+            return list(provider.stream([{"role": "user", "content": "fixture"}]))
+
+    def test_privacy_safe_openrouter_contract_fixtures_cover_observed_shapes(self):
+        reasoning = self._fixture_events("reasoning_only.sse")
+        self.assertEqual(reasoning, [ProviderStreamCompleted("stop", input_tokens=12, output_tokens=4, reasoning_tokens=4)])
+
+        prose = self._fixture_events("prose_preamble.sse")
+        self.assertIn("Here is the JSONL response", "".join(event.text for event in prose if isinstance(event, ProviderTextDelta)))
+
+        fenced = self._fixture_events("fenced_jsonl.sse")
+        self.assertIn("```jsonl", "".join(event.text for event in fenced if isinstance(event, ProviderTextDelta)))
+
+        multi = self._fixture_events("multi_frame.sse")
+        self.assertEqual(len([event for event in multi if isinstance(event, ProviderTextDelta)]), 2)
+
+        tools = self._fixture_events("tool_continuation.sse")
+        self.assertEqual(tools[0], ProviderToolCallReady("call_fixture", "search", '{"q":"example"}'))
+        self.assertEqual(tools[-1], ProviderStreamCompleted("tool_calls"))
+
+        with self.assertRaises(ProviderStreamError) as raised:
+            self._fixture_events("malformed_stream.sse")
+        self.assertEqual(raised.exception.code, "malformed_json")
+
     def test_structured_stream_serializes_response_format_only_for_xai_and_fixed_token_providers(self):
         terminal = json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}]})
         providers = (
@@ -98,7 +131,8 @@ class ProviderStreamingTests(unittest.TestCase):
         body = stream.call_args.kwargs["json"]
         self.assertEqual(body["provider"], {"require_parameters": True})
         self.assertEqual(body["max_tokens"], 4096)
-        self.assertEqual(body["reasoning"], {"effort": "high", "exclude": True})
+        self.assertEqual(body["reasoning"], {"effort": "low", "exclude": True})
+        self.assertEqual(body["stream_options"], {"include_usage": True})
 
     def test_openrouter_vision_structured_stream_omits_xai_store_parameter(self):
         terminal = json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}]})
@@ -115,7 +149,7 @@ class ProviderStreamingTests(unittest.TestCase):
 
         body = stream.call_args.kwargs["json"]
         self.assertEqual(body["provider"], {"require_parameters": True})
-        self.assertEqual(body["reasoning_effort"], "low")
+        self.assertEqual(body["reasoning"], {"effort": "low", "exclude": True})
         self.assertNotIn("store", body)
 
     def test_oauth_backed_and_grok_auth_providers_forward_structured_streams(self):
@@ -184,6 +218,7 @@ class ProviderStreamingTests(unittest.TestCase):
         self.assertEqual(result, [ProviderTextDelta("hi"), ProviderStreamCompleted("stop", input_tokens=3, output_tokens=1)])
         self.assertEqual(stream.call_args.kwargs["timeout"], 180)
         self.assertEqual(stream.call_args.kwargs["headers"]["HTTP-Referer"], "https://github.com/pandacover/tomo_v2")
+        self.assertEqual(stream.call_args.kwargs["json"]["stream_options"], {"include_usage": True})
 
     def test_stream_assembles_multiple_native_tool_calls_before_terminal_event(self):
         events = (
@@ -252,7 +287,7 @@ class ProviderStreamingTests(unittest.TestCase):
         ]
         for response in cases:
             with self.subTest(response=response), patch("tomo_core.providers.httpx.stream", return_value=response):
-                with self.assertRaises((ValueError, httpx.HTTPStatusError)):
+                with self.assertRaises((ProviderStreamError, ProviderTransportError)):
                     list(XaiApiProvider(api_key="test-key").stream([{"role": "user", "content": "hi"}]))
 
     def test_stream_failures_have_stable_privacy_safe_codes(self):
@@ -284,7 +319,7 @@ class ProviderStreamingTests(unittest.TestCase):
             sse_chunks(invalid_usage, "[DONE]"),
         ):
             with self.subTest(chunks=chunks), patch("tomo_core.providers.httpx.stream", return_value=FakeStreamResponse(chunks)):
-                with self.assertRaises(ValueError):
+                with self.assertRaises(ProviderStreamError):
                     list(XaiApiProvider(api_key="test-key").stream([{"role": "user", "content": "hi"}]))
         with patch("tomo_core.providers.httpx.stream", return_value=FakeStreamResponse(sse_chunks(no_finish, "[DONE]"))):
             events = list(XaiApiProvider(api_key="test-key").stream([{"role": "user", "content": "hi"}]))
@@ -295,7 +330,7 @@ class ProviderStreamingTests(unittest.TestCase):
         first = json.dumps({"choices": [{"delta": {}, "finish_reason": None}], "usage": {"completion_tokens_details": {"reasoning_tokens": 2}}})
         later = json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}], "usage": {"completion_tokens_details": {"reasoning_tokens": 3}}})
         with patch("tomo_core.providers.httpx.stream", return_value=FakeStreamResponse(sse_chunks(invalid, "[DONE]"))):
-            with self.assertRaises(ValueError):
+            with self.assertRaises(ProviderStreamError):
                 list(XaiApiProvider(api_key="test-key").stream([{"role": "user", "content": "hi"}]))
         with patch("tomo_core.providers.httpx.stream", return_value=FakeStreamResponse(sse_chunks(first, later, "[DONE]"))):
             events = list(XaiApiProvider(api_key="test-key").stream([{"role": "user", "content": "hi"}]))
@@ -324,7 +359,7 @@ class ProviderStreamingTests(unittest.TestCase):
         ready_events = []
         with patch("tomo_core.providers.httpx.stream", return_value=FakeStreamResponse(sse_chunks(duplicate_ids, "[DONE]"))):
             stream = XaiApiProvider(api_key="test-key").stream([{"role": "user", "content": "hi"}])
-            with self.assertRaises(ValueError):
+            with self.assertRaises(ProviderStreamError):
                 for event in stream:
                     if isinstance(event, ProviderToolCallReady):
                         ready_events.append(event)

@@ -10,18 +10,18 @@ import httpx
 from ..context import ContextHydrator
 from ..delivery import split_sentences
 from ..models import AutomationTurn, PeerTurn, ResponseContract
-from ..providers import ProviderAdapter, ProviderSetupRequired, ProviderStreamCompleted, ProviderStreamError, ProviderTextDelta, ProviderToolCallReady
+from ..providers import ProviderAdapter, ProviderSetupRequired, ProviderStreamCompleted, ProviderStreamError, ProviderTextDelta, ProviderToolCallReady, ProviderTransportError
 from ..tool_execution import ToolBatchCancelled, ToolBatchValidationError, ToolExecutor
 from ..tools import ToolRegistry
 from .. import latency_trace
 from .contract import PlanSource, synthesized_tool_plan
 from .framing import SegmentFrameParser
-from .models import ConversationRequest, Frame, FrameReady, MemoryControlReady, MovePlan, REACTION_EMOJI_OPTIONS, ReactionWindowReady, SegmentFinish, SegmentResult, TurnBudget, TurnRunCompleted, TurnRunEvent, TurnRunResult, TurnRunStarted, TurnRunStatus, TurnUsage
+from .models import ConversationRequest, Frame, FrameReady, MemoryControlReady, MovePlan, ReactionWindowReady, SegmentFinish, SegmentResult, TurnBudget, TurnRunCompleted, TurnRunEvent, TurnRunResult, TurnRunStarted, TurnRunStatus, TurnUsage
 from .parsing import ConversationOutputError
 from .prompts import build_first_segment_repair_messages, build_segment_messages, build_segment_repair_messages, build_structured_frame_repair_messages
 
 
-def _structured_frame_response_format(budget: TurnBudget, *, include_reaction: bool = False) -> dict[str, object]:
+def _structured_frame_response_format(budget: TurnBudget) -> dict[str, object]:
     properties: dict[str, object] = {
         "frames": {
             "type": "array",
@@ -42,14 +42,6 @@ def _structured_frame_response_format(budget: TurnBudget, *, include_reaction: b
             },
         },
     }
-    required = ["frames"]
-    if include_reaction:
-        properties["reaction"] = {
-            "type": "string",
-            "enum": [*REACTION_EMOJI_OPTIONS, "none"],
-            "description": "A sparse Telegram reaction intent for the incoming message, or the string none.",
-        }
-        required.append("reaction")
     return {
         "type": "json_schema",
         "json_schema": {
@@ -58,7 +50,7 @@ def _structured_frame_response_format(budget: TurnBudget, *, include_reaction: b
             "schema": {
                 "type": "object",
                 "properties": properties,
-                "required": required,
+                "required": ["frames"],
                 "additionalProperties": False,
             },
         },
@@ -69,33 +61,17 @@ def _parse_structured_frame_repair(
     text: str,
     parser: SegmentFrameParser,
     budget: TurnBudget,
-    *,
-    include_reaction: bool = False,
 ) -> list[object]:
     try:
         payload = json.loads(text)
     except json.JSONDecodeError:
         raise ConversationOutputError("invalid_json_object") from None
-    expected_fields = ({"frames"}, {"frames", "reaction"}) if include_reaction else ({"frames"},)
-    if not isinstance(payload, dict) or set(payload) not in expected_fields:
+    if not isinstance(payload, dict) or set(payload) != {"frames"}:
         raise ConversationOutputError("invalid_frame_batch")
     frames = payload["frames"]
     if not isinstance(frames, list) or not 1 <= len(frames) <= budget.max_frames_per_segment:
         raise ConversationOutputError("invalid_frame_batch")
     records: list[object] = []
-    if include_reaction:
-        reaction_value = payload.get("reaction", "none")
-        if reaction_value != "none" and reaction_value not in REACTION_EMOJI_OPTIONS:
-            raise ConversationOutputError("invalid_frame_batch")
-        reaction = None if reaction_value == "none" else reaction_value
-        records.extend(parser.feed(json.dumps({
-            "type": "turn_plan",
-            "primary_move": "answer",
-            "supporting_moves": [],
-            "response_goal": "answer the user",
-            "confidence": "low",
-            "reaction": reaction,
-        }, ensure_ascii=False) + "\n"))
     for frame in frames:
         if not isinstance(frame, dict) or set(frame) != {"text"}:
             raise ConversationOutputError("invalid_frame_batch")
@@ -105,20 +81,35 @@ def _parse_structured_frame_repair(
 
 
 def _provider_failure_code(error: BaseException) -> str:
-    if isinstance(error, httpx.TimeoutException):
-        return "provider_timeout"
-    if isinstance(error, httpx.ConnectError):
-        return "provider_connect"
+    if isinstance(error, ConversationOutputError):
+        return error.code
+    if isinstance(error, ProviderTransportError):
+        return f"provider_transport_{error.code}"
     if isinstance(error, ProviderStreamError):
-        return f"provider_stream_{error.code}"
+        return f"provider_protocol_{error.code}"
+    if isinstance(error, httpx.TimeoutException):
+        return "provider_transport_timeout"
+    if isinstance(error, httpx.ConnectError):
+        return "provider_transport_connect"
+    if isinstance(error, httpx.HTTPStatusError):
+        status = error.response.status_code
+        return f"provider_transport_http_{status}" if 100 <= status <= 599 else "provider_transport_http_status"
     if isinstance(error, ValueError):
-        message = str(error).split(":")[-1].strip().lower()
-        slug = "".join(character if character.isalnum() else "_" for character in message).strip("_")[:48]
-        if slug:
-            return f"provider_{slug}"
-    name = type(error).__name__.lower()
-    slug = "".join(character if character.isalnum() else "_" for character in name).strip("_")[:40]
-    return f"provider_{slug}" if slug else "provider_stream_failure"
+        return "provider_value_error"
+    return "provider_unexpected"
+
+
+def _use_structured_frame_repair(code: str | None, *, mutating_execution_attempted: bool) -> bool:
+    if not code or mutating_execution_attempted:
+        return False
+    tool_failures = (
+        "tool_",
+        "native_tool_",
+        "duplicate_tool_",
+        "mismatched_tool_",
+        "peer_",
+    )
+    return not code.startswith(tool_failures)
 
 
 def _missing_frame_code(raw: list[str], terminal: ProviderStreamCompleted | None) -> str:
@@ -272,7 +263,6 @@ class ConversationEngine:
                 schemas = tuple(schema for schema in schemas if schema.get("function", {}).get("name") == "peer_resume")
             replacement = False
             repair_code: str | None = None
-            reaction_repair_fallback = False
             while True:
                 remaining_frames = 3 - len(frames)
                 if remaining_frames < 1:
@@ -283,8 +273,10 @@ class ConversationEngine:
                 segment_budget = replace(self.budget, max_frames_per_segment=min(self.budget.max_frames_per_segment, remaining_frames))
                 parser = SegmentFrameParser(index, first_segment=plan is None, budget=segment_budget)
                 structured_stream = getattr(self.provider, "stream_structured", None)
-                structured_frame_repair = replacement and bool(repair_code and repair_code.startswith("missing_frame")) and callable(structured_stream)
-                structured_reaction = structured_frame_repair and not reaction_repair_fallback and index == 0 and plan is None and not isinstance(request.burst, (AutomationTurn, PeerTurn))
+                structured_frame_repair = replacement and callable(structured_stream) and _use_structured_frame_repair(
+                    repair_code,
+                    mutating_execution_attempted=mutating_execution_attempted,
+                )
                 if structured_frame_repair:
                     schemas = ()
                     messages = build_structured_frame_repair_messages(
@@ -459,7 +451,7 @@ class ConversationEngine:
                     if structured_frame_repair:
                         stream = structured_stream(
                             messages,
-                            response_format=_structured_frame_response_format(segment_budget, include_reaction=structured_reaction),
+                            response_format=_structured_frame_response_format(segment_budget),
                             actor_id=actor_id,
                         )
                     else:
@@ -497,11 +489,6 @@ class ConversationEngine:
                         return
                     yield completed(TurnRunStatus.COMPLETED)
                     return
-                except httpx.HTTPStatusError:
-                    if not structured_reaction:
-                        raise
-                    failure = ConversationOutputError("reaction_repair_unavailable")
-                    stream = None
                 except Exception as error:
                     failure = ConversationOutputError(_provider_failure_code(error))
                     stream = None
@@ -542,10 +529,6 @@ class ConversationEngine:
                             failure = error
                             break
                     stream_exhausted = True
-                except httpx.HTTPStatusError:
-                    if not structured_reaction:
-                        raise
-                    failure = ConversationOutputError("reaction_repair_unavailable")
                 except Exception as error:
                     if failure is None:
                         failure = ConversationOutputError(_provider_failure_code(error))
@@ -566,7 +549,6 @@ class ConversationEngine:
                                 "".join(raw),
                                 parser,
                                 segment_budget,
-                                include_reaction=structured_reaction,
                             )
                             if structured_frame_repair
                             else parser.finish()
@@ -788,14 +770,6 @@ class ConversationEngine:
                         return
                     if expired():
                         raise ConversationOutputError("elapsed_budget_exhausted")
-                    if structured_reaction:
-                        # Reaction metadata must never make a reply unavailable.
-                        # Retry the already-authorized repair once with the proven
-                        # frame-only schema and preserve the global repair budget.
-                        reaction_repair_fallback = True
-                        repair_code = "missing_frame_reaction_fallback"
-                        replacement = True
-                        continue
                     if segments or repairs >= self.budget.max_contract_repairs:
                         raise ConversationOutputError(failure.code)
                     repair_code = failure.code

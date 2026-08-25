@@ -51,14 +51,22 @@ DEFAULT_OPENROUTER_AGENT_MODEL = "deepseek/deepseek-v4-flash-0731"
 DEFAULT_OPENROUTER_VISION_MODEL = "meta/muse-spark-1.2-contributor"
 
 
-class ProviderStreamError(ValueError):
-    """A privacy-safe, stable diagnostic for OpenAI-compatible streams."""
+class ProviderFailure(RuntimeError):
+    """A typed, privacy-safe provider failure with a stable diagnostic code."""
 
     def __init__(self, code: str) -> None:
         if not code or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789_" for character in code):
-            raise ValueError("provider stream error code must be lowercase snake case")
+            raise ValueError("provider failure code must be lowercase snake case")
         self.code = code
         super().__init__(code)
+
+
+class ProviderTransportError(ProviderFailure):
+    """The HTTP connection or upstream request failed before a valid stream."""
+
+
+class ProviderStreamError(ProviderFailure):
+    """The provider returned a stream that violated the accepted SSE contract."""
 
 
 def _provider_headers(base_url: str, access_token: str) -> dict[str, str]:
@@ -127,16 +135,24 @@ def _stream_openai_compatible(
     store: bool | None,
     response_format: dict[str, object] | None = None,
 ) -> Iterator[ProviderStreamEvent]:
+    openrouter = "openrouter.ai" in base_url
     request_body: dict[str, object] = {"model": model, "messages": messages, "stream": True}
     if tools:
         request_body["tools"] = list(tools)
     if reasoning_effort:
-        request_body["reasoning_effort"] = reasoning_effort
+        if openrouter:
+            request_body["reasoning"] = {"effort": reasoning_effort, "exclude": True}
+        else:
+            request_body["reasoning_effort"] = reasoning_effort
     if store is not None:
         request_body["store"] = store
+    if openrouter:
+        request_body["stream_options"] = {"include_usage": True}
+        if tools:
+            request_body["provider"] = {"require_parameters": True}
     if response_format is not None:
         request_body["response_format"] = response_format
-        if "openrouter.ai" in base_url:
+        if openrouter:
             # Structured-output support is endpoint-specific on OpenRouter.
             # Do not let routing silently choose an endpoint that ignores the
             # response schema used by the conversation repair path.
@@ -150,9 +166,8 @@ def _stream_openai_compatible(
                 # This reasoning model can otherwise spend a completion on
                 # thinking without returning user-visible content. Reserve a
                 # bounded completion budget and keep reasoning out of the SSE.
-                request_body.pop("reasoning_effort", None)
                 request_body["max_tokens"] = 4096
-                request_body["reasoning"] = {"effort": "high", "exclude": True}
+                request_body["reasoning"] = {"effort": "low", "exclude": True}
 
     tool_calls: dict[int, _ToolCallParts] = {}
     tool_call_indices: dict[str, int] = {}
@@ -274,27 +289,37 @@ def _stream_openai_compatible(
             return
         yield from consume_data("\n".join(data_lines))
 
-    with httpx.stream(
-        "POST",
-        f"{base_url}/chat/completions",
-        headers=_provider_headers(base_url, access_token),
-        json=request_body,
-        timeout=180,
-        verify=_httpx_verify(),
-    ) as response:
-        response.raise_for_status()
-        for chunk in response.iter_raw():
-            if not isinstance(chunk, bytes):
-                raise ProviderStreamError("invalid_chunk")
-            buffer += decoder.decode(chunk)
-            while "\n\n" in buffer or "\r\n\r\n" in buffer:
-                separator = "\r\n\r\n" if "\r\n\r\n" in buffer and (
-                    "\n\n" not in buffer or buffer.index("\r\n\r\n") <= buffer.index("\n\n")) else "\n\n"
-                raw_event, buffer = buffer.split(separator, 1)
-                yield from consume_sse_event(raw_event)
-        buffer += decoder.decode(b"", final=True)
-        if buffer.strip():
-            yield from consume_sse_event(buffer)
+    try:
+        with httpx.stream(
+            "POST",
+            f"{base_url}/chat/completions",
+            headers=_provider_headers(base_url, access_token),
+            json=request_body,
+            timeout=180,
+            verify=_httpx_verify(),
+        ) as response:
+            response.raise_for_status()
+            for chunk in response.iter_raw():
+                if not isinstance(chunk, bytes):
+                    raise ProviderStreamError("invalid_chunk")
+                buffer += decoder.decode(chunk)
+                while "\n\n" in buffer or "\r\n\r\n" in buffer:
+                    separator = "\r\n\r\n" if "\r\n\r\n" in buffer and (
+                        "\n\n" not in buffer or buffer.index("\r\n\r\n") <= buffer.index("\n\n")) else "\n\n"
+                    raw_event, buffer = buffer.split(separator, 1)
+                    yield from consume_sse_event(raw_event)
+            buffer += decoder.decode(b"", final=True)
+            if buffer.strip():
+                yield from consume_sse_event(buffer)
+    except httpx.TimeoutException as error:
+        raise ProviderTransportError("timeout") from error
+    except httpx.ConnectError as error:
+        raise ProviderTransportError("connect") from error
+    except httpx.HTTPStatusError as error:
+        status = error.response.status_code
+        raise ProviderTransportError(f"http_{status}" if 100 <= status <= 599 else "http_status") from error
+    except httpx.RequestError as error:
+        raise ProviderTransportError("request") from error
 
     if finish_reason is None and saw_done:
         finish_reason = "stop"

@@ -1,0 +1,4 @@
+data: {"choices":[{"delta":{"content":"```jsonl\n{\"type\":\"frame\",\"text\":\"Fenced answer.\"}\n```\n"},"finish_reason":"stop"}]}
+
+data: [DONE]
+

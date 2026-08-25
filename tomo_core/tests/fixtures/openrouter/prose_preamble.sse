@@ -1,0 +1,6 @@
+data: {"choices":[{"delta":{"content":"Here is the JSONL response:\n{\"type\":\"frame\",\"text\":\"Direct answer.\"}\n"},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
