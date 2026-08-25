@@ -37,7 +37,7 @@ async function resolveAttachment(request: Request, env: Env): Promise<Response> 
 }
 
 Sandbox.outboundByHost = {
-  "tomo.control": (request, env) => resolveAttachment(request, env as Env),
+  "tomo.control": (request, env) => resolveAttachment(request, env as unknown as Env),
 };
 
 export default {
