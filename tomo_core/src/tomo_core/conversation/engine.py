@@ -30,19 +30,53 @@ def _structured_frame_response_format(budget: TurnBudget) -> dict[str, object]:
             "schema": {
                 "type": "object",
                 "properties": {
-                    "type": {"type": "string", "const": "frame"},
-                    "text": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": budget.max_chars_per_frame,
-                        "description": "One user-visible Tomo message with no Markdown or internal labels.",
+                    "frames": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": budget.max_frames_per_segment,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "text": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": budget.max_chars_per_frame,
+                                    "description": "One user-visible Tomo message with no Markdown or internal labels.",
+                                },
+                            },
+                            "required": ["text"],
+                            "additionalProperties": False,
+                        },
                     },
                 },
-                "required": ["type", "text"],
+                "required": ["frames"],
                 "additionalProperties": False,
             },
         },
     }
+
+
+def _parse_structured_frame_repair(
+    text: str,
+    parser: SegmentFrameParser,
+    budget: TurnBudget,
+) -> list[object]:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        raise ConversationOutputError("invalid_json_object") from None
+    if not isinstance(payload, dict) or set(payload) != {"frames"}:
+        raise ConversationOutputError("invalid_frame_batch")
+    frames = payload["frames"]
+    if not isinstance(frames, list) or not 1 <= len(frames) <= budget.max_frames_per_segment:
+        raise ConversationOutputError("invalid_frame_batch")
+    records: list[object] = []
+    for frame in frames:
+        if not isinstance(frame, dict) or set(frame) != {"text"}:
+            raise ConversationOutputError("invalid_frame_batch")
+        records.extend(parser.feed(json.dumps({"type": "frame", "text": frame["text"]}, ensure_ascii=False) + "\n"))
+    records.extend(parser.finish())
+    return records
 
 
 def _provider_failure_code(error: BaseException) -> str:
@@ -60,6 +94,16 @@ def _provider_failure_code(error: BaseException) -> str:
     name = type(error).__name__.lower()
     slug = "".join(character if character.isalnum() else "_" for character in name).strip("_")[:40]
     return f"provider_{slug}" if slug else "provider_stream_failure"
+
+
+def _missing_frame_code(raw: list[str], terminal: ProviderStreamCompleted | None) -> str:
+    if any(text for text in raw):
+        return "missing_frame_nonempty_content"
+    if terminal is not None and terminal.reasoning_tokens:
+        return "missing_frame_reasoning_only"
+    if terminal is not None and terminal.output_tokens:
+        return "missing_frame_empty_content"
+    return "missing_frame"
 
 
 def should_repair_performative_output(user_text: str, frames: Sequence[Frame]) -> bool:
@@ -213,7 +257,7 @@ class ConversationEngine:
                 segment_budget = replace(self.budget, max_frames_per_segment=min(self.budget.max_frames_per_segment, remaining_frames))
                 parser = SegmentFrameParser(index, first_segment=plan is None, budget=segment_budget)
                 structured_stream = getattr(self.provider, "stream_structured", None)
-                structured_frame_repair = replacement and repair_code == "missing_frame" and callable(structured_stream)
+                structured_frame_repair = replacement and bool(repair_code and repair_code.startswith("missing_frame")) and callable(structured_stream)
                 if structured_frame_repair:
                     schemas = ()
                     messages = build_structured_frame_repair_messages(
@@ -446,7 +490,7 @@ class ConversationEngine:
                                 if event.text:
                                     emit_provider_stage("sandbox_provider_first_text_delta")
                                 raw.append(event.text)
-                                for chunk in event.text.splitlines(keepends=True):
+                                for chunk in (() if structured_frame_repair else event.text.splitlines(keepends=True)):
                                     if first_frame_chars is None:
                                         output_chars_through_first_frame += len(chunk)
                                     for record in parser.feed(chunk):
@@ -485,7 +529,12 @@ class ConversationEngine:
                     failure = ConversationOutputError("missing_completion")
                 if failure is None:
                     try:
-                        for record in parser.finish():
+                        parsed_records = (
+                            _parse_structured_frame_repair("".join(raw), parser, segment_budget)
+                            if structured_frame_repair
+                            else parser.finish()
+                        )
+                        for record in parsed_records:
                             if not is_active():
                                 return
                             if expired():
@@ -680,7 +729,7 @@ class ConversationEngine:
                     yield completed(TurnRunStatus.COMPLETED)
                     return
                 if failure is None and (plan is None or not segment_frames):
-                    failure = ConversationOutputError("missing_frame")
+                    failure = ConversationOutputError(_missing_frame_code(raw, terminal))
                 # Finalize after parsing and contract validation, before any tool work.
                 emit_provider_attempt("error" if failure is not None else "ok")
                 if failure is not None:

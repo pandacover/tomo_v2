@@ -124,7 +124,7 @@ def build_structured_frame_repair_messages(
     plan: MovePlan | None = None,
     prior_messages: Sequence[dict[str, object]] = (),
 ) -> list[dict[str, object]]:
-    """Build the schema-enforced, one-frame fallback for a missing JSONL frame."""
+    """Build the schema-enforced frame-batch fallback for missing JSONL frames."""
     messages = build_segment_messages(
         request,
         context,
@@ -142,7 +142,8 @@ def build_structured_frame_repair_messages(
         "STRUCTURED FRAME REPAIR\n"
         f"the previous segment produced no usable frame: {safe_code}. "
         "the response schema overrides the JSONL output contract for this repair only. "
-        "emit exactly one frame object and nothing else. omit turn_plan, memory_control, native tools, prose, fences, and backticks."
+        "emit exactly one frame-batch object and nothing else. honor the user's requested number of separate messages within the schema limits. "
+        "omit turn_plan, memory_control, native tools, prose, fences, and backticks."
     )
     return messages
 

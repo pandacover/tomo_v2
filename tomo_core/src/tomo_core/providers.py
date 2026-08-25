@@ -141,6 +141,18 @@ def _stream_openai_compatible(
             # Do not let routing silently choose an endpoint that ignores the
             # response schema used by the conversation repair path.
             request_body["provider"] = {"require_parameters": True}
+            json_schema = response_format.get("json_schema")
+            if (
+                model == DEFAULT_OPENROUTER_AGENT_MODEL
+                and isinstance(json_schema, dict)
+                and json_schema.get("name") == "tomo_frame_repair"
+            ):
+                # This reasoning model can otherwise spend a completion on
+                # thinking without returning user-visible content. Reserve a
+                # bounded completion budget and keep reasoning out of the SSE.
+                request_body.pop("reasoning_effort", None)
+                request_body["max_tokens"] = 4096
+                request_body["reasoning"] = {"effort": "high", "exclude": True}
 
     tool_calls: dict[int, _ToolCallParts] = {}
     tool_call_indices: dict[str, int] = {}

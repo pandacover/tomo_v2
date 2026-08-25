@@ -89,9 +89,16 @@ class ProviderStreamingTests(unittest.TestCase):
         )
 
         with patch("tomo_core.providers.httpx.stream", return_value=FakeStreamResponse(sse_chunks(terminal, "[DONE]"))) as stream:
-            list(provider.stream_structured([{"role": "user", "content": "describe"}], response_format=STRUCTURED_RESPONSE_FORMAT))
+            frame_format = {
+                "type": "json_schema",
+                "json_schema": {"name": "tomo_frame_repair", "strict": True, "schema": {"type": "object"}},
+            }
+            list(provider.stream_structured([{"role": "user", "content": "describe"}], response_format=frame_format))
 
-        self.assertEqual(stream.call_args.kwargs["json"]["provider"], {"require_parameters": True})
+        body = stream.call_args.kwargs["json"]
+        self.assertEqual(body["provider"], {"require_parameters": True})
+        self.assertEqual(body["max_tokens"], 4096)
+        self.assertEqual(body["reasoning"], {"effort": "high", "exclude": True})
 
     def test_oauth_backed_and_grok_auth_providers_forward_structured_streams(self):
         oauth = type("OAuth", (), {"token_path": lambda *_: type("Path", (), {"exists": lambda _: True, "read_text": lambda _, **__: '{"access_token":"unused"}'})()})()

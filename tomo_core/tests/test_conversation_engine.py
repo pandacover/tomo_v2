@@ -574,22 +574,34 @@ class ConversationEngineTests(unittest.TestCase):
                 self.assertEqual(len(provider.calls), 2)
                 self.assertIn(repair_code, provider.calls[1][0][0]["content"])
 
-    def test_missing_frame_uses_schema_enforced_single_frame_repair_when_supported(self):
+    def test_missing_frame_uses_schema_enforced_frame_batch_repair_when_supported(self):
         provider = StructuredRepairProvider(
             [[ProviderStreamCompleted("stop")]],
-            [[ProviderTextDelta('{"type":"frame","text":"Recovered answer."}'), ProviderStreamCompleted("stop")]],
+            [[ProviderTextDelta('{"frames":[{"text":"First answer."},{"text":"Second answer."},{"text":"Third answer."}]}'), ProviderStreamCompleted("stop")]],
         )
 
         result = ConversationEngine(provider).respond(self.request())
 
-        self.assertEqual([frame.text for frame in result.frames], ["Recovered answer."])
+        self.assertEqual([frame.text for frame in result.frames], ["First answer.", "Second answer.", "Third answer."])
         self.assertEqual(result.usage.contract_repairs, 1)
         self.assertEqual(len(provider.calls), 1)
         self.assertEqual(len(provider.structured_calls), 1)
         messages, response_format, actor_id = provider.structured_calls[0]
         self.assertIn("response schema overrides the JSONL output contract for this repair only", messages[0]["content"])
-        self.assertEqual(response_format["json_schema"]["schema"]["properties"]["type"]["const"], "frame")
+        self.assertEqual(response_format["json_schema"]["schema"]["properties"]["frames"]["maxItems"], 3)
         self.assertEqual(actor_id, "u1")
+
+    def test_missing_frame_failure_distinguishes_reasoning_only_and_nonempty_content(self):
+        budget = TurnBudget(1, 0, 0, 1, 3, 3, 800, max_contract_repairs=0)
+        cases = (
+            ([ProviderStreamCompleted("stop", output_tokens=9, reasoning_tokens=9)], "missing_frame_reasoning_only"),
+            ([ProviderTextDelta("plain reply\n"), ProviderStreamCompleted("stop", output_tokens=2)], "missing_frame_nonempty_content"),
+        )
+
+        for stream, code in cases:
+            with self.subTest(code=code), self.assertRaises(ConversationOutputError) as raised:
+                ConversationEngine(ScriptedProvider([stream]), budget=budget).respond(self.request())
+            self.assertEqual(raised.exception.code, code)
 
     def test_non_json_preamble_before_valid_jsonl_does_not_require_repair(self):
         provider = ScriptedProvider([[
