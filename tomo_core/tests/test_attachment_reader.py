@@ -23,6 +23,8 @@ class ControlAttachmentReaderTests(unittest.TestCase):
         attachment = MessageAttachment("image", file_id="file")
         reader = ControlAttachmentReader("https://control.example", "capability", "owner", "generation", lambda request, timeout: Response(b"jpeg"))
         self.assertEqual(reader.read(attachment).data, b"jpeg")
+        internal = ControlAttachmentReader("http://tomo.control", "capability", "owner", "generation", lambda request, timeout: Response(b"jpeg"))
+        self.assertEqual(internal.read(attachment).data, b"jpeg")
         for response, code in ((Response(b"x", "text/plain"), "attachment_unavailable"), (Response(b"x" * (10 * 1024 * 1024 + 1)), "attachment_too_large")):
             with self.subTest(code=code), self.assertRaisesRegex(AttachmentReadError, code):
                 ControlAttachmentReader("https://control.example", "capability", "owner", "generation", lambda request, timeout: response).read(attachment)
@@ -34,6 +36,6 @@ class ControlAttachmentReaderTests(unittest.TestCase):
                 ControlAttachmentReader("https://control.example", "secret-capability", "owner", "generation", lambda request, timeout: (_ for _ in ()).throw(error)).read(attachment)
             self.assertEqual(str(raised.exception), "attachment_unavailable")
             self.assertNotIn("secret", str(raised.exception))
-        for args in (("not-a-url", "cap", "owner", "generation"), ("https://control.example", "", "owner", "generation")):
+        for args in (("not-a-url", "cap", "owner", "generation"), ("http://control.example", "cap", "owner", "generation"), ("https://control.example", "", "owner", "generation")):
             with self.subTest(args=args), self.assertRaisesRegex(AttachmentReadError, "attachment_invalid"):
                 ControlAttachmentReader(*args).read(attachment)

@@ -1,4 +1,4 @@
-import { Sandbox as CloudflareSandbox } from "@cloudflare/sandbox";
+import { ContainerProxy, Sandbox as CloudflareSandbox } from "@cloudflare/sandbox";
 import type { Env } from "./env";
 import { hexKey, logOps } from "./env";
 import { verifyAttachment, verifyCron } from "./hmac";
@@ -12,11 +12,33 @@ export class Sandbox extends CloudflareSandbox {
   interceptHttps = false;
 }
 
-export { OwnerDO, RegistryDO, PeerDO };
+export { ContainerProxy, OwnerDO, RegistryDO, PeerDO };
 
 function json(payload: unknown, status = 200): Response {
   return Response.json(payload, { status, headers: { "cache-control": "no-store" } });
 }
+
+async function resolveAttachment(request: Request, env: Env): Promise<Response> {
+  const token = bearer(request);
+  const ownerId = request.headers.get("x-tomo-owner-id") || "";
+  const generationId = request.headers.get("x-tomo-generation-id") || "";
+  const body = (await request.json().catch(() => null)) as { fileId?: string } | null;
+  if (!token || !ownerId || !generationId || !body?.fileId) return json({ error: "invalid capability" }, 401);
+  try {
+    await verifyAttachment(hexKey(env.ATTACHMENT_CAPABILITY_KEY), token, body.fileId, ownerId, generationId);
+  } catch {
+    return json({ error: "invalid capability" }, 401);
+  }
+  const file = await new TelegramApi(env.TELEGRAM_BOT_TOKEN).fetchFile(body.fileId);
+  if (!file) return json({ error: "attachment service unavailable" }, 503);
+  return new Response(file.bytes.slice(), {
+    headers: { "content-type": file.mime, "cache-control": "no-store" },
+  });
+}
+
+Sandbox.outboundByHost = {
+  "tomo.control": (request, env) => resolveAttachment(request, env as Env),
+};
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -58,21 +80,7 @@ export default {
     }
 
     if (url.pathname === "/v1/attachments/resolve" && request.method === "POST") {
-      const token = bearer(request);
-      const ownerId = request.headers.get("x-tomo-owner-id") || "";
-      const generationId = request.headers.get("x-tomo-generation-id") || "";
-      const body = (await request.json().catch(() => null)) as { fileId?: string } | null;
-      if (!token || !ownerId || !generationId || !body?.fileId) return json({ error: "invalid capability" }, 401);
-      try {
-        await verifyAttachment(hexKey(env.ATTACHMENT_CAPABILITY_KEY), token, body.fileId, ownerId, generationId);
-      } catch {
-        return json({ error: "invalid capability" }, 401);
-      }
-      const file = await new TelegramApi(env.TELEGRAM_BOT_TOKEN).fetchFile(body.fileId);
-      if (!file) return json({ error: "attachment service unavailable" }, 503);
-      return new Response(file.bytes.slice(), {
-        headers: { "content-type": file.mime, "cache-control": "no-store" },
-      });
+      return resolveAttachment(request, env);
     }
 
     if (url.pathname.startsWith("/v1/cron/")) {

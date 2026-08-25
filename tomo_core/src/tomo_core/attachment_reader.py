@@ -61,4 +61,13 @@ class ControlAttachmentReader:
 
 def _valid_context(control_url: object, capability: object, owner_id: object, generation_id: object) -> bool:
     parsed = urlparse(control_url) if isinstance(control_url, str) else None
-    return bool(parsed and parsed.scheme == "https" and parsed.netloc and not parsed.username and not parsed.password and all(isinstance(value, str) and value for value in (capability, owner_id, generation_id)))
+    secure_control = bool(
+        parsed
+        and (
+            (parsed.scheme == "https" and parsed.netloc)
+            or (parsed.scheme == "http" and parsed.netloc == "tomo.control")
+        )
+        and not parsed.username
+        and not parsed.password
+    )
+    return bool(secure_control and all(isinstance(value, str) and value for value in (capability, owner_id, generation_id)))

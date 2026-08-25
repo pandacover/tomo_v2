@@ -584,26 +584,28 @@ export class OwnerDO extends DurableObject<Env> {
       TOMO_VISION_MODEL: this.env.TOMO_VISION_MODEL,
       ...extra,
     };
-    if (options.interactive && origin.startsWith("https://")) {
-      const cronKey = hexKey(this.env.CRON_CAPABILITY_KEY);
-      env.TOMO_CRON_CONTROL_URL = origin;
-      env.TOMO_CRON_CAPABILITY = await issueCron(cronKey, {
-        owner_id: this.tomoId(),
-        actor_id: actorId,
-        destination: `telegram:${chatId}`,
-        session_id: `telegram:actor:${actorId}`,
-        issued_at: now,
-        expires_at: now + 300,
-        operations: CRON_OPS,
-      });
-      env.TOMO_CRON_OWNER_ID = this.tomoId();
-      env.TOMO_CRON_ACTOR_ID = actorId;
-      env.TOMO_CRON_DESTINATION = `telegram:${chatId}`;
-      env.TOMO_CRON_SESSION_ID = `telegram:actor:${actorId}`;
+    if (options.interactive) {
+      if (origin.startsWith("https://")) {
+        const cronKey = hexKey(this.env.CRON_CAPABILITY_KEY);
+        env.TOMO_CRON_CONTROL_URL = origin;
+        env.TOMO_CRON_CAPABILITY = await issueCron(cronKey, {
+          owner_id: this.tomoId(),
+          actor_id: actorId,
+          destination: `telegram:${chatId}`,
+          session_id: `telegram:actor:${actorId}`,
+          issued_at: now,
+          expires_at: now + 300,
+          operations: CRON_OPS,
+        });
+        env.TOMO_CRON_OWNER_ID = this.tomoId();
+        env.TOMO_CRON_ACTOR_ID = actorId;
+        env.TOMO_CRON_DESTINATION = `telegram:${chatId}`;
+        env.TOMO_CRON_SESSION_ID = `telegram:actor:${actorId}`;
+      }
       if (options.images.length > 0) {
         const hashes = [];
         for (const fileId of options.images.slice(0, 8)) hashes.push(await sha256Hex(fileId));
-        env.TOMO_ATTACHMENT_CONTROL_URL = origin;
+        env.TOMO_ATTACHMENT_CONTROL_URL = "http://tomo.control";
         env.TOMO_ATTACHMENT_CAPABILITY = await issueAttachment(hexKey(this.env.ATTACHMENT_CAPABILITY_KEY), {
           owner_id: this.tomoId(),
           generation_id: generationId,
