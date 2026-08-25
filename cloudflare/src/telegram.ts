@@ -116,19 +116,37 @@ export class TelegramApi {
     }
   }
 
-  async react(chatId: string, messageId: string, emoji: string): Promise<void> {
+  async react(
+    chatId: string,
+    messageId: string,
+    emoji: string,
+  ): Promise<{ ok: true } | { ok: false; code: string }> {
+    const numericMessageId = Number(messageId);
+    if (!chatId || !Number.isSafeInteger(numericMessageId) || numericMessageId <= 0) {
+      return { ok: false, code: "invalid_target" };
+    }
     try {
-      await fetch(`https://api.telegram.org/bot${this.token}/setMessageReaction`, {
+      const response = await fetch(`https://api.telegram.org/bot${this.token}/setMessageReaction`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           chat_id: chatId,
-          message_id: Number(messageId),
+          message_id: numericMessageId,
           reaction: [{ type: "emoji", emoji }],
+          is_big: false,
         }),
       });
+      let payload: { ok?: boolean; result?: boolean; error_code?: number };
+      try {
+        payload = (await response.json()) as { ok?: boolean; result?: boolean; error_code?: number };
+      } catch {
+        return { ok: false, code: response.ok ? "invalid_response" : `http_${response.status}` };
+      }
+      if (response.ok && payload.ok === true && payload.result === true) return { ok: true };
+      if (typeof payload.error_code === "number") return { ok: false, code: `telegram_${payload.error_code}` };
+      return { ok: false, code: response.ok ? "telegram_rejected" : `http_${response.status}` };
     } catch {
-      // reactions are best-effort
+      return { ok: false, code: "transport" };
     }
   }
 

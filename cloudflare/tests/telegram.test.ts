@@ -69,3 +69,40 @@ test("treats Telegram photo downloads with a generic content type as JPEG", asyn
     globalThis.fetch = originalFetch;
   }
 });
+
+test("sends a bounded Telegram reaction and verifies the Bot API result", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestBody: Record<string, unknown> | null = null;
+  globalThis.fetch = async (_input, init) => {
+    requestBody = JSON.parse(String(init?.body));
+    return Response.json({ ok: true, result: true });
+  };
+  try {
+    const result = await new TelegramApi("token").react("123", "7", "👍");
+    assert.deepEqual(result, { ok: true });
+    assert.deepEqual(requestBody, {
+      chat_id: "123",
+      message_id: 7,
+      reaction: [{ type: "emoji", emoji: "👍" }],
+      is_big: false,
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("classifies Telegram reaction rejection without exposing its description", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => Response.json(
+    { ok: false, error_code: 400, description: "sensitive upstream detail" },
+    { status: 400 },
+  );
+  try {
+    assert.deepEqual(await new TelegramApi("token").react("123", "7", "👍"), {
+      ok: false,
+      code: "telegram_400",
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

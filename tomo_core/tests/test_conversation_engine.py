@@ -577,7 +577,7 @@ class ConversationEngineTests(unittest.TestCase):
     def test_missing_frame_uses_schema_enforced_frame_batch_repair_when_supported(self):
         provider = StructuredRepairProvider(
             [[ProviderStreamCompleted("stop")]],
-            [[ProviderTextDelta('{"frames":[{"text":"First answer."},{"text":"Second answer."},{"text":"Third answer."}]}'), ProviderStreamCompleted("stop")]],
+            [[ProviderTextDelta('{"frames":[{"text":"First answer."},{"text":"Second answer."},{"text":"Third answer."}],"reaction":"👏"}'), ProviderStreamCompleted("stop")]],
         )
 
         result = ConversationEngine(provider).respond(self.request())
@@ -589,6 +589,8 @@ class ConversationEngineTests(unittest.TestCase):
         messages, response_format, actor_id = provider.structured_calls[0]
         self.assertIn("response schema overrides the JSONL output contract for this repair only", messages[0]["content"])
         self.assertEqual(response_format["json_schema"]["schema"]["properties"]["frames"]["maxItems"], 3)
+        self.assertEqual(response_format["json_schema"]["schema"]["properties"]["reaction"]["enum"][-1], None)
+        self.assertEqual(result.plan.reaction.emoji, "👏")
         self.assertEqual(actor_id, "u1")
 
     def test_missing_frame_failure_distinguishes_reasoning_only_and_nonempty_content(self):

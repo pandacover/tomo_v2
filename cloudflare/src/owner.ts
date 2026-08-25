@@ -514,8 +514,23 @@ export class OwnerDO extends DurableObject<Env> {
         errorClass = "stale";
         continue;
       }
-      if (event.type === "reaction" && last?.messageId) {
-        await telegram.react(chatId, last.messageId, event.emoji);
+      if (event.type === "reaction") {
+        if (!last?.messageId || event.target_message_id !== last.messageId) {
+          logOps({
+            event: "telegram_reaction_suppressed",
+            tomo_id: this.tomoId(),
+            generation_id: generationId,
+            code: "target_mismatch",
+          });
+          continue;
+        }
+        const reaction = await telegram.react(chatId, event.target_message_id, event.emoji);
+        logOps({
+          event: reaction.ok ? "telegram_reaction_sent" : "telegram_reaction_failed",
+          tomo_id: this.tomoId(),
+          generation_id: generationId,
+          code: reaction.ok ? undefined : reaction.code,
+        });
         continue;
       }
       if (event.type === "frame") {

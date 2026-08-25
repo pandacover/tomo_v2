@@ -16,12 +16,40 @@ from ..tools import ToolRegistry
 from .. import latency_trace
 from .contract import PlanSource, synthesized_tool_plan
 from .framing import SegmentFrameParser
-from .models import ConversationRequest, Frame, FrameReady, MemoryControlReady, MovePlan, ReactionWindowReady, SegmentFinish, SegmentResult, TurnBudget, TurnRunCompleted, TurnRunEvent, TurnRunResult, TurnRunStarted, TurnRunStatus, TurnUsage
+from .models import ConversationRequest, Frame, FrameReady, MemoryControlReady, MovePlan, REACTION_EMOJI_OPTIONS, ReactionWindowReady, SegmentFinish, SegmentResult, TurnBudget, TurnRunCompleted, TurnRunEvent, TurnRunResult, TurnRunStarted, TurnRunStatus, TurnUsage
 from .parsing import ConversationOutputError
 from .prompts import build_first_segment_repair_messages, build_segment_messages, build_segment_repair_messages, build_structured_frame_repair_messages
 
 
-def _structured_frame_response_format(budget: TurnBudget) -> dict[str, object]:
+def _structured_frame_response_format(budget: TurnBudget, *, include_reaction: bool = False) -> dict[str, object]:
+    properties: dict[str, object] = {
+        "frames": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": budget.max_frames_per_segment,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": budget.max_chars_per_frame,
+                        "description": "One user-visible Tomo message with no Markdown or internal labels.",
+                    },
+                },
+                "required": ["text"],
+                "additionalProperties": False,
+            },
+        },
+    }
+    required = ["frames"]
+    if include_reaction:
+        properties["reaction"] = {
+            "type": ["string", "null"],
+            "enum": [*REACTION_EMOJI_OPTIONS, None],
+            "description": "A sparse Telegram reaction intent for the incoming message, or null.",
+        }
+        required.append("reaction")
     return {
         "type": "json_schema",
         "json_schema": {
@@ -29,27 +57,8 @@ def _structured_frame_response_format(budget: TurnBudget) -> dict[str, object]:
             "strict": True,
             "schema": {
                 "type": "object",
-                "properties": {
-                    "frames": {
-                        "type": "array",
-                        "minItems": 1,
-                        "maxItems": budget.max_frames_per_segment,
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "text": {
-                                    "type": "string",
-                                    "minLength": 1,
-                                    "maxLength": budget.max_chars_per_frame,
-                                    "description": "One user-visible Tomo message with no Markdown or internal labels.",
-                                },
-                            },
-                            "required": ["text"],
-                            "additionalProperties": False,
-                        },
-                    },
-                },
-                "required": ["frames"],
+                "properties": properties,
+                "required": required,
                 "additionalProperties": False,
             },
         },
@@ -60,17 +69,32 @@ def _parse_structured_frame_repair(
     text: str,
     parser: SegmentFrameParser,
     budget: TurnBudget,
+    *,
+    include_reaction: bool = False,
 ) -> list[object]:
     try:
         payload = json.loads(text)
     except json.JSONDecodeError:
         raise ConversationOutputError("invalid_json_object") from None
-    if not isinstance(payload, dict) or set(payload) != {"frames"}:
+    expected_fields = {"frames", "reaction"} if include_reaction else {"frames"}
+    if not isinstance(payload, dict) or set(payload) != expected_fields:
         raise ConversationOutputError("invalid_frame_batch")
     frames = payload["frames"]
     if not isinstance(frames, list) or not 1 <= len(frames) <= budget.max_frames_per_segment:
         raise ConversationOutputError("invalid_frame_batch")
     records: list[object] = []
+    if include_reaction:
+        reaction = payload["reaction"]
+        if reaction is not None and reaction not in REACTION_EMOJI_OPTIONS:
+            raise ConversationOutputError("invalid_frame_batch")
+        records.extend(parser.feed(json.dumps({
+            "type": "turn_plan",
+            "primary_move": "answer",
+            "supporting_moves": [],
+            "response_goal": "answer the user",
+            "confidence": "low",
+            "reaction": reaction,
+        }, ensure_ascii=False) + "\n"))
     for frame in frames:
         if not isinstance(frame, dict) or set(frame) != {"text"}:
             raise ConversationOutputError("invalid_frame_batch")
@@ -258,6 +282,7 @@ class ConversationEngine:
                 parser = SegmentFrameParser(index, first_segment=plan is None, budget=segment_budget)
                 structured_stream = getattr(self.provider, "stream_structured", None)
                 structured_frame_repair = replacement and bool(repair_code and repair_code.startswith("missing_frame")) and callable(structured_stream)
+                structured_reaction = structured_frame_repair and index == 0 and plan is None and not isinstance(request.burst, (AutomationTurn, PeerTurn))
                 if structured_frame_repair:
                     schemas = ()
                     messages = build_structured_frame_repair_messages(
@@ -432,7 +457,7 @@ class ConversationEngine:
                     if structured_frame_repair:
                         stream = structured_stream(
                             messages,
-                            response_format=_structured_frame_response_format(segment_budget),
+                            response_format=_structured_frame_response_format(segment_budget, include_reaction=structured_reaction),
                             actor_id=actor_id,
                         )
                     else:
@@ -530,7 +555,12 @@ class ConversationEngine:
                 if failure is None:
                     try:
                         parsed_records = (
-                            _parse_structured_frame_repair("".join(raw), parser, segment_budget)
+                            _parse_structured_frame_repair(
+                                "".join(raw),
+                                parser,
+                                segment_budget,
+                                include_reaction=structured_reaction,
+                            )
                             if structured_frame_repair
                             else parser.finish()
                         )

@@ -48,6 +48,15 @@ test("parses frame and error events and ignores latency", () => {
   assert.equal(parseEventLine("TOMO_SANDBOX_LATENCY_V1=phase=sandbox_runtime_entry outcome=ok elapsed_ms=0", "r1", "g1"), null);
 });
 
+test("keeps the runtime-bound reaction target", () => {
+  const reaction = parseEventLine(
+    'TOMO_SANDBOX_EVENT={"version":5,"request_id":"r1","generation_id":"g1","sequence":0,"type":"reaction","owner_id":"owner","actor_id":"123","chat_id":"123","target_message_id":"7","reaction_generation_id":"g1","revision":1,"emoji":"👍"}',
+    "r1",
+    "g1",
+  );
+  assert.deepEqual(reaction, { type: "reaction", sequence: 0, emoji: "👍", target_message_id: "7" });
+});
+
 test("splitLines carries partial chunks", () => {
   const first = splitLines("a\nb\nhe", "");
   assert.deepEqual(first.lines, ["a", "b"]);
