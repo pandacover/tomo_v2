@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from tomo_core.cli import _log_shared_gateway_error, build_vision_interpreter, main
+from tomo_core.cli import _log_shared_gateway_error, _sandbox_vision_provider_from_env, build_vision_interpreter, main
 from tomo_core.cron_models import CronJob, JobIntent, ScheduleSpec
 from tomo_core.cron_store import CronStore
 from tomo_core.telegram_router import RetryableTelegramUpdateError
@@ -261,6 +261,26 @@ class CliTests(unittest.TestCase):
         self.assertEqual(provider.base_url, OPENROUTER_BASE_URL)
         self.assertEqual(provider.model, DEFAULT_OPENROUTER_AGENT_MODEL)
         self.assertEqual(run_once.call_args.kwargs["secret_values"], ("or-key",))
+
+    def test_sandbox_openrouter_vision_omits_xai_store_parameter(self):
+        from tomo_core.providers import OPENROUTER_BASE_URL
+
+        with patch.dict(
+            "os.environ",
+            {
+                "OPENROUTER_API_KEY": "or-key",
+                "TOMO_VISION_MODEL": "meta/muse-spark-1.2-contributor",
+                "TOMO_XAI_VISION_REASONING_EFFORT": "low",
+            },
+            clear=True,
+        ):
+            provider = _sandbox_vision_provider_from_env("or-key")
+
+        self.assertIsInstance(provider, XaiApiProvider)
+        self.assertEqual(provider.base_url, OPENROUTER_BASE_URL)
+        self.assertEqual(provider.model, "meta/muse-spark-1.2-contributor")
+        self.assertEqual(provider.reasoning_effort, "low")
+        self.assertIsNone(provider.store)
 
     def test_sandbox_health_reads_environment_payload_without_constructing_a_provider(self):
         with (

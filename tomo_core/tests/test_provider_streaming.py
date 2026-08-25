@@ -100,6 +100,24 @@ class ProviderStreamingTests(unittest.TestCase):
         self.assertEqual(body["max_tokens"], 4096)
         self.assertEqual(body["reasoning"], {"effort": "high", "exclude": True})
 
+    def test_openrouter_vision_structured_stream_omits_xai_store_parameter(self):
+        terminal = json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}]})
+        provider = XaiApiProvider(
+            api_key="or-key",
+            model="meta/muse-spark-1.2-contributor",
+            base_url="https://openrouter.ai/api/v1",
+            reasoning_effort="low",
+        )
+        messages = [{"role": "user", "content": [{"type": "text", "text": "describe"}, {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,abc"}}]}]
+
+        with patch("tomo_core.providers.httpx.stream", return_value=FakeStreamResponse(sse_chunks(terminal, "[DONE]"))) as stream:
+            list(provider.stream_structured(messages, response_format=STRUCTURED_RESPONSE_FORMAT))
+
+        body = stream.call_args.kwargs["json"]
+        self.assertEqual(body["provider"], {"require_parameters": True})
+        self.assertEqual(body["reasoning_effort"], "low")
+        self.assertNotIn("store", body)
+
     def test_oauth_backed_and_grok_auth_providers_forward_structured_streams(self):
         oauth = type("OAuth", (), {"token_path": lambda *_: type("Path", (), {"exists": lambda _: True, "read_text": lambda _, **__: '{"access_token":"unused"}'})()})()
         auth_store = type("AuthStore", (), {"access_token": lambda _: "unused"})()

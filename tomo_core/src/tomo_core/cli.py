@@ -407,7 +407,6 @@ def _sandbox_vision_provider_from_env(credential: str):
             model=os.getenv("TOMO_VISION_MODEL") or os.getenv("TOMO_XAI_VISION_MODEL") or DEFAULT_OPENROUTER_VISION_MODEL,
             base_url=OPENROUTER_BASE_URL,
             reasoning_effort=effort,
-            store=False,
         )
     return supergrok_oauth_provider_from_access_token(
         credential,
