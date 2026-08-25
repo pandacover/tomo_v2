@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { compactPrivateMessage } from "../src/telegram.ts";
+import { compactPrivateMessage, TelegramApi } from "../src/telegram.ts";
 
 test("keeps private text DMs and drops groups", () => {
   const dm = compactPrivateMessage({
@@ -48,4 +48,24 @@ test("uses the largest photo and caption", () => {
   assert.equal(compact?.photoFileId, "large");
   assert.equal(compact?.text, "look");
   assert.equal(compact?.photoMeta.width, 100);
+});
+
+test("treats Telegram photo downloads with a generic content type as JPEG", async () => {
+  const originalFetch = globalThis.fetch;
+  let request = 0;
+  globalThis.fetch = async () => {
+    request += 1;
+    if (request === 1) {
+      return Response.json({ ok: true, result: { file_path: "photos/file_1.jpg" } });
+    }
+    return new Response(new Uint8Array([0xff, 0xd8, 0xff]), {
+      headers: { "content-type": "application/octet-stream" },
+    });
+  };
+  try {
+    const result = await new TelegramApi("token").fetchFile("file-id");
+    assert.equal(result?.mime, "image/jpeg");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });

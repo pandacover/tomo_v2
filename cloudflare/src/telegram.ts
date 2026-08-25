@@ -145,9 +145,16 @@ export class TelegramApi {
     if (!file.ok) return null;
     const bytes = new Uint8Array(await file.arrayBuffer());
     if (bytes.byteLength > 10 * 1024 * 1024) return null;
-    const mime = file.headers.get("content-type") || "image/jpeg";
+    const contentType = file.headers.get("content-type") || "";
+    const mime = contentType.startsWith("image/") ? contentType : photoMime(payload.result.file_path);
     return { bytes, mime };
   }
+}
+
+function photoMime(filePath: string): string {
+  if (/\.png$/i.test(filePath)) return "image/png";
+  if (/\.webp$/i.test(filePath)) return "image/webp";
+  return "image/jpeg";
 }
 
 export async function equalSecret(left: string, right: string): Promise<boolean> {

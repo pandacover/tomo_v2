@@ -48,15 +48,26 @@ class ControlAttachmentReader:
             with self.opener(request, timeout=10) as response:
                 mime_type = response.headers.get_content_type()
                 if not mime_type.startswith("image/"):
-                    raise AttachmentReadError("attachment_unavailable")
+                    raise AttachmentReadError("attachment_invalid_mime")
                 data = response.read(10 * 1024 * 1024 + 1)
         except AttachmentReadError:
             raise
         except HTTPError as error:
-            code = "attachment_auth_failed" if error.code == 401 else "attachment_source_failed" if error.code == 503 else "attachment_unavailable"
+            if error.code == 401:
+                code = "attachment_auth_failed"
+            elif error.code == 503:
+                code = "attachment_source_failed"
+            elif 400 <= error.code < 500:
+                code = "attachment_http_4xx"
+            elif error.code >= 500:
+                code = "attachment_http_5xx"
+            else:
+                code = "attachment_http_error"
             raise AttachmentReadError(code) from None
-        except (URLError, OSError, ValueError):
-            raise AttachmentReadError("attachment_unavailable") from None
+        except URLError:
+            raise AttachmentReadError("attachment_transport_failed") from None
+        except (OSError, ValueError):
+            raise AttachmentReadError("attachment_read_failed") from None
         if len(data) > 10 * 1024 * 1024:
             raise AttachmentReadError("attachment_too_large")
         return DownloadedAttachment(data, mime_type)

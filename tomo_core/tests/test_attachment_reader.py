@@ -25,7 +25,7 @@ class ControlAttachmentReaderTests(unittest.TestCase):
         self.assertEqual(reader.read(attachment).data, b"jpeg")
         internal = ControlAttachmentReader("http://tomo.control", "capability", "owner", "generation", lambda request, timeout: Response(b"jpeg"))
         self.assertEqual(internal.read(attachment).data, b"jpeg")
-        for response, code in ((Response(b"x", "text/plain"), "attachment_unavailable"), (Response(b"x" * (10 * 1024 * 1024 + 1)), "attachment_too_large")):
+        for response, code in ((Response(b"x", "text/plain"), "attachment_invalid_mime"), (Response(b"x" * (10 * 1024 * 1024 + 1)), "attachment_too_large")):
             with self.subTest(code=code), self.assertRaisesRegex(AttachmentReadError, code):
                 ControlAttachmentReader("https://control.example", "capability", "owner", "generation", lambda request, timeout: response).read(attachment)
 
@@ -33,9 +33,9 @@ class ControlAttachmentReaderTests(unittest.TestCase):
         attachment = MessageAttachment("image", file_id="secret-file")
         cases = (
             (HTTPError("https://secret", 401, "secret-body", {}, None), "attachment_auth_failed"),
-            (HTTPError("https://secret", 413, "secret-body", {}, None), "attachment_unavailable"),
-            (HTTPError("https://secret", 500, "secret-body", {}, None), "attachment_unavailable"),
-            (URLError("secret-body"), "attachment_unavailable"),
+            (HTTPError("https://secret", 413, "secret-body", {}, None), "attachment_http_4xx"),
+            (HTTPError("https://secret", 500, "secret-body", {}, None), "attachment_http_5xx"),
+            (URLError("secret-body"), "attachment_transport_failed"),
         )
         for error, code in cases:
             with self.subTest(error=error), self.assertRaises(AttachmentReadError) as raised:

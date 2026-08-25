@@ -23,8 +23,14 @@ _MAX_ITEM_LENGTH = 1000
 _MAX_ITEMS = 8
 _UNAVAILABLE_CODES = frozenset({
     "attachment_auth_failed",
+    "attachment_http_4xx",
+    "attachment_http_5xx",
+    "attachment_http_error",
+    "attachment_invalid_mime",
+    "attachment_read_failed",
     "attachment_source_failed",
     "attachment_too_large",
+    "attachment_transport_failed",
     "attachment_unavailable",
     "unsupported_image",
     "vision_invalid_response",
