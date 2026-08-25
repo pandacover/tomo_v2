@@ -43,6 +43,24 @@ jobs:
       - name: Install
         run: npm ci
 
+      - name: Configure models
+        env:
+          TOMO_CORE_MODEL: ${{ secrets.TOMO_CORE_MODEL }}
+          TOMO_MM_MODEL: ${{ secrets.TOMO_MM_MODEL }}
+        run: |
+          if [[ -z "$TOMO_CORE_MODEL" || -z "$TOMO_MM_MODEL" ]]; then
+            echo "::error::TOMO_CORE_MODEL and TOMO_MM_MODEL must both be configured."
+            exit 1
+          fi
+          node --input-type=module -e '
+            import fs from "node:fs";
+            const path = "wrangler.jsonc";
+            const config = JSON.parse(fs.readFileSync(path, "utf8"));
+            config.vars.TOMO_AGENT_MODEL = process.env.TOMO_CORE_MODEL;
+            config.vars.TOMO_VISION_MODEL = process.env.TOMO_MM_MODEL;
+            fs.writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`);
+          '
+
       - name: Types
         run: npm run types
 
