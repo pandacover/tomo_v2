@@ -7,6 +7,7 @@ import {
   encodeAutomation,
   encodeInbound,
   envelopeFromCompact,
+  parseDiagnosticLine,
   parseEventLine,
   requestIdFor,
   splitLines,
@@ -378,6 +379,7 @@ export class OwnerDO extends DurableObject<Env> {
       let firstFrame = true;
       let exitCode: number | null = null;
       let stderrPresent = false;
+      const diagnosticCodes = new Set<string>();
       for await (const event of parseSSEStream<ExecEvent>(stream)) {
         if (event.type === "stdout") {
           const split = splitLines(event.data || "", carry);
@@ -390,6 +392,7 @@ export class OwnerDO extends DurableObject<Env> {
             telegram,
             last,
             firstFrame,
+            diagnosticCodes,
           );
           firstFrame = flag.firstFrame;
           if (flag.errorClass) errorClass = flag.errorClass;
@@ -410,6 +413,7 @@ export class OwnerDO extends DurableObject<Env> {
           telegram,
           last,
           firstFrame,
+          diagnosticCodes,
         );
         if (flag.errorClass) errorClass = flag.errorClass;
       }
@@ -474,9 +478,19 @@ export class OwnerDO extends DurableObject<Env> {
     telegram: TelegramApi,
     last: CompactUpdate | null,
     firstFrame: boolean,
+    diagnosticCodes: Set<string>,
   ): Promise<{ firstFrame: boolean; errorClass: string | null }> {
     let errorClass: string | null = null;
     for (const line of lines) {
+      const diagnostic = parseDiagnosticLine(line);
+      if (diagnostic) {
+        if (!diagnosticCodes.has(diagnostic) && this.generationActive(generationId)) {
+          diagnosticCodes.add(diagnostic);
+          logOps({ event: "vision_diagnostic", tomo_id: this.tomoId(), generation_id: generationId, code: diagnostic });
+          await telegram.sendMessage(chatId, `Vision diagnostic: ${diagnostic}`);
+        }
+        continue;
+      }
       let event;
       try {
         event = parseEventLine(line, requestId, generationId);
@@ -582,6 +596,7 @@ export class OwnerDO extends DurableObject<Env> {
       OPENROUTER_API_KEY: this.env.OPENROUTER_API_KEY,
       TOMO_AGENT_MODEL: this.env.TOMO_AGENT_MODEL,
       TOMO_VISION_MODEL: this.env.TOMO_VISION_MODEL,
+      TOMO_VISION_DIAGNOSTICS: "1",
       ...extra,
     };
     if (options.interactive) {

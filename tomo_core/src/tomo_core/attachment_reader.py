@@ -52,7 +52,10 @@ class ControlAttachmentReader:
                 data = response.read(10 * 1024 * 1024 + 1)
         except AttachmentReadError:
             raise
-        except (HTTPError, URLError, OSError, ValueError):
+        except HTTPError as error:
+            code = "attachment_auth_failed" if error.code == 401 else "attachment_source_failed" if error.code == 503 else "attachment_unavailable"
+            raise AttachmentReadError(code) from None
+        except (URLError, OSError, ValueError):
             raise AttachmentReadError("attachment_unavailable") from None
         if len(data) > 10 * 1024 * 1024:
             raise AttachmentReadError("attachment_too_large")

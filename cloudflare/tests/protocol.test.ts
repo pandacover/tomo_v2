@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { encodeInbound, parseEventLine, requestIdFor, splitLines } from "../src/protocol.ts";
+import { encodeInbound, parseDiagnosticLine, parseEventLine, requestIdFor, splitLines } from "../src/protocol.ts";
 
 test("inbound envelope is protocol v2", () => {
   const payload = JSON.parse(
@@ -54,4 +54,11 @@ test("splitLines carries partial chunks", () => {
   const second = splitLines("llo\n", first.rest);
   assert.deepEqual(second.lines, ["hello"]);
   assert.equal(requestIdFor("chat:1:r2").startsWith("telegram-generation-"), true);
+});
+
+test("parses only fixed sandbox diagnostic codes", () => {
+  assert.equal(parseDiagnosticLine("TOMO_SANDBOX_DIAGNOSTIC=attachment_auth_failed"), "attachment_auth_failed");
+  assert.equal(parseDiagnosticLine("TOMO_SANDBOX_DIAGNOSTIC=vision_provider_timeout"), "vision_provider_timeout");
+  assert.equal(parseDiagnosticLine("TOMO_SANDBOX_DIAGNOSTIC=unsupported_image"), "unsupported_image");
+  assert.equal(parseDiagnosticLine("TOMO_SANDBOX_DIAGNOSTIC=secret=value"), null);
 });

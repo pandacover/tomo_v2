@@ -31,10 +31,16 @@ class ControlAttachmentReaderTests(unittest.TestCase):
 
     def test_reader_classifies_transport_and_invalid_context_without_leaks(self):
         attachment = MessageAttachment("image", file_id="secret-file")
-        for error in (HTTPError("https://secret", 401, "secret-body", {}, None), HTTPError("https://secret", 413, "secret-body", {}, None), HTTPError("https://secret", 500, "secret-body", {}, None), URLError("secret-body")):
+        cases = (
+            (HTTPError("https://secret", 401, "secret-body", {}, None), "attachment_auth_failed"),
+            (HTTPError("https://secret", 413, "secret-body", {}, None), "attachment_unavailable"),
+            (HTTPError("https://secret", 500, "secret-body", {}, None), "attachment_unavailable"),
+            (URLError("secret-body"), "attachment_unavailable"),
+        )
+        for error, code in cases:
             with self.subTest(error=error), self.assertRaises(AttachmentReadError) as raised:
                 ControlAttachmentReader("https://control.example", "secret-capability", "owner", "generation", lambda request, timeout: (_ for _ in ()).throw(error)).read(attachment)
-            self.assertEqual(str(raised.exception), "attachment_unavailable")
+            self.assertEqual(str(raised.exception), code)
             self.assertNotIn("secret", str(raised.exception))
         for args in (("not-a-url", "cap", "owner", "generation"), ("http://control.example", "cap", "owner", "generation"), ("https://control.example", "", "owner", "generation")):
             with self.subTest(args=args), self.assertRaisesRegex(AttachmentReadError, "attachment_invalid"):

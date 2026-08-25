@@ -2,6 +2,7 @@ import type { CompactUpdate } from "./telegram";
 
 const EVENT_MARKER = "TOMO_SANDBOX_EVENT=";
 const LATENCY_MARKER = "TOMO_SANDBOX_LATENCY_V1=";
+const DIAGNOSTIC_MARKER = "TOMO_SANDBOX_DIAGNOSTIC=";
 
 export interface InboundBurst {
   burst_id: string;
@@ -106,6 +107,12 @@ export function splitLines(chunk: string, carry: string): { lines: string[]; res
   const parts = combined.split(/\r?\n/);
   const rest = parts.pop() ?? "";
   return { lines: parts, rest };
+}
+
+export function parseDiagnosticLine(line: string): string | null {
+  if (!line.startsWith(DIAGNOSTIC_MARKER)) return null;
+  const code = line.slice(DIAGNOSTIC_MARKER.length);
+  return /^(?:attachment_[a-z0-9_]+|unsupported_image|vision_[a-z0-9_]+)$/.test(code) ? code : null;
 }
 
 export function requestIdFor(generationId: string): string {
