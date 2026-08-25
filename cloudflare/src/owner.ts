@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { getSandbox } from "@cloudflare/sandbox";
+import { getSandbox, parseSSEStream, type ExecEvent } from "@cloudflare/sandbox";
 import type { Env } from "./env";
 import { hexKey, logOps } from "./env";
 import { CRON_OPS, issueAttachment, issueCron, sha256Hex } from "./hmac";
@@ -9,6 +9,7 @@ import {
   envelopeFromCompact,
   parseEventLine,
   requestIdFor,
+  splitLines,
   type InboundBurst,
 } from "./protocol";
 import { TelegramApi, type CompactUpdate } from "./telegram";
@@ -372,18 +373,57 @@ export class OwnerDO extends DurableObject<Env> {
       await this.prepareGuest(sandbox);
       const env = await this.guestEnv(generationId, chatId, actorId, extraEnv, options);
       const timeout = 240_000 + Math.min(options.images.length, 8) * 75_000;
-      const result = await this.execGuest(sandbox, env, timeout, false);
-      const lines = result.stdout.split(/\r?\n/).filter((line) => line.length > 0);
-      const flag = await this.handleLines(lines, generationId, chatId, requestId, telegram, last, true);
-      errorClass = flag.errorClass;
-      if (!result.success && !errorClass) errorClass = result.exitCode === 124 ? "sandbox_timeout" : `sandbox_exit_${result.exitCode}`;
+      const stream = await this.execGuestStream(sandbox, env, timeout);
+      let carry = "";
+      let firstFrame = true;
+      let exitCode: number | null = null;
+      let stderrPresent = false;
+      for await (const event of parseSSEStream<ExecEvent>(stream)) {
+        if (event.type === "stdout") {
+          const split = splitLines(event.data || "", carry);
+          carry = split.rest;
+          const flag = await this.handleLines(
+            split.lines,
+            generationId,
+            chatId,
+            requestId,
+            telegram,
+            last,
+            firstFrame,
+          );
+          firstFrame = flag.firstFrame;
+          if (flag.errorClass) errorClass = flag.errorClass;
+        } else if (event.type === "stderr") {
+          stderrPresent = stderrPresent || Boolean(event.data);
+        } else if (event.type === "complete") {
+          exitCode = typeof event.exitCode === "number" ? event.exitCode : null;
+        } else if (event.type === "error") {
+          throw new Error(`sandbox_stream_${event.error || "failed"}`);
+        }
+      }
+      if (carry.trim()) {
+        const flag = await this.handleLines(
+          [carry],
+          generationId,
+          chatId,
+          requestId,
+          telegram,
+          last,
+          firstFrame,
+        );
+        if (flag.errorClass) errorClass = flag.errorClass;
+      }
+      if (exitCode === null && !errorClass) errorClass = "sandbox_stream_incomplete";
+      if (exitCode !== null && exitCode !== 0 && !errorClass) {
+        errorClass = exitCode === 124 ? "sandbox_timeout" : `sandbox_exit_${exitCode}`;
+      }
       logOps({
         event: "exec_result",
         tomo_id: this.tomoId(),
         generation_id: generationId,
-        exit_code: result.exitCode,
+        exit_code: exitCode,
         error_class: errorClass,
-        stderr_present: result.stderr ? 1 : 0,
+        stderr_present: stderrPresent ? 1 : 0,
       });
       if (this.generationActive(generationId) && !abort.signal.aborted) {
         await this.checkpoint(sandbox);
@@ -583,15 +623,13 @@ export class OwnerDO extends DurableObject<Env> {
     await this.hydrate(sandbox);
   }
 
-  private async execGuest(
+  private async execGuestStream(
     sandbox: SandboxHandle,
     env: Record<string, string>,
     timeout: number,
-    health = false,
-  ): Promise<{ success: boolean; exitCode: number; stdout: string; stderr: string }> {
-    const command = health ? `${COMMAND} --health` : COMMAND;
+  ): Promise<ReadableStream> {
     return this.withContainerRetry(() =>
-      sandbox.exec(command, { env: { PYTHONUNBUFFERED: "1", ...env }, timeout }),
+      sandbox.execStream(COMMAND, { env: { PYTHONUNBUFFERED: "1", ...env }, timeout }),
     );
   }
 
