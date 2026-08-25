@@ -11,6 +11,9 @@ from .parsing import ConversationOutputError, _parse_memory_control_payload, _va
 class SegmentFrameParser:
     """Incrementally parses one model segment encoded as strict JSON Lines."""
 
+    _MAX_PREAMBLE_LINES = 16
+    _MAX_PREAMBLE_CHARS = 4096
+
     def __init__(self, segment_index: int, first_segment: bool, budget: TurnBudget) -> None:
         if not isinstance(segment_index, int) or isinstance(segment_index, bool) or segment_index < 0:
             raise ValueError("segment_index must be a non-negative integer")
@@ -22,6 +25,9 @@ class SegmentFrameParser:
         self._first_segment = first_segment
         self._budget = budget
         self._buffer = ""
+        self._record_seen = False
+        self._preamble_lines = 0
+        self._preamble_chars = 0
         self._plan_seen = False
         self._plan_source: PlanSource | None = None
         self._frame_count = 0
@@ -55,17 +61,28 @@ class SegmentFrameParser:
         try:
             payload = json.loads(line)
         except json.JSONDecodeError:
-            code = "invalid_json_object" if stripped.startswith("{") else "invalid_json_non_record"
-            raise ConversationOutputError(code) from None
+            if stripped.startswith("{"):
+                raise ConversationOutputError("invalid_json_object") from None
+            if not self._record_seen:
+                next_lines = self._preamble_lines + 1
+                next_chars = self._preamble_chars + len(stripped)
+                if next_lines <= self._MAX_PREAMBLE_LINES and next_chars <= self._MAX_PREAMBLE_CHARS:
+                    self._preamble_lines = next_lines
+                    self._preamble_chars = next_chars
+                    return []
+            raise ConversationOutputError("invalid_json_non_record") from None
         if not isinstance(payload, dict) or not isinstance(payload.get("type"), str):
             raise ConversationOutputError("invalid_record")
         record_type = payload["type"]
         if record_type == "turn_plan":
+            self._record_seen = True
             return [self._parse_plan(payload)]
         if record_type == "frame":
+            self._record_seen = True
             frame = self._parse_frame(payload)
             return self._synthesized_plan_if_needed() + [frame]
         if record_type == "memory_control":
+            self._record_seen = True
             control = self._parse_memory_control(payload)
             return self._synthesized_plan_if_needed() + [control]
         raise ConversationOutputError("invalid_record")

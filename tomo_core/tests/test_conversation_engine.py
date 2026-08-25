@@ -545,7 +545,7 @@ class ConversationEngineTests(unittest.TestCase):
     def test_empty_stop_and_malformed_json_still_use_one_repair(self):
         for first_attempt, repair_code in (
             ([ProviderStreamCompleted("stop")], "missing_frame"),
-            ([ProviderTextDelta("not json\n"), ProviderStreamCompleted("stop")], "invalid_json_non_record"),
+            ([ProviderTextDelta('{"type":"frame"\n'), ProviderStreamCompleted("stop")], "invalid_json_object"),
         ):
             with self.subTest(repair_code=repair_code):
                 provider = ScriptedProvider([
@@ -559,6 +559,18 @@ class ConversationEngineTests(unittest.TestCase):
                 self.assertEqual(result.usage.contract_repairs, 1)
                 self.assertEqual(len(provider.calls), 2)
                 self.assertIn(repair_code, provider.calls[1][0][0]["content"])
+
+    def test_non_json_preamble_before_valid_jsonl_does_not_require_repair(self):
+        provider = ScriptedProvider([[
+            ProviderTextDelta("Here is the JSONL response:\n" + CANONICAL_PLAN + '{"type":"frame","text":"Direct answer."}\n'),
+            ProviderStreamCompleted("stop"),
+        ]])
+
+        result = ConversationEngine(provider).respond(self.request())
+
+        self.assertEqual([frame.text for frame in result.frames], ["Direct answer."])
+        self.assertEqual(result.usage.contract_repairs, 0)
+        self.assertEqual(len(provider.calls), 1)
 
     def test_invalid_first_response_repairs_with_one_mutating_tool_call(self):
         from tomo_core.tools import BoundTool, ToolRegistry, ToolSpec

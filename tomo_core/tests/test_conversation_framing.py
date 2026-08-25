@@ -103,6 +103,24 @@ class SegmentFrameParserTests(unittest.TestCase):
         self.assertEqual(records, [MovePlan.direct_answer(), Frame(0, 0, "Direct answer.")])
         self.assertEqual(parser.finish(), [])
 
+    def test_ignores_bounded_non_json_preamble_before_the_first_record_only(self):
+        parser = SegmentFrameParser(segment_index=0, first_segment=True, budget=budget())
+
+        records = parser.feed(
+            "I will format the response now.\n"
+            "Here is the JSONL:\n"
+            '{"type":"frame","text":"Direct answer."}\n'
+        )
+
+        self.assertEqual(records, [MovePlan.direct_answer(), Frame(0, 0, "Direct answer.")])
+        with self.assertRaises(ConversationOutputError) as raised:
+            parser.feed("Trailing prose is still rejected.\n")
+        self.assertEqual(raised.exception.code, "invalid_json_non_record")
+
+        preamble_only = SegmentFrameParser(segment_index=0, first_segment=True, budget=budget())
+        self.assertEqual(preamble_only.feed("Here is the response:\n"), [])
+        self.assertEqual(preamble_only.finish(), [])
+
     def test_rejects_invalid_record_shapes_and_plan_ordering_with_safe_codes(self):
         cases = [
             ('{"type":"frame","text":"ok","extra":"x"}\n', "invalid_frame"),
@@ -133,7 +151,6 @@ class SegmentFrameParserTests(unittest.TestCase):
         cases = [
             (False, '{"type":"frame","text":"unfinished', "invalid_json_object"),
             (False, '{"type":"frame","text":"valid"} garbage', "invalid_json_object"),
-            (False, "Here is the response:", "invalid_json_non_record"),
         ]
         for first_segment, raw, code in cases:
             with self.subTest(code=code):
