@@ -90,6 +90,10 @@ On the operator Telegram chat:
 
 R2 key: `owners/<tomo_id>/tomo.sqlite3`. Copy a versioned object onto that key. Next turn hydrates the guest. Do not snapshot OwnerDO.
 
+If the object is missing, Tomo starts with an empty SQLite state and writes a new checkpoint after a successful turn. If the current object is corrupt, restore the most recent known-good R2 version onto the same key (or delete it only when an intentional empty reset is acceptable), destroy the owner sandbox, and retry. OwnerDO cron rows are independent of the guest checkpoint.
+
+Cron jobs advance only after their background generation reaches a terminal result. A delivered frame counts as a completed run even if a later provider error occurs, preventing an alarm retry from duplicating visible output. Failures before delivery retry after one minute. Mutations require both a revision and an idempotency key, and the latest 32 durable run outcomes are available through `cron_history`. One-shot, delayed, and interval schedules are supported; cron-expression schedules fail explicitly until timezone evaluation is implemented.
+
 ## Container lifecycle and provenance
 
 Production stays on `basic` (1 GiB memory). The earlier deterministic `lite` benchmark passed, but the complete live guest later produced container 500/OOM failures; reliability takes precedence over the smaller shape until a new live benchmark proves otherwise.

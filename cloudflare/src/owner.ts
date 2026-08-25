@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { getSandbox, isPlatformTransientError } from "@cloudflare/sandbox";
 import { cancelSupersededExecution } from "./cancellation";
+import { nextIntervalAt, parseCronSchedule, type CronScheduleInput } from "./cron-policy";
 import type { Env } from "./env";
 import { hexKey, logOps } from "./env";
 import { CRON_OPS, issueAttachment, issueCron, sha256Hex } from "./hmac";
@@ -108,6 +109,20 @@ export class OwnerDO extends DurableObject<Env> {
         successful_runs INTEGER NOT NULL DEFAULT 0,
         idempotency_key TEXT UNIQUE
       );
+      CREATE TABLE IF NOT EXISTS cron_runs (
+        run_id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL,
+        generation_id TEXT NOT NULL UNIQUE,
+        scheduled_at INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        completed_at INTEGER,
+        error_class TEXT
+      );
+      CREATE TABLE IF NOT EXISTS cron_receipts (
+        idempotency_key TEXT PRIMARY KEY,
+        request_hash TEXT NOT NULL,
+        response TEXT NOT NULL
+      );
     `);
     this.ensureGenerationColumn("process_id", "process_id TEXT");
     this.ensureGenerationColumn("stdout_offset", "stdout_offset INTEGER NOT NULL DEFAULT 0");
@@ -117,11 +132,18 @@ export class OwnerDO extends DurableObject<Env> {
     this.ensureGenerationColumn("diagnostic_codes", "diagnostic_codes TEXT NOT NULL DEFAULT '[]'");
     this.ensureGenerationColumn("stderr_present", "stderr_present INTEGER NOT NULL DEFAULT 0");
     this.ensureGenerationColumn("poll_failures", "poll_failures INTEGER NOT NULL DEFAULT 0");
+    this.ensureCronColumn("ends_at", "ends_at INTEGER");
+    this.ensureCronColumn("max_successful_runs", "max_successful_runs INTEGER");
   }
 
   private ensureGenerationColumn(name: string, definition: string): void {
     const columns = new Set(this.sql("PRAGMA table_info(generations)").map((row) => String(row.name)));
     if (!columns.has(name)) this.ctx.storage.sql.exec(`ALTER TABLE generations ADD COLUMN ${definition}`);
+  }
+
+  private ensureCronColumn(name: string, definition: string): void {
+    const columns = new Set(this.sql("PRAGMA table_info(cron_jobs)").map((row) => String(row.name)));
+    if (!columns.has(name)) this.ctx.storage.sql.exec(`ALTER TABLE cron_jobs ADD COLUMN ${definition}`);
   }
 
   private tomoId(): string {
@@ -281,7 +303,7 @@ export class OwnerDO extends DurableObject<Env> {
 
   private async runInteractive(chatId: string): Promise<void> {
     const turn = this.one("SELECT * FROM chat_turn WHERE chat_id = ?", chatId);
-    if (!turn?.burst_id || turn.active_generation_id) return;
+    if (!turn?.burst_id || turn.active_generation_id || this.one("SELECT 1 AS ok FROM generations WHERE status = 'active' LIMIT 1")) return;
     const burstId = String(turn.burst_id);
     const revision = Number(turn.revision);
     const generationId = `${burstId}:r${revision}`;
@@ -325,13 +347,14 @@ export class OwnerDO extends DurableObject<Env> {
   private async runCron(job: SqlRow): Promise<void> {
     const turn = this.one("SELECT * FROM chat_turn LIMIT 1");
     if (!turn) return;
-    if (turn.active_generation_id) return;
+    if (turn.active_generation_id || this.one("SELECT 1 AS ok FROM generations WHERE status = 'active' LIMIT 1")) return;
     const chatId = String(turn.chat_id);
     const actorId = String(turn.actor_id);
     const destination = String(job.destination);
     const boundChat = destination.startsWith("telegram:") ? destination.slice("telegram:".length) : chatId;
     const revision = Number(turn.revision) + 1;
-    const generationId = `cron:${job.job_id}:${Date.now()}`;
+    const scheduledAt = Number(job.schedule_at) || Date.now();
+    const generationId = `cron:${job.job_id}:${scheduledAt}`;
     const runId = `run:${generationId}`;
     this.ctx.storage.sql.exec("UPDATE chat_turn SET revision = ?, active_generation_id = ? WHERE chat_id = ?", revision, generationId, boundChat);
     this.ctx.storage.sql.exec(
@@ -342,7 +365,14 @@ export class OwnerDO extends DurableObject<Env> {
       boundChat,
       Date.now(),
     );
-    const scheduled = new Date(Number(job.schedule_at) || Date.now()).toISOString();
+    this.ctx.storage.sql.exec(
+      "INSERT INTO cron_runs(run_id, job_id, generation_id, scheduled_at, status) VALUES (?, ?, ?, ?, 'running')",
+      runId,
+      String(job.job_id),
+      generationId,
+      scheduledAt,
+    );
+    const scheduled = new Date(scheduledAt).toISOString();
     const turnPayload = {
       generation_id: generationId,
       revision,
@@ -354,7 +384,8 @@ export class OwnerDO extends DurableObject<Env> {
       scheduled_for: scheduled,
       previous_outcome: null,
       trigger: "schedule",
-      will_end_after_run: job.schedule_kind === "once" || job.schedule_every == null,
+      will_end_after_run: job.schedule_kind === "once" || job.schedule_every == null ||
+        (job.max_successful_runs != null && Number(job.successful_runs || 0) + 1 >= Number(job.max_successful_runs)),
       connector: "telegram",
       constraints: JSON.parse(String(job.constraints || "[]")),
       successful_runs: Number(job.successful_runs || 0),
@@ -364,18 +395,6 @@ export class OwnerDO extends DurableObject<Env> {
     await this.execute(generationId, boundChat, actorId, requestId, {
       TOMO_AUTOMATION_JSON: encodeAutomation(requestId, turnPayload),
     }, { interactive: false, images: [] });
-    if (job.schedule_every != null) {
-      this.ctx.storage.sql.exec(
-        "UPDATE cron_jobs SET schedule_at = ?, successful_runs = successful_runs + 1 WHERE job_id = ?",
-        Date.now() + Number(job.schedule_every) * 1000,
-        String(job.job_id),
-      );
-    } else {
-      this.ctx.storage.sql.exec(
-        "UPDATE cron_jobs SET status = 'ended', successful_runs = successful_runs + 1, schedule_at = NULL WHERE job_id = ?",
-        String(job.job_id),
-      );
-    }
   }
 
   private generationActive(generationId: string): boolean {
@@ -633,7 +652,11 @@ export class OwnerDO extends DurableObject<Env> {
       "SELECT 1 AS ok FROM deliveries WHERE generation_id = ? AND status = 'sent'",
       generationId,
     );
-    if (this.generationActive(generationId) && errorClass && errorClass !== "provider_budget" && !delivered) {
+    const generation = this.one("SELECT kind, burst_id FROM generations WHERE generation_id = ?", generationId);
+    if (this.generationActive(generationId) && generation?.kind === "automation") {
+      this.settleCronRun(generationId, errorClass, delivered !== null);
+    }
+    if (this.generationActive(generationId) && generation?.kind !== "peer" && errorClass && errorClass !== "provider_budget" && !delivered) {
       await new TelegramApi(this.env.TELEGRAM_BOT_TOKEN).sendMessage(
         chatId,
         `I couldn't finish that turn (${errorClass}). Try again.`,
@@ -649,6 +672,43 @@ export class OwnerDO extends DurableObject<Env> {
       duration_ms: Math.max(0, Date.now() - createdAt),
       error_class: errorClass,
     });
+  }
+
+  private settleCronRun(generationId: string, errorClass: string | null, delivered: boolean): void {
+    const run = this.one("SELECT * FROM cron_runs WHERE generation_id = ? AND status = 'running'", generationId);
+    if (!run) return;
+    const job = this.one("SELECT * FROM cron_jobs WHERE job_id = ?", String(run.job_id));
+    if (!job) return;
+    const successful = !errorClass || delivered;
+    this.ctx.storage.sql.exec(
+      "UPDATE cron_runs SET status = ?, completed_at = ?, error_class = ? WHERE run_id = ? AND status = 'running'",
+      successful ? "completed" : "failed",
+      Date.now(),
+      errorClass,
+      String(run.run_id),
+    );
+    if (!successful) {
+      this.ctx.storage.sql.exec("UPDATE cron_jobs SET schedule_at = ? WHERE job_id = ? AND status = 'active'", Date.now() + 60_000, String(job.job_id));
+      return;
+    }
+    const successes = Number(job.successful_runs || 0) + 1;
+    const lifecycleEnded =
+      (job.max_successful_runs != null && successes >= Number(job.max_successful_runs)) ||
+      (job.ends_at != null && Date.now() >= Number(job.ends_at));
+    if (job.schedule_every != null && !lifecycleEnded) {
+      this.ctx.storage.sql.exec(
+        "UPDATE cron_jobs SET schedule_at = ?, successful_runs = ? WHERE job_id = ?",
+        nextIntervalAt(Number(run.scheduled_at), Number(job.schedule_every)),
+        successes,
+        String(job.job_id),
+      );
+    } else {
+      this.ctx.storage.sql.exec(
+        "UPDATE cron_jobs SET status = 'ended', successful_runs = ?, schedule_at = NULL WHERE job_id = ?",
+        successes,
+        String(job.job_id),
+      );
+    }
   }
 
   private async handleLines(
@@ -901,56 +961,98 @@ export class OwnerDO extends DurableObject<Env> {
     if (operation === "create") {
       const idempotency = request.headers.get("idempotency-key") || "";
       if (!idempotency) return Response.json({ ok: false, error: "missing_idempotency" }, { status: 400 });
-      const existing = this.one("SELECT * FROM cron_jobs WHERE idempotency_key = ?", idempotency);
-      if (existing) return Response.json({ ok: true, job: jobJson(existing) });
       const body = (await request.json()) as {
         intent?: string;
         constraints?: string[];
-        schedule?: { kind?: string; at?: string; afterSeconds?: number; everySeconds?: number };
+        schedule?: CronScheduleInput;
+        lifecycle?: { endsAt?: string; maxSuccessfulRuns?: number };
       };
-      const jobId = (await sha256Hex(`${ownerId}\ncreate\n${idempotency}`)).slice(0, 32);
-      const schedule = body.schedule || {};
-      let scheduleAt: number | null = null;
-      let every: number | null = null;
-      let kind = schedule.kind || "once";
-      if (kind === "delay") {
-        kind = "once";
-        scheduleAt = Date.now() + Number(schedule.afterSeconds || 0) * 1000;
-      } else if (kind === "once") {
-        scheduleAt = schedule.at ? Date.parse(schedule.at) : Date.now();
-      } else if (kind === "interval") {
-        every = Number(schedule.everySeconds || 0);
-        scheduleAt = Date.now() + every * 1000;
-      } else {
-        scheduleAt = Date.now() + 60_000;
+      const requestHash = await sha256Hex(`${request.method}\n${url.pathname}\n${JSON.stringify(body)}`);
+      const receipt = this.cronReceipt(idempotency, requestHash);
+      if (receipt) return receipt;
+      const legacyExisting = this.one("SELECT * FROM cron_jobs WHERE idempotency_key = ?", idempotency);
+      if (legacyExisting) {
+        return this.storeCronReceipt(idempotency, requestHash, { ok: true, job: jobJson(legacyExisting) });
       }
+      if (typeof body.intent !== "string" || !body.intent.trim() || body.intent.length > 4000) {
+        return Response.json({ ok: false, error: "cron_invalid_intent" }, { status: 400 });
+      }
+      let parsed;
+      try {
+        parsed = parseCronSchedule(body.schedule || {});
+      } catch (error) {
+        return Response.json({ ok: false, error: error instanceof Error ? error.message : "cron_invalid_schedule" }, { status: 400 });
+      }
+      const endsAt = body.lifecycle?.endsAt ? Date.parse(body.lifecycle.endsAt) : null;
+      const maxRuns = body.lifecycle?.maxSuccessfulRuns ?? null;
+      if ((endsAt !== null && !Number.isFinite(endsAt)) || (maxRuns !== null && (!Number.isInteger(maxRuns) || maxRuns < 1))) {
+        return Response.json({ ok: false, error: "cron_invalid_lifecycle" }, { status: 400 });
+      }
+      const jobId = (await sha256Hex(`${ownerId}\ncreate\n${idempotency}`)).slice(0, 32);
       const destination = request.headers.get("x-tomo-destination") || "";
       this.ctx.storage.sql.exec(
-        "INSERT INTO cron_jobs(job_id, destination, intent, constraints, schedule_kind, schedule_at, schedule_every, status, revision, successful_runs, idempotency_key) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 1, 0, ?)",
+        "INSERT INTO cron_jobs(job_id, destination, intent, constraints, schedule_kind, schedule_at, schedule_every, status, revision, successful_runs, idempotency_key, ends_at, max_successful_runs) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 1, 0, ?, ?, ?)",
         jobId,
         destination,
-        body.intent || "",
+        body.intent,
         JSON.stringify(body.constraints || []),
-        kind,
-        scheduleAt,
-        every,
+        parsed.kind,
+        parsed.scheduleAt,
+        parsed.everySeconds,
         idempotency,
+        endsAt,
+        maxRuns,
       );
       await this.scheduleWake();
-      return Response.json({ ok: true, job: jobJson(this.one("SELECT * FROM cron_jobs WHERE job_id = ?", jobId)!) });
+      return this.storeCronReceipt(idempotency, requestHash, { ok: true, job: jobJson(this.one("SELECT * FROM cron_jobs WHERE job_id = ?", jobId)!) });
     }
     const match = url.pathname.match(/\/v1\/cron\/jobs\/([^/]+)(?:\/([^/]+))?$/);
     const jobId = match?.[1] ? decodeURIComponent(match[1]) : "";
     const job = this.one("SELECT * FROM cron_jobs WHERE job_id = ?", jobId);
     if (!job) return Response.json({ ok: false, error: "cron_not_found" }, { status: 404 });
     if (operation === "inspect") return Response.json({ ok: true, job: jobJson(job) });
-    if (operation === "history") return Response.json({ ok: true, history: [] });
-    if (operation === "pause") this.ctx.storage.sql.exec("UPDATE cron_jobs SET status='paused', revision=revision+1 WHERE job_id=?", jobId);
-    if (operation === "resume") this.ctx.storage.sql.exec("UPDATE cron_jobs SET status='active', revision=revision+1 WHERE job_id=?", jobId);
+    if (operation === "history") {
+      const history = this.sql("SELECT run_id, scheduled_at, status, completed_at, error_class FROM cron_runs WHERE job_id = ? ORDER BY scheduled_at DESC LIMIT 32", jobId)
+        .map((row) => ({ runId: row.run_id, scheduledAt: new Date(Number(row.scheduled_at)).toISOString(), status: row.status, completedAt: row.completed_at ? new Date(Number(row.completed_at)).toISOString() : null, error: row.error_class }));
+      return Response.json({ ok: true, history });
+    }
+    const body = (await request.json().catch(() => null)) as { revision?: number; intent?: string; constraints?: string[]; schedule?: CronScheduleInput; lifecycle?: { endsAt?: string; maxSuccessfulRuns?: number } } | null;
+    const idempotency = request.headers.get("idempotency-key") || "";
+    if (!idempotency || !body || !Number.isInteger(body.revision)) return Response.json({ ok: false, error: "missing_idempotency_or_revision" }, { status: 400 });
+    const requestHash = await sha256Hex(`${request.method}\n${url.pathname}\n${JSON.stringify(body)}`);
+    const receipt = this.cronReceipt(idempotency, requestHash);
+    if (receipt) return receipt;
+    if (Number(job.revision) !== body.revision) return Response.json({ ok: false, error: "cron_revision_conflict" }, { status: 409 });
+    if (operation === "update") {
+      let parsed;
+      try { parsed = parseCronSchedule(body.schedule || {}); }
+      catch (error) { return Response.json({ ok: false, error: error instanceof Error ? error.message : "cron_invalid_schedule" }, { status: 400 }); }
+      if (typeof body.intent !== "string" || !body.intent.trim()) return Response.json({ ok: false, error: "cron_invalid_intent" }, { status: 400 });
+      const endsAt = body.lifecycle?.endsAt ? Date.parse(body.lifecycle.endsAt) : null;
+      const maxRuns = body.lifecycle?.maxSuccessfulRuns ?? null;
+      if ((endsAt !== null && !Number.isFinite(endsAt)) || (maxRuns !== null && (!Number.isInteger(maxRuns) || maxRuns < 1))) {
+        return Response.json({ ok: false, error: "cron_invalid_lifecycle" }, { status: 400 });
+      }
+      this.ctx.storage.sql.exec("UPDATE cron_jobs SET intent=?, constraints=?, schedule_kind=?, schedule_at=?, schedule_every=?, ends_at=?, max_successful_runs=?, revision=revision+1 WHERE job_id=? AND status IN ('active','paused')", body.intent, JSON.stringify(body.constraints || []), parsed.kind, parsed.scheduleAt, parsed.everySeconds, endsAt, maxRuns, jobId);
+    }
+    if (operation === "pause" && job.status === "active") this.ctx.storage.sql.exec("UPDATE cron_jobs SET status='paused', revision=revision+1 WHERE job_id=?", jobId);
+    if (operation === "resume" && job.status === "paused") this.ctx.storage.sql.exec("UPDATE cron_jobs SET status='active', revision=revision+1 WHERE job_id=?", jobId);
     if (operation === "delete") this.ctx.storage.sql.exec("UPDATE cron_jobs SET status='cancelled', revision=revision+1, schedule_at=NULL WHERE job_id=?", jobId);
-    if (operation === "run_now") this.ctx.storage.sql.exec("UPDATE cron_jobs SET schedule_at=? WHERE job_id=?", Date.now(), jobId);
+    if (operation === "run_now" && job.status === "active") this.ctx.storage.sql.exec("UPDATE cron_jobs SET schedule_at=?, revision=revision+1 WHERE job_id=?", Date.now(), jobId);
     await this.scheduleWake();
-    return Response.json({ ok: true, job: jobJson(this.one("SELECT * FROM cron_jobs WHERE job_id = ?", jobId)!) });
+    return this.storeCronReceipt(idempotency, requestHash, { ok: true, job: jobJson(this.one("SELECT * FROM cron_jobs WHERE job_id = ?", jobId)!) });
+  }
+
+  private cronReceipt(idempotency: string, requestHash: string): Response | null {
+    const receipt = this.one("SELECT request_hash, response FROM cron_receipts WHERE idempotency_key = ?", idempotency);
+    if (!receipt) return null;
+    if (receipt.request_hash !== requestHash) return Response.json({ ok: false, error: "idempotency_conflict" }, { status: 409 });
+    return Response.json(JSON.parse(String(receipt.response)));
+  }
+
+  private storeCronReceipt(idempotency: string, requestHash: string, response: Record<string, unknown>): Response {
+    this.ctx.storage.sql.exec("INSERT INTO cron_receipts(idempotency_key, request_hash, response) VALUES (?, ?, ?)", idempotency, requestHash, JSON.stringify(response));
+    return Response.json(response);
   }
 }
 
@@ -982,9 +1084,13 @@ function jobJson(job: SqlRow): Record<string, unknown> {
       timezoneName: "UTC",
       startsAt: null,
     },
-    lifecycle: { endsAt: null, maxSuccessfulRuns: null },
+    lifecycle: {
+      endsAt: job.ends_at ? new Date(Number(job.ends_at)).toISOString() : null,
+      maxSuccessfulRuns: job.max_successful_runs,
+    },
     status: job.status,
     revision: job.revision,
+    successfulRuns: job.successful_runs,
   };
 }
 
