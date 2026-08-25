@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { encodeInbound, parseDiagnosticLine, parseEventLine, requestIdFor, splitLines } from "../src/protocol.ts";
+import { consumeLogSnapshot, encodeInbound, parseDiagnosticLine, parseEventLine, requestIdFor, splitLines } from "../src/protocol.ts";
 
 test("inbound envelope is protocol v2", () => {
   const payload = JSON.parse(
@@ -63,6 +63,16 @@ test("splitLines carries partial chunks", () => {
   const second = splitLines("llo\n", first.rest);
   assert.deepEqual(second.lines, ["hello"]);
   assert.equal(requestIdFor("chat:1:r2").startsWith("telegram-generation-"), true);
+});
+
+test("persisted sandbox log cursors resume without replaying complete lines", () => {
+  const first = consumeLogSnapshot("first\npar", 0, "");
+  assert.deepEqual(first, { lines: ["first"], offset: 9, carry: "par" });
+
+  const second = consumeLogSnapshot("first\npartial\nsecond\n", first.offset, first.carry);
+  assert.deepEqual(second, { lines: ["partial", "second"], offset: 21, carry: "" });
+
+  assert.throws(() => consumeLogSnapshot("short", 6, ""), /cursor/);
 });
 
 test("parses only fixed sandbox diagnostic codes", () => {

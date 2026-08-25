@@ -109,6 +109,18 @@ export function splitLines(chunk: string, carry: string): { lines: string[]; res
   return { lines: parts, rest };
 }
 
+export function consumeLogSnapshot(
+  snapshot: string,
+  offset: number,
+  carry: string,
+): { lines: string[]; offset: number; carry: string } {
+  if (!Number.isInteger(offset) || offset < 0 || offset > snapshot.length) {
+    throw new Error("sandbox log cursor is invalid");
+  }
+  const split = splitLines(snapshot.slice(offset), carry);
+  return { lines: split.lines, offset: snapshot.length, carry: split.rest };
+}
+
 export function parseDiagnosticLine(line: string): string | null {
   if (!line.startsWith(DIAGNOSTIC_MARKER)) return null;
   const code = line.slice(DIAGNOSTIC_MARKER.length);

@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { getSandbox, parseSSEStream, type ExecEvent } from "@cloudflare/sandbox";
+import { getSandbox } from "@cloudflare/sandbox";
 import { cancelSupersededExecution } from "./cancellation";
 import type { Env } from "./env";
 import { hexKey, logOps } from "./env";
@@ -7,11 +7,11 @@ import { CRON_OPS, issueAttachment, issueCron, sha256Hex } from "./hmac";
 import {
   encodeAutomation,
   encodeInbound,
+  consumeLogSnapshot,
   envelopeFromCompact,
   parseDiagnosticLine,
   parseEventLine,
   requestIdFor,
-  splitLines,
   type InboundBurst,
 } from "./protocol";
 import { TelegramApi, type CompactUpdate } from "./telegram";
@@ -20,6 +20,9 @@ const DATA_DIR = "/workspace/tomo-data";
 const COMMAND = "/opt/tomo/.venv/bin/tomo-core sandbox-inbound";
 const DEBOUNCE_MS = 700;
 const PACE_MS = 1500;
+const PROCESS_POLL_MS = 2000;
+const PROCESS_POLL_RETRY_MS = 5000;
+const MAX_PROCESS_POLL_FAILURES = 5;
 const BUDGET_LINE = "I cannot think right now. Model budget hit. Try later.";
 
 type SqlRow = Record<string, string | number | null>;
@@ -71,7 +74,15 @@ export class OwnerDO extends DurableObject<Env> {
         kind TEXT NOT NULL,
         status TEXT NOT NULL,
         created_at INTEGER NOT NULL,
-        error_class TEXT
+        error_class TEXT,
+        process_id TEXT,
+        stdout_offset INTEGER NOT NULL DEFAULT 0,
+        stdout_carry TEXT NOT NULL DEFAULT '',
+        poll_at INTEGER,
+        deadline_at INTEGER,
+        diagnostic_codes TEXT NOT NULL DEFAULT '[]',
+        stderr_present INTEGER NOT NULL DEFAULT 0,
+        poll_failures INTEGER NOT NULL DEFAULT 0
       );
       CREATE TABLE IF NOT EXISTS deliveries (
         generation_id TEXT NOT NULL,
@@ -96,6 +107,19 @@ export class OwnerDO extends DurableObject<Env> {
         idempotency_key TEXT UNIQUE
       );
     `);
+    this.ensureGenerationColumn("process_id", "process_id TEXT");
+    this.ensureGenerationColumn("stdout_offset", "stdout_offset INTEGER NOT NULL DEFAULT 0");
+    this.ensureGenerationColumn("stdout_carry", "stdout_carry TEXT NOT NULL DEFAULT ''");
+    this.ensureGenerationColumn("poll_at", "poll_at INTEGER");
+    this.ensureGenerationColumn("deadline_at", "deadline_at INTEGER");
+    this.ensureGenerationColumn("diagnostic_codes", "diagnostic_codes TEXT NOT NULL DEFAULT '[]'");
+    this.ensureGenerationColumn("stderr_present", "stderr_present INTEGER NOT NULL DEFAULT 0");
+    this.ensureGenerationColumn("poll_failures", "poll_failures INTEGER NOT NULL DEFAULT 0");
+  }
+
+  private ensureGenerationColumn(name: string, definition: string): void {
+    const columns = new Set(this.sql("PRAGMA table_info(generations)").map((row) => String(row.name)));
+    if (!columns.has(name)) this.ctx.storage.sql.exec(`ALTER TABLE generations ADD COLUMN ${definition}`);
   }
 
   private tomoId(): string {
@@ -144,14 +168,20 @@ export class OwnerDO extends DurableObject<Env> {
       "SELECT * FROM chat_turn WHERE burst_id IS NOT NULL AND active_generation_id IS NULL AND quiet_until IS NOT NULL AND quiet_until <= ?",
       Date.now(),
     );
+    const generation = this.one(
+      "SELECT * FROM generations WHERE status = 'active' AND poll_at IS NOT NULL AND poll_at <= ? ORDER BY poll_at LIMIT 1",
+      Date.now(),
+    );
     logOps({
       event: "owner_alarm",
       tomo_id: this.tomoId(),
+      generation: generation ? 1 : 0,
       cron: dueCron ? 1 : 0,
       turn: turn ? 1 : 0,
     });
     try {
-      if (dueCron) await this.runCron(dueCron);
+      if (generation) await this.pollGeneration(generation);
+      else if (dueCron) await this.runCron(dueCron);
       else if (turn) await this.runInteractive(String(turn.chat_id));
     } catch (error) {
       logOps({
@@ -170,7 +200,10 @@ export class OwnerDO extends DurableObject<Env> {
     const cron = this.one(
       "SELECT MIN(schedule_at) AS next FROM cron_jobs WHERE status = 'active' AND schedule_at IS NOT NULL",
     );
-    const candidates = [quiet?.next, cron?.next].filter((value): value is number => typeof value === "number");
+    const generation = this.one(
+      "SELECT MIN(poll_at) AS next FROM generations WHERE status = 'active' AND poll_at IS NOT NULL",
+    );
+    const candidates = [quiet?.next, cron?.next, generation?.next].filter((value): value is number => typeof value === "number");
     if (candidates.length === 0) {
       await this.ctx.storage.deleteAlarm();
       return;
@@ -284,7 +317,7 @@ export class OwnerDO extends DurableObject<Env> {
     const last = messages[messages.length - 1];
     await this.execute(generationId, chatId, last.actorId, requestId, {
       TOMO_INBOUND_JSON: encodeInbound(requestId, burst),
-    }, last, { interactive: true, images: messages.flatMap((item) => item.photoFileId ? [item.photoFileId] : []) });
+    }, { interactive: true, images: messages.flatMap((item) => item.photoFileId ? [item.photoFileId] : []) });
   }
 
   private async runCron(job: SqlRow): Promise<void> {
@@ -328,7 +361,7 @@ export class OwnerDO extends DurableObject<Env> {
     const requestId = requestIdFor(generationId);
     await this.execute(generationId, boundChat, actorId, requestId, {
       TOMO_AUTOMATION_JSON: encodeAutomation(requestId, turnPayload),
-    }, null, { interactive: false, images: [] });
+    }, { interactive: false, images: [] });
     if (job.schedule_every != null) {
       this.ctx.storage.sql.exec(
         "UPDATE cron_jobs SET schedule_at = ?, successful_runs = successful_runs + 1 WHERE job_id = ?",
@@ -367,10 +400,10 @@ export class OwnerDO extends DurableObject<Env> {
     actorId: string,
     requestId: string,
     extraEnv: Record<string, string>,
-    last: CompactUpdate | null,
     options: { interactive: boolean; images: string[] },
   ): Promise<void> {
     const started = Date.now();
+    const timeout = 240_000 + Math.min(options.images.length, 8) * 75_000;
     this.running = true;
     const abort = new AbortController();
     this.abort = abort;
@@ -379,6 +412,18 @@ export class OwnerDO extends DurableObject<Env> {
     const sandbox = this.sandbox();
     this.liveSandbox = sandbox;
     let errorClass: string | null = null;
+    let processStarted = false;
+    this.ctx.storage.sql.exec(
+      `UPDATE generations
+       SET process_id = ?, stdout_offset = 0, stdout_carry = '', poll_at = ?, deadline_at = ?,
+           diagnostic_codes = '[]', stderr_present = 0, poll_failures = 0
+       WHERE generation_id = ? AND status = 'active'`,
+      requestId,
+      started + PROCESS_POLL_MS,
+      started + timeout + 300_000,
+      generationId,
+    );
+    await this.ctx.storage.setAlarm(started + PROCESS_POLL_MS);
     try {
       if (!this.env.OPENROUTER_API_KEY) {
         throw new Error("missing_openrouter_key");
@@ -386,65 +431,30 @@ export class OwnerDO extends DurableObject<Env> {
       logOps({ event: "exec_start", tomo_id: this.tomoId(), generation_id: generationId });
       await this.prepareGuest(sandbox);
       const env = await this.guestEnv(generationId, chatId, actorId, extraEnv, options);
-      const timeout = 240_000 + Math.min(options.images.length, 8) * 75_000;
-      const stream = await this.execGuestStream(sandbox, env, timeout, abort.signal);
-      let carry = "";
-      let firstFrame = true;
-      let exitCode: number | null = null;
-      let stderrPresent = false;
-      const diagnosticCodes = new Set<string>();
-      for await (const event of parseSSEStream<ExecEvent>(stream, abort.signal)) {
-        if (event.type === "stdout") {
-          const split = splitLines(event.data || "", carry);
-          carry = split.rest;
-          const flag = await this.handleLines(
-            split.lines,
-            generationId,
-            chatId,
-            requestId,
-            telegram,
-            last,
-            firstFrame,
-            diagnosticCodes,
-          );
-          firstFrame = flag.firstFrame;
-          if (flag.errorClass) errorClass = flag.errorClass;
-        } else if (event.type === "stderr") {
-          stderrPresent = stderrPresent || Boolean(event.data);
-        } else if (event.type === "complete") {
-          exitCode = typeof event.exitCode === "number" ? event.exitCode : null;
-        } else if (event.type === "error") {
-          throw new Error(`sandbox_stream_${event.error || "failed"}`);
-        }
-      }
-      if (carry.trim()) {
-        const flag = await this.handleLines(
-          [carry],
-          generationId,
-          chatId,
-          requestId,
-          telegram,
-          last,
-          firstFrame,
-          diagnosticCodes,
-        );
-        if (flag.errorClass) errorClass = flag.errorClass;
-      }
-      if (exitCode === null && !errorClass) errorClass = "sandbox_stream_incomplete";
-      if (exitCode !== null && exitCode !== 0 && !errorClass) {
-        errorClass = exitCode === 124 ? "sandbox_timeout" : `sandbox_exit_${exitCode}`;
-      }
+      await sandbox.setKeepAlive(true);
+      const process = await this.withContainerRetry(() =>
+        sandbox.startProcess(COMMAND, {
+          env: { PYTHONUNBUFFERED: "1", ...env },
+          timeout,
+          processId: requestId,
+          autoCleanup: false,
+        }),
+      );
+      processStarted = true;
+      if (!this.generationActive(generationId)) return;
+      this.ctx.storage.sql.exec(
+        "UPDATE generations SET process_id = ?, poll_at = ?, deadline_at = ? WHERE generation_id = ? AND status = 'active'",
+        process.id,
+        Date.now() + PROCESS_POLL_MS,
+        Date.now() + timeout,
+        generationId,
+      );
       logOps({
-        event: "exec_result",
+        event: "exec_process_started",
         tomo_id: this.tomoId(),
         generation_id: generationId,
-        exit_code: exitCode,
-        error_class: errorClass,
-        stderr_present: stderrPresent ? 1 : 0,
+        process_id: process.id,
       });
-      if (this.generationActive(generationId) && !abort.signal.aborted) {
-        await this.checkpoint(sandbox);
-      }
     } catch (error) {
       if (abort.signal.aborted && !this.generationActive(generationId)) {
         logOps({ event: "exec_cancelled", tomo_id: this.tomoId(), generation_id: generationId });
@@ -460,31 +470,178 @@ export class OwnerDO extends DurableObject<Env> {
     } finally {
       abort.abort();
       await typing.catch(() => undefined);
-      try {
-        await sandbox.destroy();
-      } catch {
-        // destroy is best-effort stop for the $5 envelope
-      }
       this.running = false;
       this.abort = null;
       this.liveSandbox = null;
-      const delivered = this.one(
-        "SELECT 1 AS ok FROM deliveries WHERE generation_id = ? AND status = 'sent'",
+      if (!processStarted) {
+        if (this.generationActive(generationId)) {
+          await this.settleGeneration(generationId, chatId, errorClass || "sandbox_start_failed", sandbox);
+        } else {
+          await sandbox.destroy().catch(() => undefined);
+        }
+      }
+    }
+  }
+
+  private async pollGeneration(generation: SqlRow): Promise<void> {
+    const generationId = String(generation.generation_id);
+    const chatId = String(generation.chat_id);
+    const processId = String(generation.process_id || requestIdFor(generationId));
+    const sandbox = this.sandbox();
+    this.running = true;
+    this.liveSandbox = sandbox;
+    try {
+      if (!this.generationActive(generationId)) return;
+      const process = await this.withContainerRetry(() => sandbox.getProcess(processId));
+      if (!process) {
+        await this.settleGeneration(generationId, chatId, "sandbox_process_missing", sandbox);
+        return;
+      }
+      const status = await process.getStatus();
+      const logs = await process.getLogs();
+      if (!this.generationActive(generationId)) return;
+      let cursor = consumeLogSnapshot(
+        logs.stdout,
+        Number(generation.stdout_offset || 0),
+        String(generation.stdout_carry || ""),
+      );
+      const diagnosticCodes = stringSet(generation.diagnostic_codes);
+      const telegram = new TelegramApi(this.env.TELEGRAM_BOT_TOKEN);
+      const messages = String(generation.kind) === "interactive"
+        ? this.messagesForBurst(String(generation.burst_id), chatId)
+        : [];
+      const last = messages.length ? messages[messages.length - 1] : null;
+      let firstFrame = this.one("SELECT 1 AS ok FROM deliveries WHERE generation_id = ? LIMIT 1", generationId) === null;
+      let errorClass = generation.error_class ? String(generation.error_class) : null;
+      let flag = await this.handleLines(
+        cursor.lines,
+        generationId,
+        chatId,
+        requestIdFor(generationId),
+        telegram,
+        last,
+        firstFrame,
+        diagnosticCodes,
+      );
+      firstFrame = flag.firstFrame;
+      if (flag.errorClass) errorClass = flag.errorClass;
+      const terminal = status !== "starting" && status !== "running";
+      if (terminal && cursor.carry.trim()) {
+        flag = await this.handleLines(
+          [cursor.carry],
+          generationId,
+          chatId,
+          requestIdFor(generationId),
+          telegram,
+          last,
+          firstFrame,
+          diagnosticCodes,
+        );
+        if (flag.errorClass) errorClass = flag.errorClass;
+        cursor = { ...cursor, carry: "" };
+      }
+      this.ctx.storage.sql.exec(
+        `UPDATE generations
+         SET stdout_offset = ?, stdout_carry = ?, diagnostic_codes = ?, stderr_present = ?,
+             error_class = ?, poll_failures = 0
+         WHERE generation_id = ? AND status = 'active'`,
+        cursor.offset,
+        cursor.carry,
+        JSON.stringify([...diagnosticCodes]),
+        logs.stderr ? 1 : Number(generation.stderr_present || 0),
+        errorClass,
         generationId,
       );
-      if (this.generationActive(generationId) && errorClass && errorClass !== "provider_budget" && !delivered) {
-        await telegram.sendMessage(chatId, `I couldn't finish that turn (${errorClass}). Try again.`);
+      if (!this.generationActive(generationId)) return;
+      if (terminal) {
+        const refreshed = await sandbox.getProcess(processId);
+        const exitCode = refreshed?.exitCode ?? (status === "completed" ? 0 : 1);
+        if (exitCode !== 0 && !errorClass) {
+          errorClass = exitCode === 124 ? "sandbox_timeout" : `sandbox_exit_${exitCode}`;
+        }
+        logOps({
+          event: "exec_result",
+          tomo_id: this.tomoId(),
+          generation_id: generationId,
+          exit_code: exitCode,
+          error_class: errorClass,
+          stderr_present: logs.stderr ? 1 : Number(generation.stderr_present || 0),
+        });
+        await this.settleGeneration(generationId, chatId, errorClass, sandbox);
+        return;
       }
-      const status = this.generationActive(generationId) ? (errorClass ? "failed" : "completed") : "superseded";
-      if (this.generationActive(generationId)) this.finishGeneration(generationId, chatId, status, errorClass);
+      if (typeof generation.deadline_at === "number" && Date.now() >= generation.deadline_at) {
+        await process.kill().catch(() => undefined);
+        await this.settleGeneration(generationId, chatId, "sandbox_timeout", sandbox);
+        return;
+      }
+      this.ctx.storage.sql.exec(
+        "UPDATE generations SET poll_at = ? WHERE generation_id = ? AND status = 'active'",
+        Date.now() + PROCESS_POLL_MS,
+        generationId,
+      );
+      await telegram.sendTyping(chatId);
+    } catch (error) {
+      if (!this.generationActive(generationId)) return;
+      const failures = Number(generation.poll_failures || 0) + 1;
       logOps({
-        event: "generation_done",
+        event: "exec_poll_failed",
         tomo_id: this.tomoId(),
         generation_id: generationId,
-        duration_ms: Date.now() - started,
-        error_class: errorClass,
+        error_class: sandboxLabel(error),
+        attempt: failures,
       });
+      if (failures >= MAX_PROCESS_POLL_FAILURES) {
+        await this.settleGeneration(generationId, chatId, "sandbox_poll_failed", sandbox);
+      } else {
+        this.ctx.storage.sql.exec(
+          "UPDATE generations SET poll_failures = ?, poll_at = ? WHERE generation_id = ? AND status = 'active'",
+          failures,
+          Date.now() + PROCESS_POLL_RETRY_MS,
+          generationId,
+        );
+      }
+    } finally {
+      this.running = false;
+      this.liveSandbox = null;
     }
+  }
+
+  private async settleGeneration(
+    generationId: string,
+    chatId: string,
+    errorClass: string | null,
+    sandbox: SandboxHandle,
+  ): Promise<void> {
+    if (this.generationActive(generationId) && !errorClass) {
+      try {
+        await this.checkpoint(sandbox);
+      } catch {
+        errorClass = "sandbox_checkpoint_failed";
+      }
+    }
+    await sandbox.setKeepAlive(false).catch(() => undefined);
+    await sandbox.destroy().catch(() => undefined);
+    const delivered = this.one(
+      "SELECT 1 AS ok FROM deliveries WHERE generation_id = ? AND status = 'sent'",
+      generationId,
+    );
+    if (this.generationActive(generationId) && errorClass && errorClass !== "provider_budget" && !delivered) {
+      await new TelegramApi(this.env.TELEGRAM_BOT_TOKEN).sendMessage(
+        chatId,
+        `I couldn't finish that turn (${errorClass}). Try again.`,
+      );
+    }
+    const status = this.generationActive(generationId) ? (errorClass ? "failed" : "completed") : "superseded";
+    if (this.generationActive(generationId)) this.finishGeneration(generationId, chatId, status, errorClass);
+    const createdAt = Number(this.one("SELECT created_at FROM generations WHERE generation_id = ?", generationId)?.created_at || Date.now());
+    logOps({
+      event: "generation_done",
+      tomo_id: this.tomoId(),
+      generation_id: generationId,
+      duration_ms: Math.max(0, Date.now() - createdAt),
+      error_class: errorClass,
+    });
   }
 
   private async handleLines(
@@ -672,17 +829,6 @@ export class OwnerDO extends DurableObject<Env> {
     await this.hydrate(sandbox);
   }
 
-  private async execGuestStream(
-    sandbox: SandboxHandle,
-    env: Record<string, string>,
-    timeout: number,
-    signal: AbortSignal,
-  ): Promise<ReadableStream> {
-    return this.withContainerRetry(() =>
-      sandbox.execStream(COMMAND, { env: { PYTHONUNBUFFERED: "1", ...env }, timeout, signal }),
-    );
-  }
-
   private sandbox(): SandboxHandle {
     return getSandbox(this.env.Sandbox, this.tomoId(), {
       enableDefaultSession: false,
@@ -848,6 +994,16 @@ function retryableSandbox(error: unknown): boolean {
     blob.includes("http_error_status_500") ||
     blob.includes("status 500")
   );
+}
+
+function stringSet(value: string | number | null): Set<string> {
+  if (typeof value !== "string") return new Set();
+  try {
+    const parsed = JSON.parse(value);
+    return new Set(Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : []);
+  } catch {
+    return new Set();
+  }
 }
 
 function bytesToB64(bytes: Uint8Array): string {
