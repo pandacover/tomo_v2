@@ -8,6 +8,7 @@ on:
     paths:
       - "cloudflare/**"
       - "tomo_core/Dockerfile.cloudflare"
+      - "tomo_core/IMAGE_REVISION"
       - "tomo_core/SOUL.md"
       - "tomo_core/pyproject.toml"
       - "tomo_core/uv.lock"
@@ -43,10 +44,11 @@ jobs:
       - name: Install
         run: npm ci
 
-      - name: Configure models
+      - name: Configure deployment
         env:
           TOMO_CORE_MODEL: ${{ secrets.TOMO_CORE_MODEL }}
           TOMO_MM_MODEL: ${{ secrets.TOMO_MM_MODEL }}
+          TOMO_IMAGE_REVISION: ${{ github.sha }}
         run: |
           if [[ -z "$TOMO_CORE_MODEL" || -z "$TOMO_MM_MODEL" ]]; then
             echo "::error::TOMO_CORE_MODEL and TOMO_MM_MODEL must both be configured."
@@ -54,11 +56,17 @@ jobs:
           fi
           node --input-type=module -e '
             import fs from "node:fs";
+            import crypto from "node:crypto";
             const path = "wrangler.jsonc";
             const config = JSON.parse(fs.readFileSync(path, "utf8"));
             config.vars.TOMO_AGENT_MODEL = process.env.TOMO_CORE_MODEL;
             config.vars.TOMO_VISION_MODEL = process.env.TOMO_MM_MODEL;
+            config.vars.TOMO_IMAGE_REVISION = process.env.TOMO_IMAGE_REVISION;
+            const probeToken = crypto.randomBytes(32).toString("hex");
+            config.vars.TOMO_DEPLOY_PROBE_TOKEN = probeToken;
             fs.writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`);
+            fs.writeFileSync("../tomo_core/IMAGE_REVISION", `${process.env.TOMO_IMAGE_REVISION}\n`);
+            fs.appendFileSync(process.env.GITHUB_ENV, `TOMO_DEPLOY_PROBE_TOKEN=${probeToken}\n`);
           '
 
       - name: Types
@@ -94,6 +102,25 @@ jobs:
           echo "::error::$WORKER_URL/health did not return 200"
           exit 1
 
+      - name: Prove Worker and guest provenance
+        run: |
+          curl --fail-with-body --silent --show-error \
+            --retry 12 --retry-all-errors --retry-delay 10 \
+            --connect-timeout 10 --max-time 210 \
+            --request POST \
+            --header "Authorization: Bearer $TOMO_DEPLOY_PROBE_TOKEN" \
+            --output "$RUNNER_TEMP/provenance.json" \
+            "$WORKER_URL/v1/ops/provenance"
+          node --input-type=module -e '
+            import fs from "node:fs";
+            const result = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + "/provenance.json", "utf8"));
+            if (!result.ok || result.worker_revision !== process.env.GITHUB_SHA || result.guest_revision !== process.env.GITHUB_SHA) {
+              throw new Error("Worker/guest provenance mismatch");
+            }
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `\nWorker revision: \`${result.worker_revision}\`\n\nGuest image revision: \`${result.guest_revision}\`\n`);
+            console.log(`Provenance verified at ${result.worker_revision}`);
+          '
+
       - name: Summary
         if: always()
         run: |
@@ -102,5 +129,5 @@ jobs:
             echo
             echo "Worker URL: \`${WORKER_URL:-unknown}\`"
             echo
-            echo "Secrets are not in this deploy. Add them in the dashboard, then setWebhook."
+            echo "Cloudflare keeps the existing Worker secrets during deploy."
           } | tee -a "$GITHUB_STEP_SUMMARY"

@@ -20,6 +20,8 @@ export interface Env {
   TOMO_AGENT_MODEL: string;
   TOMO_VISION_MODEL: string;
   TOMO_ALLOWLIST: string;
+  TOMO_IMAGE_REVISION: string;
+  TOMO_DEPLOY_PROBE_TOKEN: string;
 }
 
 export function parseAllowlist(raw: string): AllowlistEntry[] {

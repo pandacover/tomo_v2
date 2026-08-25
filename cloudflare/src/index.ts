@@ -1,9 +1,10 @@
-import { ContainerProxy, Sandbox as CloudflareSandbox } from "@cloudflare/sandbox";
+import { ContainerProxy, getSandbox, Sandbox as CloudflareSandbox } from "@cloudflare/sandbox";
 import type { Env } from "./env";
 import { hexKey, logOps } from "./env";
 import { verifyAttachment, verifyCron } from "./hmac";
 import { OwnerDO } from "./owner";
 import { PeerDO } from "./peer";
+import { IMAGE_REVISION_PATH, observedImageRevision } from "./provenance";
 import { RegistryDO } from "./registry";
 import { compactPrivateMessage, equalSecret, TelegramApi } from "./telegram";
 
@@ -40,10 +41,43 @@ Sandbox.outboundByHost = {
   "tomo.control": (request, env) => resolveAttachment(request, env as unknown as Env),
 };
 
+async function proveProvenance(request: Request, env: Env): Promise<Response> {
+  const token = bearer(request);
+  if (!token || !env.TOMO_DEPLOY_PROBE_TOKEN || !(await equalSecret(token, env.TOMO_DEPLOY_PROBE_TOKEN))) {
+    return json({ error: "unauthorized" }, 401);
+  }
+  const expected = env.TOMO_IMAGE_REVISION;
+  const sandbox = getSandbox(env.Sandbox, `deploy-probe-${expected.slice(0, 16)}`, {
+    enableDefaultSession: false,
+    normalizeId: true,
+    sleepAfter: "10s",
+    containerTimeouts: { instanceGetTimeoutMS: 120_000, portReadyTimeoutMS: 180_000 },
+  });
+  const started = Date.now();
+  try {
+    const result = await sandbox.exec(`cat ${IMAGE_REVISION_PATH}`, { timeout: 30_000 });
+    const guestRevision = observedImageRevision(result);
+    const ok = guestRevision === expected;
+    logOps({ event: "deploy_provenance", worker_revision: expected, guest_revision: guestRevision, ok: ok ? 1 : 0, duration_ms: Date.now() - started });
+    return json({ ok, worker_revision: expected, guest_revision: guestRevision }, ok ? 200 : 503);
+  } catch {
+    logOps({ event: "deploy_provenance", worker_revision: expected, ok: 0, duration_ms: Date.now() - started });
+    return json({ ok: false, worker_revision: expected, guest_revision: null, error: "sandbox_probe_failed" }, 503);
+  } finally {
+    await sandbox.destroy().catch(() => undefined);
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname === "/health" || url.pathname === "/v1/health") return json({ ok: true });
+    if (url.pathname === "/health" || url.pathname === "/v1/health") {
+      return json({ ok: true, worker_revision: env.TOMO_IMAGE_REVISION });
+    }
+
+    if (url.pathname === "/v1/ops/provenance" && request.method === "POST") {
+      return proveProvenance(request, env);
+    }
 
     if (url.pathname === "/telegram/webhook" && request.method === "POST") {
       const header = request.headers.get("x-telegram-bot-api-secret-token") || "";

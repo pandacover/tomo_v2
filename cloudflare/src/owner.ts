@@ -1,9 +1,11 @@
 import { DurableObject } from "cloudflare:workers";
-import { getSandbox } from "@cloudflare/sandbox";
+import { getSandbox, isPlatformTransientError } from "@cloudflare/sandbox";
 import { cancelSupersededExecution } from "./cancellation";
 import type { Env } from "./env";
 import { hexKey, logOps } from "./env";
 import { CRON_OPS, issueAttachment, issueCron, sha256Hex } from "./hmac";
+import { IMAGE_REVISION_PATH, imageRevisionMatches, observedImageRevision } from "./provenance";
+import { CONTAINER_RETRY_ATTEMPTS, CONTAINER_RETRY_BASE_MS, retryableSandbox, sandboxFailureCode } from "./sandbox-policy";
 import {
   encodeAutomation,
   encodeInbound,
@@ -409,7 +411,7 @@ export class OwnerDO extends DurableObject<Env> {
     this.abort = abort;
     const telegram = new TelegramApi(this.env.TELEGRAM_BOT_TOKEN);
     const typing = this.keepTyping(chatId, abort.signal, telegram);
-    const sandbox = this.sandbox();
+    let sandbox = this.sandbox();
     this.liveSandbox = sandbox;
     let errorClass: string | null = null;
     let processStarted = false;
@@ -429,7 +431,10 @@ export class OwnerDO extends DurableObject<Env> {
         throw new Error("missing_openrouter_key");
       }
       logOps({ event: "exec_start", tomo_id: this.tomoId(), generation_id: generationId });
-      await this.prepareGuest(sandbox);
+      const prepareStarted = Date.now();
+      sandbox = await this.prepareGuest(sandbox);
+      this.liveSandbox = sandbox;
+      logOps({ event: "guest_ready", tomo_id: this.tomoId(), generation_id: generationId, duration_ms: Date.now() - prepareStarted });
       const env = await this.guestEnv(generationId, chatId, actorId, extraEnv, options);
       await sandbox.setKeepAlive(true);
       const process = await this.withContainerRetry(() =>
@@ -459,7 +464,7 @@ export class OwnerDO extends DurableObject<Env> {
       if (abort.signal.aborted && !this.generationActive(generationId)) {
         logOps({ event: "exec_cancelled", tomo_id: this.tomoId(), generation_id: generationId });
       } else {
-        errorClass = sandboxLabel(error);
+        errorClass = sandboxFailureCode(error, isPlatformTransientError);
         logOps({
           event: "exec_failed",
           tomo_id: this.tomoId(),
@@ -588,7 +593,7 @@ export class OwnerDO extends DurableObject<Env> {
         event: "exec_poll_failed",
         tomo_id: this.tomoId(),
         generation_id: generationId,
-        error_class: sandboxLabel(error),
+        error_class: sandboxFailureCode(error, isPlatformTransientError),
         attempt: failures,
       });
       if (failures >= MAX_PROCESS_POLL_FAILURES) {
@@ -621,7 +626,9 @@ export class OwnerDO extends DurableObject<Env> {
       }
     }
     await sandbox.setKeepAlive(false).catch(() => undefined);
-    await sandbox.destroy().catch(() => undefined);
+    if (errorClass || !this.generationActive(generationId)) {
+      await sandbox.destroy().catch(() => undefined);
+    }
     const delivered = this.one(
       "SELECT 1 AS ok FROM deliveries WHERE generation_id = ? AND status = 'sent'",
       generationId,
@@ -824,29 +831,42 @@ export class OwnerDO extends DurableObject<Env> {
     return env;
   }
 
-  private async prepareGuest(sandbox: SandboxHandle): Promise<void> {
+  private async prepareGuest(sandbox: SandboxHandle): Promise<SandboxHandle> {
+    const expected = this.env.TOMO_IMAGE_REVISION;
+    let revision = await this.withContainerRetry(() => sandbox.exec(`cat ${IMAGE_REVISION_PATH}`, { timeout: 30_000 }));
+    if (!imageRevisionMatches(revision, expected)) {
+      logOps({ event: "guest_revision_stale", tomo_id: this.tomoId(), worker_revision: expected, guest_revision: observedImageRevision(revision) });
+      await sandbox.destroy().catch(() => undefined);
+      sandbox = this.sandbox();
+      revision = await this.withContainerRetry(() => sandbox.exec(`cat ${IMAGE_REVISION_PATH}`, { timeout: 30_000 }));
+      if (!imageRevisionMatches(revision, expected)) {
+        await sandbox.destroy().catch(() => undefined);
+        throw new Error("sandbox_revision_mismatch");
+      }
+    }
     await this.withContainerRetry(() => sandbox.mkdir(DATA_DIR, { recursive: true }));
     await this.hydrate(sandbox);
+    return sandbox;
   }
 
   private sandbox(): SandboxHandle {
     return getSandbox(this.env.Sandbox, this.tomoId(), {
       enableDefaultSession: false,
       normalizeId: true,
-      sleepAfter: "10s",
+      sleepAfter: "2m",
       containerTimeouts: { instanceGetTimeoutMS: 120_000, portReadyTimeoutMS: 180_000 },
     });
   }
 
   private async withContainerRetry<T>(operation: () => Promise<T>): Promise<T> {
     let last: unknown;
-    for (let attempt = 0; attempt < 5; attempt += 1) {
+    for (let attempt = 0; attempt < CONTAINER_RETRY_ATTEMPTS; attempt += 1) {
       try {
         return await operation();
       } catch (error) {
         last = error;
-        if (!retryableSandbox(error) || attempt === 4) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 4000 * (attempt + 1)));
+        if (!retryableSandbox(error, isPlatformTransientError) || attempt === CONTAINER_RETRY_ATTEMPTS - 1) throw error;
+        await new Promise((resolve) => setTimeout(resolve, CONTAINER_RETRY_BASE_MS * (attempt + 1)));
       }
     }
     throw last;
@@ -969,32 +989,6 @@ function jobJson(job: SqlRow): Record<string, unknown> {
 }
 
 type SandboxHandle = ReturnType<typeof getSandbox>;
-
-function sandboxLabel(error: unknown): string {
-  const name = error instanceof Error ? error.name : "Error";
-  const detail = error instanceof Error ? error.message : "";
-  const code = error && typeof error === "object" && "code" in error ? String((error as { code?: unknown }).code || "") : "";
-  const raw = [name, code, detail].filter(Boolean).join("_");
-  return raw.replace(/[^a-zA-Z0-9._-]+/g, "_").slice(0, 60) || "Error";
-}
-
-function retryableSandbox(error: unknown): boolean {
-  const name = error instanceof Error ? error.name : "";
-  const code = error && typeof error === "object" && "code" in error ? String((error as { code?: unknown }).code || "") : "";
-  const detail = error instanceof Error ? error.message : "";
-  const blob = `${name} ${code} ${detail}`.toLowerCase();
-  return (
-    name === "ContainerUnavailableError" ||
-    name === "RPCTransportError" ||
-    name === "SandboxError" ||
-    code === "CONTAINER_UNAVAILABLE" ||
-    code === "RPC_TRANSPORT_ERROR" ||
-    blob.includes("container_starting") ||
-    blob.includes("container unavailable") ||
-    blob.includes("http_error_status_500") ||
-    blob.includes("status 500")
-  );
-}
 
 function stringSet(value: string | number | null): Set<string> {
   if (typeof value !== "string") return new Set();

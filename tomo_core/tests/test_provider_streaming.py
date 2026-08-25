@@ -133,6 +133,7 @@ class ProviderStreamingTests(unittest.TestCase):
         self.assertEqual(body["max_tokens"], 4096)
         self.assertEqual(body["reasoning"], {"effort": "low", "exclude": True})
         self.assertEqual(body["stream_options"], {"include_usage": True})
+        self.assertNotIn("verify", stream.call_args.kwargs)
 
     def test_openrouter_vision_structured_stream_omits_xai_store_parameter(self):
         terminal = json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}]})

@@ -43,6 +43,8 @@
   "vars": {
     "TOMO_AGENT_MODEL": "deepseek/deepseek-v4-flash-0731",
     "TOMO_VISION_MODEL": "meta/muse-spark-1.2-contributor",
-    "TOMO_ALLOWLIST": "[{\"actor_id\":\"5995349219\",\"tomo_id\":\"tomo-pandacover\"}]"
+    "TOMO_ALLOWLIST": "[{\"actor_id\":\"5995349219\",\"tomo_id\":\"tomo-pandacover\"}]",
+    "TOMO_IMAGE_REVISION": "development",
+    "TOMO_DEPLOY_PROBE_TOKEN": "development-only"
   }
 }
