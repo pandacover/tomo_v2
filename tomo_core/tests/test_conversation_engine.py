@@ -4,7 +4,7 @@ from unittest.mock import patch
 from tomo_core.conversation import ConversationEngine, ConversationRequest, FrameReady, MemoryControlReady, ReactionWindowReady, SegmentFinish, TurnBudget, TurnRunCompleted, TurnRunStarted, TurnRunStatus
 from tomo_core.conversation.parsing import ConversationOutputError
 from tomo_core.models import InboundEnvelope, PeerTurn, ResponseContract
-from tomo_core.providers import ProviderSetupRequired, ProviderStreamCompleted, ProviderTextDelta, ProviderToolCallReady
+from tomo_core.providers import ProviderSetupRequired, ProviderStreamCompleted, ProviderStreamError, ProviderTextDelta, ProviderToolCallReady
 
 
 PLAN = '{"type":"turn_plan","primary_move":"answer","supporting_moves":["acknowledge"],"move_sequence":["acknowledge","answer"],"response_goal":"answer directly","confidence":"high"}\n'
@@ -56,6 +56,14 @@ class ConversationEngineTests(unittest.TestCase):
             envelope=InboundEnvelope("telegram", "u1", "m1", "my interview is tomorrow"),
             soul="SOUL SENTINEL",
             history=[{"role": "user", "content": "i need this job"}],
+        )
+
+    def test_provider_stream_error_keeps_its_stable_code(self):
+        from tomo_core.conversation.engine import _provider_failure_code
+
+        self.assertEqual(
+            _provider_failure_code(ProviderStreamError("invalid_sse_event")),
+            "provider_stream_invalid_sse_event",
         )
 
     def test_one_stream_progressively_yields_plan_and_frames_independent_of_moves(self):

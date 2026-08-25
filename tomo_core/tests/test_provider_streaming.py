@@ -8,6 +8,7 @@ from tomo_core.providers import (
     GrokAuthProvider,
     OAuthBackedSuperGrokProvider,
     ProviderStreamCompleted,
+    ProviderStreamError,
     ProviderTextDelta,
     ProviderToolCallReady,
     StaticProvider,
@@ -215,6 +216,21 @@ class ProviderStreamingTests(unittest.TestCase):
             with self.subTest(response=response), patch("tomo_core.providers.httpx.stream", return_value=response):
                 with self.assertRaises((ValueError, httpx.HTTPStatusError)):
                     list(XaiApiProvider(api_key="test-key").stream([{"role": "user", "content": "hi"}]))
+
+    def test_stream_failures_have_stable_privacy_safe_codes(self):
+        cases = (
+            (sse_chunks("not json"), "malformed_json"),
+            (b"not-sse\n\n", "invalid_sse_event"),
+            (sse_chunks(json.dumps({"choices": "wrong"})), "invalid_choices_type"),
+        )
+        for chunks, expected in cases:
+            with self.subTest(expected=expected), patch(
+                "tomo_core.providers.httpx.stream",
+                return_value=FakeStreamResponse(chunks if isinstance(chunks, list) else [chunks]),
+            ):
+                with self.assertRaises(ProviderStreamError) as raised:
+                    list(XaiApiProvider(api_key="test-key").stream([{"role": "user", "content": "hi"}]))
+                self.assertEqual(raised.exception.code, expected)
 
     def test_stream_fails_closed_on_conflicting_tool_identity_invalid_usage_or_missing_finish(self):
         conflicting_id = json.dumps(

@@ -10,7 +10,7 @@ import httpx
 from ..context import ContextHydrator
 from ..delivery import split_sentences
 from ..models import AutomationTurn, PeerTurn, ResponseContract
-from ..providers import ProviderAdapter, ProviderSetupRequired, ProviderStreamCompleted, ProviderTextDelta, ProviderToolCallReady
+from ..providers import ProviderAdapter, ProviderSetupRequired, ProviderStreamCompleted, ProviderStreamError, ProviderTextDelta, ProviderToolCallReady
 from ..tool_execution import ToolBatchCancelled, ToolBatchValidationError, ToolExecutor
 from ..tools import ToolRegistry
 from .. import latency_trace
@@ -26,6 +26,8 @@ def _provider_failure_code(error: BaseException) -> str:
         return "provider_timeout"
     if isinstance(error, httpx.ConnectError):
         return "provider_connect"
+    if isinstance(error, ProviderStreamError):
+        return f"provider_stream_{error.code}"
     if isinstance(error, ValueError):
         message = str(error).split(":")[-1].strip().lower()
         slug = "".join(character if character.isalnum() else "_" for character in message).strip("_")[:48]

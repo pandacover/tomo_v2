@@ -51,6 +51,16 @@ DEFAULT_OPENROUTER_AGENT_MODEL = "deepseek/deepseek-v4-flash-0731"
 DEFAULT_OPENROUTER_VISION_MODEL = "meta/muse-spark-1.2-contributor"
 
 
+class ProviderStreamError(ValueError):
+    """A privacy-safe, stable diagnostic for OpenAI-compatible streams."""
+
+    def __init__(self, code: str) -> None:
+        if not code or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789_" for character in code):
+            raise ValueError("provider stream error code must be lowercase snake case")
+        self.code = code
+        super().__init__(code)
+
+
 def _provider_headers(base_url: str, access_token: str) -> dict[str, str]:
     headers = {"Authorization": f"Bearer {access_token}"}
     if "openrouter.ai" in base_url:
@@ -143,16 +153,16 @@ def _stream_openai_compatible(
         if usage is None:
             return
         if not isinstance(usage, dict):
-            raise ValueError("invalid stream usage")
+            raise ProviderStreamError("invalid_usage")
         prompt = usage.get("prompt_tokens")
         completion = usage.get("completion_tokens")
         details = usage.get("completion_tokens_details")
         if details is not None and not isinstance(details, dict):
-            raise ValueError("invalid stream usage")
+            raise ProviderStreamError("invalid_usage")
         reasoning = details.get("reasoning_tokens") if isinstance(details, dict) else None
         for value in (prompt, completion, reasoning):
             if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
-                raise ValueError("invalid stream usage")
+                raise ProviderStreamError("invalid_usage")
         if prompt is not None:
             input_tokens = prompt
         if completion is not None:
@@ -164,77 +174,77 @@ def _stream_openai_compatible(
         nonlocal finish_reason, saw_done
         if data == "[DONE]":
             if saw_done:
-                raise ValueError("duplicate stream completion")
+                raise ProviderStreamError("duplicate_completion")
             saw_done = True
             return
         if saw_done:
-            raise ValueError("data after stream completion")
+            raise ProviderStreamError("data_after_completion")
         try:
             payload = json.loads(data)
         except json.JSONDecodeError as exc:
-            raise ValueError("malformed stream JSON") from exc
+            raise ProviderStreamError("malformed_json") from exc
         if not isinstance(payload, dict):
-            raise ValueError("invalid stream payload")
+            raise ProviderStreamError("invalid_payload")
         parse_usage(payload)
         if payload.get("error"):
-            raise ValueError("provider stream error")
+            raise ProviderStreamError("provider_error_event")
         choices = payload.get("choices")
         if choices is None:
             return
         if not isinstance(choices, list):
-            raise ValueError("missing stream choices")
+            raise ProviderStreamError("invalid_choices_type")
         if not choices:
             return
         if len(choices) != 1 or not isinstance(choices[0], dict):
-            raise ValueError("invalid stream choices")
+            raise ProviderStreamError("invalid_choices")
         choice = choices[0]
         current_finish = choice.get("finish_reason")
         if isinstance(current_finish, str) and current_finish.strip():
             if finish_reason is None:
                 finish_reason = current_finish
         elif current_finish not in (None, "", "null"):
-            raise ValueError("invalid stream finish reason")
+            raise ProviderStreamError("invalid_finish_reason")
         delta = choice.get("delta") or {}
         if not isinstance(delta, dict):
-            raise ValueError("invalid stream delta")
+            raise ProviderStreamError("invalid_delta")
         content = delta.get("content")
         if isinstance(content, str) and content:
             yield ProviderTextDelta(content)
         elif content not in (None, ""):
-            raise ValueError("invalid stream content")
+            raise ProviderStreamError("invalid_content")
         native_calls = delta.get("tool_calls")
         if native_calls is not None:
             if not isinstance(native_calls, list):
-                raise ValueError("invalid stream tool calls")
+                raise ProviderStreamError("invalid_tool_calls")
             for native_call in native_calls:
                 if not isinstance(native_call, dict):
-                    raise ValueError("invalid stream tool call")
+                    raise ProviderStreamError("invalid_tool_call")
                 index = native_call.get("index")
                 if isinstance(index, bool) or not isinstance(index, int) or index < 0:
-                    raise ValueError("invalid stream tool call index")
+                    raise ProviderStreamError("invalid_tool_call_index")
                 parts = tool_calls.setdefault(index, _ToolCallParts())
                 call_id = native_call.get("id")
                 if call_id is not None:
                     if not isinstance(call_id, str) or not call_id.strip() or (parts.call_id is not None and parts.call_id != call_id):
-                        raise ValueError("conflicting stream tool call id")
+                        raise ProviderStreamError("conflicting_tool_call_id")
                     existing_index = tool_call_indices.get(call_id)
                     if existing_index is not None and existing_index != index:
-                        raise ValueError("conflicting stream tool call id")
+                        raise ProviderStreamError("conflicting_tool_call_id")
                     tool_call_indices[call_id] = index
                     parts.call_id = call_id
                 function = native_call.get("function")
                 if function is not None:
                     if not isinstance(function, dict):
-                        raise ValueError("invalid stream tool function")
+                        raise ProviderStreamError("invalid_tool_function")
                     name = function.get("name")
                     if name is not None:
                         if not isinstance(name, str) or not name.strip() or (parts.name is not None and parts.name != name):
-                            raise ValueError("conflicting stream tool call name")
+                            raise ProviderStreamError("conflicting_tool_call_name")
                         parts.name = name
                     if "arguments" in function:
                         arguments = function["arguments"]
                         if not isinstance(arguments, str):
-                            raise ValueError("invalid stream tool arguments")
+                            raise ProviderStreamError("invalid_tool_arguments")
                         parts.arguments += arguments
                         parts.received_arguments = True
 
@@ -243,7 +253,7 @@ def _stream_openai_compatible(
         data_lines = [line[5:].lstrip(" ") for line in lines if line.startswith("data:")]
         if not data_lines:
             if any(line and not line.startswith((":", "event:", "id:", "retry:")) for line in lines):
-                raise ValueError("invalid SSE event")
+                raise ProviderStreamError("invalid_sse_event")
             return
         yield from consume_data("\n".join(data_lines))
 
@@ -258,7 +268,7 @@ def _stream_openai_compatible(
         response.raise_for_status()
         for chunk in response.iter_raw():
             if not isinstance(chunk, bytes):
-                raise ValueError("invalid stream chunk")
+                raise ProviderStreamError("invalid_chunk")
             buffer += decoder.decode(chunk)
             while "\n\n" in buffer or "\r\n\r\n" in buffer:
                 separator = "\r\n\r\n" if "\r\n\r\n" in buffer and (
@@ -272,16 +282,16 @@ def _stream_openai_compatible(
     if finish_reason is None and saw_done:
         finish_reason = "stop"
     if finish_reason is None:
-        raise ValueError("stream ended without terminal completion")
+        raise ProviderStreamError("missing_terminal_completion")
     if tool_calls and finish_reason != "tool_calls":
-        raise ValueError("tool calls without tool finish")
+        raise ProviderStreamError("tool_calls_without_finish")
     if finish_reason == "tool_calls":
         if not tool_calls:
-            raise ValueError("tool finish without tool calls")
+            raise ProviderStreamError("tool_finish_without_calls")
         for index in sorted(tool_calls):
             parts = tool_calls[index]
             if not parts.call_id or not parts.name or not parts.received_arguments:
-                raise ValueError("incomplete stream tool call")
+                raise ProviderStreamError("incomplete_tool_call")
             yield ProviderToolCallReady(parts.call_id, parts.name, parts.arguments)
     yield ProviderStreamCompleted(finish_reason, input_tokens, output_tokens, reasoning_tokens)
 

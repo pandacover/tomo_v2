@@ -1,5 +1,4 @@
 name: Deploy Tomo
-# Redeploy: tolerate OpenRouter SSE; slug ValueError text.
 
 on:
   workflow_dispatch:
@@ -7,6 +6,12 @@ on:
     branches:
       - cloudflare-cutover
     paths:
+      - "cloudflare/**"
+      - "tomo_core/Dockerfile.cloudflare"
+      - "tomo_core/SOUL.md"
+      - "tomo_core/pyproject.toml"
+      - "tomo_core/uv.lock"
+      - "tomo_core/src/**"
       - ".github/workflows/deploy-tomo.yml"
 
 permissions:
