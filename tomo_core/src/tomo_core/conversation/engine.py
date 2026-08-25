@@ -18,7 +18,31 @@ from .contract import PlanSource, synthesized_tool_plan
 from .framing import SegmentFrameParser
 from .models import ConversationRequest, Frame, FrameReady, MemoryControlReady, MovePlan, ReactionWindowReady, SegmentFinish, SegmentResult, TurnBudget, TurnRunCompleted, TurnRunEvent, TurnRunResult, TurnRunStarted, TurnRunStatus, TurnUsage
 from .parsing import ConversationOutputError
-from .prompts import build_first_segment_repair_messages, build_segment_messages, build_segment_repair_messages
+from .prompts import build_first_segment_repair_messages, build_segment_messages, build_segment_repair_messages, build_structured_frame_repair_messages
+
+
+def _structured_frame_response_format(budget: TurnBudget) -> dict[str, object]:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "tomo_frame_repair",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "type": {"type": "string", "const": "frame"},
+                    "text": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": budget.max_chars_per_frame,
+                        "description": "One user-visible Tomo message with no Markdown or internal labels.",
+                    },
+                },
+                "required": ["type", "text"],
+                "additionalProperties": False,
+            },
+        },
+    }
 
 
 def _provider_failure_code(error: BaseException) -> str:
@@ -188,7 +212,20 @@ class ConversationEngine:
                     raise ConversationOutputError("frame_limit")
                 segment_budget = replace(self.budget, max_frames_per_segment=min(self.budget.max_frames_per_segment, remaining_frames))
                 parser = SegmentFrameParser(index, first_segment=plan is None, budget=segment_budget)
-                if replacement and plan is None:
+                structured_stream = getattr(self.provider, "stream_structured", None)
+                structured_frame_repair = replacement and repair_code == "missing_frame" and callable(structured_stream)
+                if structured_frame_repair:
+                    schemas = ()
+                    messages = build_structured_frame_repair_messages(
+                        request,
+                        context,
+                        segment_budget,
+                        repair_code,
+                        segment_index=index,
+                        plan=plan,
+                        prior_messages=prior_messages,
+                    )
+                elif replacement and plan is None:
                     schemas = schemas if not mutating_execution_attempted else ()
                     messages = build_first_segment_repair_messages(
                         request,
@@ -348,7 +385,14 @@ class ConversationEngine:
                         actor_id = None
                     else:
                         actor_id = request.burst.latest.actor_id
-                    stream = self.provider.stream(messages, tools=schemas, actor_id=actor_id)
+                    if structured_frame_repair:
+                        stream = structured_stream(
+                            messages,
+                            response_format=_structured_frame_response_format(segment_budget),
+                            actor_id=actor_id,
+                        )
+                    else:
+                        stream = self.provider.stream(messages, tools=schemas, actor_id=actor_id)
                 except ProviderSetupRequired as error:
                     emit_provider_attempt("error")
                     if not segments:

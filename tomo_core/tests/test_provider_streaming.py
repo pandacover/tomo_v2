@@ -80,6 +80,19 @@ class ProviderStreamingTests(unittest.TestCase):
                 list(provider.stream([{"role": "user", "content": "describe"}]))
                 self.assertNotIn("response_format", stream.call_args.kwargs["json"])
 
+    def test_openrouter_structured_stream_requires_schema_capable_endpoint(self):
+        terminal = json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}]})
+        provider = XaiApiProvider(
+            api_key="or-key",
+            model="deepseek/deepseek-v4-flash-0731",
+            base_url="https://openrouter.ai/api/v1",
+        )
+
+        with patch("tomo_core.providers.httpx.stream", return_value=FakeStreamResponse(sse_chunks(terminal, "[DONE]"))) as stream:
+            list(provider.stream_structured([{"role": "user", "content": "describe"}], response_format=STRUCTURED_RESPONSE_FORMAT))
+
+        self.assertEqual(stream.call_args.kwargs["json"]["provider"], {"require_parameters": True})
+
     def test_oauth_backed_and_grok_auth_providers_forward_structured_streams(self):
         oauth = type("OAuth", (), {"token_path": lambda *_: type("Path", (), {"exists": lambda _: True, "read_text": lambda _, **__: '{"access_token":"unused"}'})()})()
         auth_store = type("AuthStore", (), {"access_token": lambda _: "unused"})()

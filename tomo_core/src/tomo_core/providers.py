@@ -136,6 +136,11 @@ def _stream_openai_compatible(
         request_body["store"] = store
     if response_format is not None:
         request_body["response_format"] = response_format
+        if "openrouter.ai" in base_url:
+            # Structured-output support is endpoint-specific on OpenRouter.
+            # Do not let routing silently choose an endpoint that ignores the
+            # response schema used by the conversation repair path.
+            request_body["provider"] = {"require_parameters": True}
 
     tool_calls: dict[int, _ToolCallParts] = {}
     tool_call_indices: dict[str, int] = {}

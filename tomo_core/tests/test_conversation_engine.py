@@ -50,6 +50,20 @@ class ScriptedProvider:
         raise AssertionError("ordinary turns must not call complete")
 
 
+class StructuredRepairProvider(ScriptedProvider):
+    def __init__(self, streams, structured_streams):
+        super().__init__(streams)
+        self.structured_streams = list(structured_streams)
+        self.structured_calls = []
+
+    def stream_structured(self, messages, *, response_format, actor_id=None):
+        self.structured_calls.append((messages, response_format, actor_id))
+        scripted = self.structured_streams.pop(0)
+        iterator = ClosingIterator(scripted)
+        self.iterators.append(iterator)
+        return iterator
+
+
 class ConversationEngineTests(unittest.TestCase):
     def request(self):
         return ConversationRequest.from_history(
@@ -559,6 +573,23 @@ class ConversationEngineTests(unittest.TestCase):
                 self.assertEqual(result.usage.contract_repairs, 1)
                 self.assertEqual(len(provider.calls), 2)
                 self.assertIn(repair_code, provider.calls[1][0][0]["content"])
+
+    def test_missing_frame_uses_schema_enforced_single_frame_repair_when_supported(self):
+        provider = StructuredRepairProvider(
+            [[ProviderStreamCompleted("stop")]],
+            [[ProviderTextDelta('{"type":"frame","text":"Recovered answer."}'), ProviderStreamCompleted("stop")]],
+        )
+
+        result = ConversationEngine(provider).respond(self.request())
+
+        self.assertEqual([frame.text for frame in result.frames], ["Recovered answer."])
+        self.assertEqual(result.usage.contract_repairs, 1)
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(len(provider.structured_calls), 1)
+        messages, response_format, actor_id = provider.structured_calls[0]
+        self.assertIn("response schema overrides the JSONL output contract for this repair only", messages[0]["content"])
+        self.assertEqual(response_format["json_schema"]["schema"]["properties"]["type"]["const"], "frame")
+        self.assertEqual(actor_id, "u1")
 
     def test_non_json_preamble_before_valid_jsonl_does_not_require_repair(self):
         provider = ScriptedProvider([[
